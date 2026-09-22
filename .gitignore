@@ -1,0 +1,7 @@
+# Zig-Bauartefakte
+.zig-cache/
+zig-out/
+
+# Messausgaben
+*.ppm
+*.png

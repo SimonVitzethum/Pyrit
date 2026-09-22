@@ -1,0 +1,544 @@
+//! pyrit-render: rendert ein Bild mit der Pyrit-API (GPU) und speichert es als PPM.
+//!
+//!   zig build render -- [--vox datei.vox] [--out bild.ppm] [--size 1280x720]
+//!                       [--frames 64] [--no-rt] [--no-gi]
+//!   zig build render -- --world [--scale 2] [--fg] [--dlss|--rr] [--profile]
+//!
+//! Ohne --vox wird eine Landschaft erzeugt. Die Voxel werden auf dem Host
+//! erzeugt bzw. gelesen; Bau, Rendern, Akkumulation und Tonemapping laufen
+//! auf der GPU.
+
+const std = @import("std");
+const pyrit = @import("pyrit");
+const pyr = @import("pyrit_device");
+const api = pyrit.api;
+const types = pyr.types;
+const cuda = pyrit.cuda;
+
+var drv: cuda.Driver = undefined;
+
+fn cu(r: cuda.CUresult) void {
+    if (r != cuda.CUDA_SUCCESS) std.debug.panic("CUDA: {s}", .{drv.errorString(r)});
+}
+
+fn req(r: api.Result) void {
+    if (r != api.ok) std.debug.panic("{s}: {s}", .{ pyrit.pyr_result_string(r), pyrit.pyr_error_message() });
+}
+
+fn devAlloc(bytes: usize) u64 {
+    var p: cuda.CUdeviceptr = 0;
+    cu(drv.cuMemAlloc_v2(&p, bytes));
+    return p;
+}
+
+fn voxel(material: u32, r: u32, g: u32, b: u32) u32 {
+    return pyrit.pyr_voxel_attribute(material, r, g, b);
+}
+
+fn hash(x: i32, z: i32) f32 {
+    var h: u32 = @as(u32, @bitCast(x)) *% 374761393 +% @as(u32, @bitCast(z)) *% 668265263;
+    h = (h ^ (h >> 13)) *% 1274126177;
+    return @as(f32, @floatFromInt(h & 0xFFFF)) / 65535.0;
+}
+
+fn noise(x: f32, z: f32) f32 {
+    const xi: i32 = @intFromFloat(@floor(x));
+    const zi: i32 = @intFromFloat(@floor(z));
+    const fx = x - @floor(x);
+    const fz = z - @floor(z);
+    const u = fx * fx * (3 - 2 * fx);
+    const v = fz * fz * (3 - 2 * fz);
+    const a = hash(xi, zi);
+    const b = hash(xi + 1, zi);
+    const c = hash(xi, zi + 1);
+    const d = hash(xi + 1, zi + 1);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+/// Hügellandschaft mit Wasser, Schnee, Bäumen und leuchtenden Kristallen
+fn landscape(gpa: std.mem.Allocator, n: u32) ![]api.Voxel {
+    var list: std.ArrayList(api.Voxel) = .empty;
+    const nf: f32 = @floatFromInt(n);
+    const water: i32 = @intFromFloat(nf * 0.18);
+    for (0..n) |zi| for (0..n) |xi| {
+        const x: f32 = @floatFromInt(xi);
+        const z: f32 = @floatFromInt(zi);
+        var h = noise(x / 64, z / 64) * 0.6 + noise(x / 24, z / 24) * 0.3 + noise(x / 8, z / 8) * 0.1;
+        h = h * h * nf * 0.55;
+        const top: i32 = @intFromFloat(h);
+        var y: i32 = 0;
+        while (y <= @max(top, water)) : (y += 1) {
+            const vx: i32 = @intCast(xi);
+            const vz: i32 = @intCast(zi);
+            const a: u32 = if (y > top)
+                voxel(2, 40, 90, 160) // Wasser
+            else if (y == top and top > @as(i32, @intFromFloat(nf * 0.42)))
+                voxel(0, 240, 240, 245) // Schnee
+            else if (y == top and top > water + 1)
+                voxel(0, 70, 140, 50) // Gras
+            else if (y == top)
+                voxel(0, 200, 190, 140) // Sand
+            else if (y > top - 4)
+                voxel(0, 110, 80, 55) // Erde
+            else
+                voxel(0, 120, 120, 125); // Stein
+            // nur Oberfläche und etwas darunter speichern (Rest ist unsichtbar)
+            if (y >= @min(top, water) - 6) try list.append(gpa, .{ .x = vx, .y = y, .z = vz, .attribute = a });
+        }
+        // Bäume
+        if (top > water + 2 and top < @as(i32, @intFromFloat(nf * 0.35)) and hash(@intCast(xi * 7), @intCast(zi * 13)) > 0.992) {
+            var t: i32 = 1;
+            while (t < 9) : (t += 1) try list.append(gpa, .{ .x = @intCast(xi), .y = top + t, .z = @intCast(zi), .attribute = voxel(0, 90, 60, 35) });
+            var dz: i32 = -3;
+            while (dz <= 3) : (dz += 1) {
+                var dx: i32 = -3;
+                while (dx <= 3) : (dx += 1) {
+                    var dy: i32 = 6;
+                    while (dy <= 11) : (dy += 1) {
+                        if (dx * dx + dz * dz + (dy - 8) * (dy - 8) <= 10) {
+                            const px = @as(i32, @intCast(xi)) + dx;
+                            const pz = @as(i32, @intCast(zi)) + dz;
+                            if (px >= 0 and pz >= 0 and px < n and pz < n)
+                                try list.append(gpa, .{ .x = px, .y = top + dy, .z = pz, .attribute = voxel(0, 45, 110, 40) });
+                        }
+                    }
+                }
+            }
+        }
+        // Kristalle (emittierend)
+        if (top > water + 1 and hash(@intCast(xi * 31), @intCast(zi * 17)) > 0.9985) {
+            var t: i32 = 1;
+            while (t < 5) : (t += 1) try list.append(gpa, .{ .x = @intCast(xi), .y = top + t, .z = @intCast(zi), .attribute = voxel(1, 255, 160, 60) });
+        }
+    };
+    return list.toOwnedSlice(gpa);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    var vox_path: ?[]const u8 = null;
+    var out_path: []const u8 = "pyrit.ppm";
+    var w: u32 = 1280;
+    var h: u32 = 720;
+    var frames: u32 = 64;
+    var flags: u32 = 0;
+    var gi = true;
+    var world_mode = false;
+    var scale: u32 = 1;
+    var fg = false;
+    var upscaler: u32 = api.upscaler_auto;
+    var profile = false;
+    var voxel_px: f32 = 0;
+    var budget_mib: u32 = 0;
+    var denoise: u32 = 2;
+    var clamp_sigma: f32 = 1.5;
+    var coarse_secondary = false;
+    var gi_distance: f32 = 0;
+    var half_gi = false;
+    // Kameradrehung je Frame in Radiant (wie Mausblick); 0 = starre Blickrichtung
+    var turn: f32 = 0;
+    var flicker = false;
+    // Sichtweite in Grundvoxeln (0 = Vorgabe 16384 = 1024 Minecraft-Chunks)
+    var view_distance: f32 = 0;
+    var sea_level: f32 = 0;
+    var rt_leaf: u32 = 0;
+    var static_cam = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--vox") and i + 1 < args.len) {
+            i += 1;
+            vox_path = args[i];
+        } else if (std.mem.eql(u8, a, "--out") and i + 1 < args.len) {
+            i += 1;
+            out_path = args[i];
+        } else if (std.mem.eql(u8, a, "--size") and i + 1 < args.len) {
+            i += 1;
+            var it = std.mem.splitScalar(u8, args[i], 'x');
+            w = try std.fmt.parseInt(u32, it.next() orelse "1280", 10);
+            h = try std.fmt.parseInt(u32, it.next() orelse "720", 10);
+        } else if (std.mem.eql(u8, a, "--frames") and i + 1 < args.len) {
+            i += 1;
+            frames = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--no-rt")) {
+            flags |= api.create_no_rt;
+        } else if (std.mem.eql(u8, a, "--no-gi")) {
+            gi = false;
+        } else if (std.mem.eql(u8, a, "--world")) {
+            world_mode = true;
+        } else if (std.mem.eql(u8, a, "--scale") and i + 1 < args.len) {
+            i += 1;
+            scale = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--fg")) {
+            fg = true;
+        } else if (std.mem.eql(u8, a, "--dlss")) {
+            upscaler = api.upscaler_dlss;
+        } else if (std.mem.eql(u8, a, "--rr")) {
+            upscaler = api.upscaler_dlss_rr;
+        } else if (std.mem.eql(u8, a, "--profile")) {
+            profile = true;
+        } else if (std.mem.eql(u8, a, "--voxel-px") and i + 1 < args.len) {
+            i += 1;
+            voxel_px = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--denoise") and i + 1 < args.len) {
+            i += 1;
+            denoise = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--gi-distance") and i + 1 < args.len) {
+            i += 1;
+            gi_distance = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--static")) {
+            static_cam = true;
+        } else if (std.mem.eql(u8, a, "--rt-leaf") and i + 1 < args.len) {
+            i += 1;
+            rt_leaf = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--sea") and i + 1 < args.len) {
+            i += 1;
+            sea_level = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--turn") and i + 1 < args.len) {
+            i += 1;
+            turn = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--view") and i + 1 < args.len) {
+            i += 1;
+            view_distance = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--flicker")) {
+            flicker = true;
+        } else if (std.mem.eql(u8, a, "--half-gi")) {
+            half_gi = true;
+        } else if (std.mem.eql(u8, a, "--coarse-gi")) {
+            coarse_secondary = true;
+        } else if (std.mem.eql(u8, a, "--clamp") and i + 1 < args.len) {
+            i += 1;
+            clamp_sigma = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--budget") and i + 1 < args.len) {
+            i += 1;
+            budget_mib = try std.fmt.parseInt(u32, args[i], 10);
+        } else {
+            std.debug.print("unbekanntes Argument: {s}\n", .{a});
+            return error.Usage;
+        }
+    }
+
+    drv = cuda.Driver.load() catch return error.NoCuda;
+    cu(drv.cuInit(0));
+    var dev: cuda.CUdevice = 0;
+    cu(drv.cuDeviceGet(&dev, 0));
+    var cu_ctx: cuda.CUcontext = null;
+    cu(drv.cuDevicePrimaryCtxRetain(&cu_ctx, dev));
+    cu(drv.cuCtxSetCurrent(cu_ctx));
+
+    var ci = std.mem.zeroes(api.CreateInfo);
+    ci.struct_size = @sizeOf(api.CreateInfo);
+    ci.version = api.version;
+    ci.flags = flags;
+    if (world_mode) {
+        // feines LOD braucht viele Chunks
+        ci.max_geometries = 65536;
+        ci.max_instances = 65536;
+        ci.node_pool_bytes = 512 << 20;
+        ci.leaf_pool_bytes = 512 << 20;
+        ci.attribute_pool_bytes = 512 << 20;
+    }
+    var ctx: ?*anyopaque = null;
+    req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
+    defer pyrit.pyr_destroy(@ptrCast(ctx));
+
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance);
+
+    // Szene
+    var voxels: []api.Voxel = undefined;
+    var log2: u32 = 8;
+    if (vox_path) |path| {
+        const data = try std.Io.Dir.cwd().readFileAlloc(init.io, path, gpa, .unlimited);
+        defer gpa.free(data);
+        var count: u32 = 0;
+        req(pyrit.pyr_vox_parse(data.ptr, data.len, 0, null, &count, &log2));
+        voxels = try gpa.alloc(api.Voxel, count);
+        req(pyrit.pyr_vox_parse(data.ptr, data.len, 0, voxels.ptr, &count, &log2));
+    } else {
+        voxels = try landscape(gpa, 256);
+    }
+    defer gpa.free(voxels);
+    const t0 = std.Io.Timestamp.now(init.io, .awake);
+    var geo: api.Handle = null;
+    req(pyrit.pyr_geometry_build(@ptrCast(ctx), log2, voxels.ptr, @intCast(voxels.len), api.build_host_input, &geo));
+    req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+    std.debug.print("Geometrie: {d} Voxel, 2^{d}, GPU-Bau {d:.1} ms\n", .{ voxels.len, log2, @as(f64, @floatFromInt(t0.untilNow(init.io, .awake).toNanoseconds())) / 1e6 });
+
+    var inst: api.Handle = null;
+    req(pyrit.pyr_instance_create(@ptrCast(ctx), geo, &inst));
+    const size: f32 = @floatFromInt(@as(u32, 1) << @intCast(log2));
+    const m = [12]f32{ 1, 0, 0, -size / 2, 0, 1, 0, 0, 0, 0, 1, -size / 2 };
+    req(pyrit.pyr_instance_set_transform(@ptrCast(ctx), inst, &m));
+
+    // Materialien: 0 diffus, 1 Kristall (leuchtend), 2 Wasser (glatt)
+    var mat: types.Material = undefined;
+    pyrit.pyr_material_default(&mat);
+    mat.emission = .{ 6, 3.5, 1.2 };
+    mat.roughness = 0.3;
+    req(pyrit.pyr_material_set(@ptrCast(ctx), 1, &mat));
+    pyrit.pyr_material_default(&mat);
+    mat.roughness = 0.08;
+    mat.metallic = 0.0;
+    req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &mat));
+
+    var light: types.Lighting = undefined;
+    pyrit.pyr_lighting_default(&light);
+    light.sun_direction = .{ 0.6, 0.55, 0.3 };
+    if (!gi) light.flags = types.lighting_shadows | types.lighting_ao | types.lighting_sun_disk;
+    req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
+
+    var view: api.Handle = null;
+    req(pyrit.pyr_view_create(@ptrCast(ctx), &view));
+    var cam = std.mem.zeroes(types.Camera);
+    const eye = [3]f32{ size * 0.55, size * 0.5, size * 0.75 };
+    const target = [3]f32{ 0, size * 0.12, 0 };
+    const up = [3]f32{ 0, 1, 0 };
+    pyrit.pyr_camera_look_at(&cam, &eye, &target, &up);
+    pyrit.pyr_camera_perspective(&cam, 0.8, w, h, 0.1);
+
+    const n: usize = @as(usize, w) * h;
+    var tg = std.mem.zeroes(api.Targets);
+    tg.hits = devAlloc(n * 16);
+    tg.motion = devAlloc(n * 8);
+    tg.color = devAlloc(n * 16);
+    tg.normal = devAlloc(n * 16);
+    tg.albedo = devAlloc(n * 16);
+    const ldr = devAlloc(n * 4);
+    defer for ([_]u64{ tg.hits, tg.motion, tg.color, tg.normal, tg.albedo, ldr }) |b| {
+        _ = drv.cuMemFree_v2(b);
+    };
+    var post = std.mem.zeroes(api.PostInfo);
+    post.output_ldr = ldr;
+    post.denoise_iterations = 3;
+    post.temporal_alpha = 1.0 / @as(f32, @floatFromInt(@max(frames, 1)));
+    post.exposure = 1.0;
+
+    const t1 = std.Io.Timestamp.now(init.io, .awake);
+    for (0..frames) |f| {
+        var j: [2]f32 = undefined;
+        pyrit.pyr_jitter_halton(@intCast(f), &j);
+        cam.jitter = j;
+        req(pyrit.pyr_commit(@ptrCast(ctx), null));
+        req(pyrit.pyr_render(@ptrCast(ctx), view, &cam, &tg));
+        req(pyrit.pyr_postprocess(@ptrCast(ctx), view, &tg, &post));
+    }
+    req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+    const ms = @as(f64, @floatFromInt(t1.untilNow(init.io, .awake).toNanoseconds())) / 1e6;
+    std.debug.print("{d} Frames {d}x{d}: {d:.2} ms pro Frame (RT-Cores: {s})\n", .{ frames, w, h, ms / @as(f64, @floatFromInt(@max(frames, 1))), if (pyrit.pyr_features(@ptrCast(ctx)) & api.feature_rt_cores != 0) "ja" else "nein" });
+
+    try savePpm(init, ldr, w, h, out_path);
+    _ = drv.cuDevicePrimaryCtxRelease_v2(dev);
+}
+
+fn savePpm(init: std.process.Init, ldr: u64, w: u32, h: u32, out_path: []const u8) !void {
+    const gpa = init.gpa;
+    const n: usize = @as(usize, w) * h;
+    const px = try gpa.alloc([4]u8, n);
+    defer gpa.free(px);
+    cu(drv.cuMemcpyDtoH_v2(px.ptr, ldr, n * 4));
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(gpa);
+    var header_buf: [64]u8 = undefined;
+    try file.appendSlice(gpa, try std.fmt.bufPrint(&header_buf, "P6\n{d} {d}\n255\n", .{ w, h }));
+    for (px) |p| try file.appendSlice(gpa, p[0..3]);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = file.items });
+    std.debug.print("Bild: {s}\n", .{out_path});
+}
+
+fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t.untilNow(init.io, .awake).toNanoseconds())) / 1e6;
+}
+
+/// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32) !void {
+    const w = out_w / scale;
+    const h = out_h / scale;
+    var terrain: api.TerrainInfo = undefined;
+    pyrit.pyr_terrain_default(&terrain);
+    // Wasser (Material 2, durchsichtig) und Bäume (Material 0)
+    if (sea_level > 0) terrain.sea_level = sea_level;
+    terrain.attr_water = voxel(2, 40, 90, 140);
+    terrain.attr_leaves = voxel(0, 48, 112, 40);
+    terrain.attr_wood = voxel(0, 96, 68, 44);
+    var water: types.Material = undefined;
+    pyrit.pyr_material_default(&water);
+    water.flags = types.material_voxel_color | types.material_transparent | types.material_refract | types.material_waves;
+    water.roughness = 0.05;
+    water.ior = 1.33;
+    water.density = 0.08;
+    water.opacity = 0.05;
+    req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &water));
+    var wi = std.mem.zeroes(api.WorldInfo);
+    wi.terrain = &terrain;
+    wi.voxel_pixels = voxel_px;
+    wi.view_distance = view_distance;
+    wi.rt_leaf_log2 = rt_leaf;
+    wi.memory_budget = @as(u64, budget_mib) << 20;
+    if (coarse_secondary) {
+        wi.secondary_mask = 0x2; // grobe Fassung nur für Schatten und GI
+    }
+    var world: ?*anyopaque = null;
+    req(pyrit.pyr_world_create(@ptrCast(ctx), &wi, @ptrCast(&world)));
+    defer _ = pyrit.pyr_world_destroy(@ptrCast(ctx), @ptrCast(world));
+
+    var light: types.Lighting = undefined;
+    pyrit.pyr_lighting_default(&light);
+    light.sun_direction = .{ 0.5, 0.35, 0.4 };
+    if (!gi) light.flags = types.lighting_shadows | types.lighting_ao | types.lighting_sun_disk;
+    light.gi_distance = gi_distance;
+    if (half_gi) light.flags |= types.lighting_gi_half;
+    req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
+
+    var view: api.Handle = null;
+    req(pyrit.pyr_view_create(@ptrCast(ctx), &view));
+    const n: usize = @as(usize, w) * h;
+    var tg = std.mem.zeroes(api.Targets);
+    tg.hits = devAlloc(n * 16);
+    tg.motion = devAlloc(n * 8);
+    tg.color = devAlloc(n * 16);
+    tg.normal = devAlloc(n * 16);
+    tg.albedo = devAlloc(n * 16);
+    // DLSS Ray Reconstruction bekommt Rauheit und Metall je Pixel
+    if (upscaler == api.upscaler_dlss_rr) tg.material = devAlloc(n * 8);
+    tg.ray_mask = 0x1;
+    if (coarse_secondary) tg.secondary_mask = 0x2;
+    const n_out: usize = @as(usize, out_w) * out_h;
+    const ldr = devAlloc(n_out * 4);
+    const ldr_fg = devAlloc(n_out * 4);
+    defer for ([_]u64{ tg.hits, tg.motion, tg.color, tg.normal, tg.albedo, ldr, ldr_fg }) |b| {
+        _ = drv.cuMemFree_v2(b);
+    };
+    var post = std.mem.zeroes(api.PostInfo);
+    post.output_ldr = ldr;
+    post.denoise_iterations = denoise;
+    post.exposure = 1.0;
+    post.clamp_sigma = clamp_sigma;
+    post.output_width = out_w;
+    post.upscaler = upscaler;
+    post.output_height = out_h;
+    var fgi = std.mem.zeroes(api.FrameGenInfo);
+    fgi.output_ldr = ldr_fg;
+    var fg_frames: u32 = 0;
+    var prof = [3]f64{ 0, 0, 0 };
+    // Flimmermaß: mittlerer Unterschied aufeinanderfolgender Ausgabebilder über
+    // die letzten Frames. Bei stehender Kamera ist jeder Unterschied Rauschen.
+    var prev_px: []([4]u8) = &.{};
+    var cur_px: []([4]u8) = &.{};
+    defer if (prev_px.len != 0) init.gpa.free(prev_px);
+    defer if (cur_px.len != 0) init.gpa.free(cur_px);
+    var flick_sum: f64 = 0;
+    var flick_n: u64 = 0;
+    var have_prev = false;
+
+    // Kamera fliegt mit 2 Voxeln pro Frame über das Gelände; Ursprung folgt in 1024er-Schritten
+    var cam = std.mem.zeroes(types.Camera);
+    const start = [3]f64{ 100_000, 0, 100_000 };
+    var update_ms: f64 = 0;
+    var update_max: f64 = 0;
+    var st: api.WorldStats = undefined;
+    const total = frames + 1;
+    const t_all = std.Io.Timestamp.now(init.io, .awake);
+    var f: u32 = 0;
+    var warm: u32 = 0;
+    var t_flight = t_all;
+    while (f < total) : (f += 1) {
+        const moved: f64 = if (static_cam) 0 else @floatFromInt(f);
+        const fx = start[0] + moved * 2;
+        const fz = start[2] + moved * 1;
+        const ground = pyrit.pyr_terrain_height(&terrain, fx, fz);
+        const pos = [3]f64{ fx, @max(ground, terrain.sea_level) + 60, fz };
+        const origin = [3]f64{ @floor(pos[0] / 1024) * 1024, 0, @floor(pos[2] / 1024) * 1024 };
+        // Kamera zuerst: die Welt wählt das LOD nach ihrem Bildschirmmaß
+        const eye = [3]f32{ @floatCast(pos[0] - origin[0]), @floatCast(pos[1] - origin[1]), @floatCast(pos[2] - origin[2]) };
+        // Blickrichtung dreht mit `turn` je Frame (Mausblick)
+        const ang = turn * @as(f32, @floatFromInt(f));
+        const dx = 200 * @cos(ang) - 100 * @sin(ang);
+        const dz = 200 * @sin(ang) + 100 * @cos(ang);
+        const target = [3]f32{ eye[0] + dx, eye[1] - 45, eye[2] + dz };
+        const up = [3]f32{ 0, 1, 0 };
+        pyrit.pyr_camera_look_at(&cam, &eye, &target, &up);
+        pyrit.pyr_camera_perspective(&cam, 1.0, w, h, 0.1);
+        var j: [2]f32 = undefined;
+        pyrit.pyr_jitter_halton(f, &j);
+        cam.jitter = j;
+        const t0 = std.Io.Timestamp.now(init.io, .awake);
+        req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
+        const u = msSince(init, t0);
+        req(pyrit.pyr_world_stats(@ptrCast(world), &st));
+        if (coarse_secondary and st.secondary_bias != light.secondary_bias) {
+            light.secondary_bias = st.secondary_bias;
+            req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
+        }
+        if (f == 0) {
+            // Aufwärmen: alles um die Startposition fertig bauen
+            const tw = std.Io.Timestamp.now(init.io, .awake);
+            while (st.pending_chunks > 0 and warm < 400) : (warm += 1) {
+                req(pyrit.pyr_world_wait(@ptrCast(ctx), @ptrCast(world), &pos));
+                req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
+                req(pyrit.pyr_world_stats(@ptrCast(world), &st));
+            }
+            t_flight = std.Io.Timestamp.now(init.io, .awake); // Aufwärmen nicht mitmessen
+            std.debug.print("Welt aufgebaut: {d} Updates, {d:.1} ms, {d} Chunks resident, {d} sichtbar, {d:.1} MiB\n", .{ warm + 1, msSince(init, tw) + u, st.resident_chunks, st.visible_chunks, @as(f64, @floatFromInt(st.bytes)) / (1 << 20) });
+        } else {
+            update_ms += u;
+            update_max = @max(update_max, u);
+
+        }
+        const fi = api.FrameInfo{ .time = @as(f64, @floatFromInt(f)) / 60.0, .origin = origin };
+        const tp0 = std.Io.Timestamp.now(init.io, .awake);
+        req(pyrit.pyr_commit(@ptrCast(ctx), &fi));
+        if (profile) req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+        const tp1 = std.Io.Timestamp.now(init.io, .awake);
+        req(pyrit.pyr_render(@ptrCast(ctx), view, &cam, &tg));
+        if (profile) req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+        const tp2 = std.Io.Timestamp.now(init.io, .awake);
+        req(pyrit.pyr_postprocess(@ptrCast(ctx), view, &tg, &post));
+        if (profile) req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+        const tp3 = std.Io.Timestamp.now(init.io, .awake);
+        if (fg and f >= 2) {
+            req(pyrit.pyr_frame_generate(@ptrCast(ctx), view, &fgi));
+            fg_frames += 1;
+        }
+        if (f > 0) {
+            prof[0] += msSince(init, tp0) - msSince(init, tp1);
+            prof[1] += msSince(init, tp1) - msSince(init, tp2);
+            prof[2] += msSince(init, tp2) - msSince(init, tp3);
+        }
+        // wie eine Anwendung mit Present: höchstens ein Frame im Voraus
+        req(pyrit.pyr_synchronize(@ptrCast(ctx)));
+
+        if (flicker and f + 8 >= total) {
+            const np: usize = @as(usize, out_w) * out_h;
+            if (cur_px.len == 0) {
+                cur_px = try init.gpa.alloc([4]u8, np);
+                prev_px = try init.gpa.alloc([4]u8, np);
+            }
+            cu(drv.cuMemcpyDtoH_v2(cur_px.ptr, ldr, np * 4));
+            if (have_prev) {
+                var sum: f64 = 0;
+                for (cur_px, prev_px) |a, b| {
+                    inline for (0..3) |k| sum += @abs(@as(f64, @floatFromInt(a[k])) - @as(f64, @floatFromInt(b[k])));
+                }
+                flick_sum += sum / @as(f64, @floatFromInt(np * 3));
+                flick_n += 1;
+            }
+            @memcpy(prev_px, cur_px);
+            have_prev = true;
+        }
+    }
+    if (flicker and flick_n > 0) {
+        std.debug.print("Flimmern: {d:.3} mittlerer Unterschied je Kanal zwischen aufeinanderfolgenden Bildern ({d} Paare)\n", .{ flick_sum / @as(f64, @floatFromInt(flick_n)), flick_n });
+    }
+    const all = msSince(init, t_flight);
+    std.debug.print("{d} Frames {d}x{d} -> {d}x{d} im Flug: {d:.2} ms pro Frame gesamt ({d} mit Zwischenbild), Welt-Update Mittel {d:.2} ms, max {d:.2} ms\n", .{ frames, w, h, out_w, out_h, all / @as(f64, @floatFromInt(@max(frames, 1))), fg_frames, update_ms / @as(f64, @floatFromInt(@max(frames, 1))), update_max });
+    const nf: f64 = @floatFromInt(@max(frames, 1));
+    if (profile) std.debug.print("Aufteilung: Commit {d:.2} ms, Rendern {d:.2} ms, Nachbearbeitung {d:.2} ms\n", .{ prof[0] / nf, prof[1] / nf, prof[2] / nf });
+    std.debug.print("Am Ende: {d} Chunks resident, {d} sichtbar, {d} ausstehend, {d:.1} MiB, Ziel {d:.1} px/Voxel, gröbste Stufe {d}, Überläufe {d}\n", .{ st.resident_chunks, st.visible_chunks, st.pending_chunks, @as(f64, @floatFromInt(st.bytes)) / (1 << 20), st.voxel_pixels, st.top_lod, st.overflow_chunks });
+    try savePpm(init, ldr, out_w, out_h, out_path);
+    if (fg_frames > 0) {
+        var buf: [512]u8 = undefined;
+        const fg_path = try std.fmt.bufPrint(&buf, "{s}.fg.ppm", .{out_path});
+        try savePpm(init, ldr_fg, out_w, out_h, fg_path);
+    }
+}

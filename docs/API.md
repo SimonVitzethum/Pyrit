@@ -1,0 +1,281 @@
+# Pyrit – API-Handbuch
+
+Pyrit ist ein GPU-Renderer für Sparse Voxel DAGs. Geometrie besteht nur aus Voxeln, es gibt keine Meshes und keine Vertices. Die Runtime liefert Treffer, Tiefe, exakte Motion Vectors, beleuchtete Farbe und ein fertiges Bild. Alles läuft in CUDA-Puffern der Anwendung, auf Wunsch auf den RT-Cores (OptiX).
+
+Pyrit ist komplett in Zig geschrieben. Zig-Programme nutzen die Module direkt; für C, C++, Rust, Java (FFM) usw. beschreibt `include/pyrit.h` dieselbe ABI. Ein Test prüft, dass Header und Implementierung übereinstimmen.
+
+## Bauen und Testen
+
+| Befehl | Zweck |
+| --- | --- |
+| `zig build --release=fast` | Bibliothek `libpyrit.a` / `libpyrit.so`, Header, PTX |
+| `zig build test` | alle Tests ohne GPU (CPU-Referenzen, ABI, AMD-Übersetzung) |
+| `zig build kernel-check` | PTX mit `ptxas` für sm_120 prüfen (CUDA-Toolkit, keine GPU) |
+| `tools/gpu_free.sh && zig build gpu-test --release=fast` | GPU gegen CPU, Durchsatz – nur bei freier GPU |
+| `zig build render -- --out bild.ppm [--vox datei.vox] [--size 1280x720] [--frames 64] [--no-rt] [--no-gi]` | Bild rendern |
+| `zig build render -- --world [--scale 2] [--fg] [--dlss\|--rr] --size 1920x1080` | Flug über eine gestreamte Welt: Hochskalieren, Frame Generation, DLSS |
+| `zig build -Ddlss-sdk=<pfad>` | mit NVIDIA DLSS (SR und Ray Reconstruction) bauen, siehe „DLSS“ |
+| `zig build optix-abi-test -Doptix-include=<pfad>` | OptiX-Anbindung gegen die Original-Header prüfen |
+
+Voraussetzungen zur Laufzeit: NVIDIA-Treiber (libcuda, für RT-Cores libnvoptix). Zum Bauen genügt Zig 0.16; ein CUDA-SDK ist nicht nötig.
+
+## Ablauf
+
+```zig
+const pyrit = @import("pyrit");   // Host-API (dieselben Funktionen wie pyrit.h)
+const api = pyrit.api;
+const types = pyrit.types;
+
+var ci = std.mem.zeroes(api.CreateInfo);
+ci.struct_size = @sizeOf(api.CreateInfo);
+ci.version = api.version;
+var ctx: ?*anyopaque = null;
+_ = pyrit.pyr_create(&ci, @ptrCast(&ctx));
+
+// Geometrie auf der GPU bauen (Voxelliste, Reihenfolge beliebig)
+var geo: api.Handle = null;
+_ = pyrit.pyr_geometry_build(@ptrCast(ctx), 8, voxels.ptr, count, api.build_host_input | api.build_editable, &geo);
+
+var inst: api.Handle = null;
+_ = pyrit.pyr_instance_create(@ptrCast(ctx), geo, &inst);
+var view: api.Handle = null;
+_ = pyrit.pyr_view_create(@ptrCast(ctx), &view);
+
+// pro Frame
+_ = pyrit.pyr_instance_set_transform(@ptrCast(ctx), inst, &matrix);   // beliebig viele Änderungen
+_ = pyrit.pyr_commit(@ptrCast(ctx), null);                             // neuer Frame
+_ = pyrit.pyr_render(@ptrCast(ctx), view, &camera, &targets);          // Treffer, MV, Farbe
+_ = pyrit.pyr_postprocess(@ptrCast(ctx), view, &targets, &post);       // TAA, Denoiser, Tonemapping
+```
+
+Alle GPU-Arbeit läuft asynchron auf dem Stream des Kontexts (`pyr_cuda_stream`). Eigene Kernel auf demselben Stream sind automatisch richtig geordnet.
+
+**Wichtig bei eigenen Eingabepuffern** (Strahlen, Voxellisten): Den Stream des Kontexts erzeugt Pyrit als nicht blockierend. Er wartet also nicht auf den CUDA-Standard-Stream, und `cuMemcpyHtoD` kann zurückkehren, bevor die Daten auf der GPU sind. Daher entweder `cuMemcpyHtoDAsync(..., pyr_cuda_stream(ctx))` verwenden oder vorher synchronisieren. Alternativ gibt man beim Erzeugen einen eigenen Stream über `PyrCreateInfo.cuda_stream` mit.
+
+## Kontext
+
+`PyrCreateInfo` legt fest:
+- Gerät, optional ein vorhandener CUDA-Kontext und Stream,
+- Kapazitäten (Instanzen, Geometrien, Ansichten, Poolgrößen),
+- Flags:
+
+| Flag | Wirkung |
+| --- | --- |
+| `PYR_CREATE_DEBUG` | synchrone Fehlerprüfung nach jedem Kernel, OptiX-Validierung |
+| `PYR_CREATE_NO_RT` | RT-Cores nie verwenden |
+| `PYR_CREATE_FORCE_RT` | RT-Cores immer verwenden |
+
+Ohne Flag entscheidet Pyrit selbst:
+- **Mit Shading** (Farbe, Normale oder Albedo angefordert) laufen `pyr_render` und `pyr_trace` immer auf den RT-Cores.
+- **Ohne Shading** erst ab 16 Instanzen; darunter ist die CUDA-Traversierung schneller.
+
+`pyr_features` meldet `PYR_FEATURE_RT_CORES`, `pyr_get_stats` Poolbelegung und Anzahlen. Fehler liefern einen `PyrResult`, die Details stehen in `pyr_error_message()` (thread-lokal).
+
+## Geometrie
+
+Eine Geometrie ist ein Würfel aus 2^log2_size Voxeln pro Kante, mit log2_size zwischen 3 und 20. Im Objektraum ist ein Voxel 1 groß.
+
+| Weg | Funktion | Wo |
+| --- | --- | --- |
+| Voxelliste → DAG | `pyr_geometry_build` | **GPU**: Sortieren, Deduplizieren, Knotenebenen, RT-Primitive |
+| Voxel ändern | `pyr_geometry_edit` (Attribut 0 = entfernen) | **GPU**: Neubau aus der gespeicherten Voxelliste |
+| DAG auf der CPU bauen | `pyr_dag_build_dense/points/fn` + `pyr_geometry_create` | CPU, dann Upload |
+| Datei laden | `pyr_vox_parse` (MagicaVoxel), `pyr_dag_load` | Datei auf der CPU, Bau auf der GPU |
+| Speichern | `pyr_geometry_download` + `pyr_dag_save` | |
+
+- **Voxelformat:** `PyrVoxel {x, y, z, attribute}`. Doppelte Koordinaten sind erlaubt, der letzte Eintrag gewinnt.
+- **Eingabe:** `pyr_geometry_build` erwartet einen Gerätezeiger. Mit `PYR_BUILD_HOST_INPUT` darf es ein Host-Zeiger sein. `PYR_BUILD_EDITABLE` behält die Voxelliste auf der GPU, damit später `pyr_geometry_edit` möglich ist.
+- **Messung** (128³-Szene, 312 000 Voxel, RTX 5070 Laptop, GPU ohne Last): 2,7 ms für den Bau inklusive Upload und GAS; eine Änderung mit 90 000 Einträgen dauert 2,1 ms.
+- **Zwischenspeicher:** Der Bau braucht rund 115 Byte je Voxel, nur während des Baus. Er kommt stream-geordnet aus dem CUDA-Speicherpool (`cuMemAllocAsync`) und hält nichts dauerhaft fest.
+- **LOD:** `pyr_geometry_downsample(ctx, geo, shift, flags, &lod)` baut auf der GPU eine Fassung mit 2^shift-fach gröberer Auflösung; je grober Zelle bleibt das oberste Voxel. Für dieselbe Weltgröße skaliert man die Instanz um 2^shift. Große Welten entstehen so: Chunks als Geometrien, Instanzen auf einem Gitter, und je nach Entfernung wechselt man mit `pyr_instance_set_geometry` zwischen den Detailstufen.
+- **Freigabe:** Geänderte oder gelöschte Geometrien werden erst nach dem nächsten `pyr_commit` freigegeben, weil der alte Zustand bis dahin noch gerendert werden kann.
+
+## Instanzen und Frames
+
+Eine Instanz ist eine Geometrie mit Transformation (3×4, Objekt → Welt), Maske und Benutzerwert. Ihr Index ist über ihre ganze Lebensdauer stabil, er erscheint in `PyrHit.instance`.
+
+- Änderungen werden mit `pyr_commit` aktiv. Der alte Zustand wird dann zum Vorframe und liefert die Motion Vectors.
+- `pyr_instance_reset_history` markiert einen Teleport. Die Treffer tragen dann `PYR_HIT_NEW`, und der Motion Vector kommt nur aus der Kamerabewegung.
+- **Masken:** Auf den RT-Cores wirken nur die unteren 8 Bits.
+
+## Rendern
+
+`pyr_render(ctx, view, camera, targets)`: Die Ansicht merkt sich ihre Kamera vom Vorframe.
+
+| Ziel in `PyrTargets` | Inhalt |
+| --- | --- |
+| `hits` | `PyrHit` (t, Instanz, Attribut, Fläche und Flags) |
+| `depth` | lineare Tiefe entlang der Blickachse |
+| `motion` | Motion Vector in Pixeln: Position im Vorframe − jetzt, ohne Jitter, exakt pro Pixel |
+| `color` | lineare HDR-Farbe; a = 1 bei Treffer, 0 bei Himmel |
+| `normal` | Weltnormale, w = lineare Tiefe |
+| `albedo` | Albedo |
+| `transparent_mask` | Instanzmaske der transparenten Ebene (Wasser, Glas), siehe unten |
+
+Nicht benötigte Ziele bleiben 0. Shading wird nur berechnet, wenn `color`, `normal` oder `albedo` gesetzt ist.
+
+**Transparenz:** Durchsichtig ist, was entweder über die Instanzmaske (`(mask & transparent_mask) != 0`) oder über das Material (`PYR_MATERIAL_TRANSPARENT`) gekennzeichnet ist. Die Material-Variante braucht keine eigene Instanz: Wasser kann in derselben Chunk-Geometrie wie der Boden liegen – die Traversierung überspringt solche Voxel für Primär- und Schattenstrahlen (`PYR_TRACE_SKIP_TRANSPARENT`). Bis zu `PYR_MAX_TRANSPARENT_LAYERS` (4) Körper hintereinander werden je Pixel verfolgt:
+- **Eintritt:** Fresnel-Reflexion (`ior`), Deckkraft der Oberfläche (`opacity`), mit `PYR_MATERIAL_REFRACT` Brechung nach Snell.
+- **Im Körper:** Absorption `base_color` hoch `density · Strecke` bis zum echten Austritt (die Traversierung findet den Übergang in leere Voxel).
+- **Austritt:** Fresnel-Transmission und Rückbrechung; eine Glasscheibe versetzt den Strahl also parallel. Liegt ein Körper auf dem Untergrund (Wasser auf Boden), endet das Medium dort.
+- Ohne `PYR_MATERIAL_REFRACT` läuft der Strahl gerade hindurch (dünne Scheiben, Laub).
+- **Medium:** Eine eigene Instanz endet dort, wo ihre Voxel enden; ein nur über das Material markierter Körper reicht bis zum Untergrund – genau richtig für Wasser über Grund.
+- **Schatten:** Durchsichtige Körper blockieren Schattenstrahlen nicht, sondern tönen sie (Deckkraft und Absorption). Unter Wasser liegt damit blaues Licht statt Schwarz.
+- **Wellen:** `PYR_MATERIAL_WAVES` stört die Normale zeitabhängig (`wave_height`, `wave_length`, `wave_speed`). Die Geometrie bleibt stehen, Treffer, Tiefe und Motion Vectors bleiben exakt.
+- Treffer, Tiefe, Motion Vectors und Denoiser-Puffer beziehen sich auf den undurchsichtigen Untergrund. Schatten- und GI-Strahlen ignorieren transparente Körper.
+
+**Kamera:** `pyr_camera_look_at`, `pyr_camera_perspective`, `pyr_camera_orthographic`. Für TAA liefert `pyr_jitter_halton(frame)` den Subpixel-Versatz, der in `camera.jitter` gehört.
+
+## Materialien und Licht
+
+**Voxelattribut:** Bits 0..7 sind der Materialindex, Bits 8..31 die Farbe `0xRRGGBB` (sRGB).
+- Erzeugen mit `pyr_voxel_attribute(material, r, g, b)` oder `PYR_VOXEL(...)`.
+- Attribut 0 heißt „leer“.
+
+**Materialien:** 256 Stück über `pyr_material_set`.
+- Felder: Grundfarbe, Rauheit, Metall, Emission.
+- Mit `PYR_MATERIAL_VOXEL_COLOR` wird die Grundfarbe mit der Voxelfarbe multipliziert; das ist der Standard.
+
+**Licht:** `pyr_set_lighting`, Voreinstellung über `pyr_lighting_default`.
+- Sonne mit Winkelradius für weiche Schatten
+- Himmel: Zenit, Horizont, Boden
+- bis zu 16 Punktlichter als Kugeln mit Radius
+- Flags `PYR_LIGHTING_SHADOWS`, `_GI` (eine indirekte Reflexion), `_AO` (günstigere Alternative zu GI), `_SUN_DISK`, `_REFLECTIONS` (Reflexionsstrahlen für Oberflächen mit Rauheit < 0,5, gestreut nach Rauheit)
+
+- `gi_distance` begrenzt die Reichweite der indirekten Strahlen (0 = unbegrenzt); darüber zählt der Himmel: 64 Voxel sparen rund 20 % Renderzeit bei etwa 1 % Bildunterschied.
+- `PYR_LIGHTING_GI_HALF` rechnet die indirekte Beleuchtung in halber Auflösung (ein Strahl je 2x2-Block, wandernder Abtastpunkt) und skaliert sie kantenbewusst hoch: **halbe Renderzeit, aber deutlich mehr Flimmern**. Ein Strahl versorgt vier Pixel, das Rauschen ist damit über den 2x2-Block korreliert – räumlich kaum wegzufiltern und zeitlich nur langsam wegzumitteln. Gemessen bei *stehender* Kamera als mittlerer Unterschied aufeinanderfolgender Bilder: 0,89 gegen 0,28 bei voller Auflösung (Faktor 3,2). In einem Standbild sieht man davon nichts, im laufenden Bild sehr wohl. Standard im Betrachter ist daher volle Auflösung; halbe Auflösung lohnt, wo Renderzeit wichtiger ist als Ruhe im Bild. Braucht die Ziele `color`, `normal`, `albedo` und `hits`.
+- `secondary_bias` versetzt Schatten-, GI- und Reflexionsstrahlen entlang der Normale, anteilig zur Trefferentfernung – nötig bei `PyrTargets.secondary_mask`.
+
+Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über dieselbe Strahlverfolgung wie die Primärstrahlen.
+
+## Nachbearbeitung, Hochskalieren, DLSS, Frame Generation
+
+`pyr_postprocess(ctx, view, targets, post)` läuft vollständig auf der GPU:
+1. **Temporal:** Die Beleuchtung wird mit den Motion Vectors reprojiziert und über Normale und Tiefe auf Gültigkeit geprüft (Rauschreduktion für GI). `clamp_sigma` (typisch 1,5) begrenzt Geisterbilder.
+2. **À-trous-Denoiser, varianzgeführt:** `denoise_iterations` Schritte (typisch 3–5), kantenerhaltend über Normale, Tiefe und Helligkeit. Die Helligkeitstoleranz kommt aus der *gemessenen* Varianz: die Akkumulation führt die Momente der Helligkeit mit (zeitlich, in den ersten Frames räumlich geschätzt), der Filter glättet sie 3x3 und filtert sie mit quadrierten Gewichten mit. Dadurch wird verrauschtes Gebiet geglättet, statt sein Rauschen für Kanten zu halten – vor allem auf dunklen, indirekt beleuchteten Flächen und bei bewegter Kamera, wo nur wenige Frames akkumuliert sind. `denoise_phi` steuert die Stärke (0 = 4; kleiner = glatter, größer = mehr Details und mehr Rauschen). Gefiltert wird die Beleuchtung ohne Albedo, damit Voxelfarben scharf bleiben.
+   Gemessen (CPU-Test, 5 akkumulierte Frames, dunkle Fläche mit Einzelsample-Rauschen): Restrauschen 0,0026 → 0,0013 bei zugleich besser erhaltener Kante (Sprunghöhe 0,60 → 0,90 der echten Kante).
+3. **Upscaler** (`post.upscaler`), Ausgabe in `output_width × output_height` (0 = Renderauflösung):
+
+| Upscaler | Verfahren |
+| --- | --- |
+| `PYR_UPSCALER_AUTO` / `_TAAU` | eigenes TAAU: gejitterte Samples an ihrer echten Subpixelposition rekonstruiert, Verlauf per Catmull-Rom, Varianzbegrenzung in YCoCg, MV des vordersten Nachbarn. Bei Faktor 1 gewöhnliches TAA. Bis 4× |
+| `PYR_UPSCALER_DLSS` | NVIDIA DLSS Super Resolution hinter dem eigenen Denoiser |
+| `PYR_UPSCALER_DLSS_RR` | NVIDIA DLSS Ray Reconstruction: ersetzt Denoiser und TAA; bekommt verrauschte Farbe, Albedo, Normalen, Tiefe, MVs sowie Rauheit und spiegelnde Albedo (dafür das Ziel `material` setzen) |
+| `PYR_UPSCALER_NONE` | nur Renderauflösung, ohne TAAU |
+
+4. **Tonemapping:** ACES, Reinhard oder keines. Ausgabe als HDR (`output_hdr`) und/oder RGBA8 sRGB (`output_ldr`).
+
+Für TAAU und DLSS gehört pro Frame ein Jitter in die Kamera (`pyr_jitter_halton(frame)` → `camera.jitter`). Die Verlaufspuffer gehören der Ansicht. `PYR_POST_RESET` verwirft den Verlauf, etwa bei einem Kameraschnitt.
+
+**Frame Generation** (`pyr_frame_generate(ctx, view, &info)`), reines CUDA: Nach `pyr_postprocess` von Frame N entsteht ein Zwischenbild zwischen N−1 und N (`info.t`, Standard 0,5; für mehrere Zwischenbilder mehrfach mit 1/3, 2/3 …). Grundlage sind die exakten Motion Vectors und die Tiefe: Jedes Pixel wirft seinen Bewegungsvektor in das Zwischenbild (die kleinste Tiefe gewinnt, also die richtige Verdeckung); wo nichts ankommt, sucht ein Fixpunktverfahren. Das Zwischenbild wird vor Frame N angezeigt. Eigene Verfahren hängt man über `info.generate` ein: Pyrit ruft die Funktion mit allen Eingaben (`PyrFrameGenParams`: beide Frames in HDR, MV und Tiefe in Ausgabeauflösung) und dem Stream auf. Funktioniert hinter TAAU und hinter DLSS. DLSS-FG selbst ist ohne D3D12/Vulkan nicht nutzbar.
+
+**DLSS einbinden:** Das SDK (github.com/NVIDIA/DLSS) wird nicht mitgeliefert. `zig build -Ddlss-sdk=<pfad>` übersetzt die NGX-Header beim Bauen und linkt `libnvsdk_ngx.a` (braucht libstdc++ des Systems). Zur Laufzeit sucht NGX `libnvidia-ngx-dlss*.so` im SDK-Verzeichnis `lib/Linux_x86_64/rel`, in `$PYRIT_DLSS_PATH` oder im Programmverzeichnis; für die Auslieferung gelten die Lizenzbedingungen des SDK. Ohne DLSS-Build liefern die DLSS-Upscaler `PYR_ERROR_NOT_FOUND`.
+
+**Messung** (RTX 5070 Laptop, Flug über die gestreamte Welt mit Schatten + GI, Ausgabe 1920×1080):
+
+| Einstellung | ms pro Frame |
+| --- | --- |
+| nativ 1080p, TAA | 14,8 |
+| nativ mit `PYR_LIGHTING_GI_HALF` | 9,6 |
+| 960×540 → 1080p, TAAU | 5,3 |
+| dazu ein Zwischenbild je Frame (FG) | 6,1 für 2 angezeigte Bilder |
+| 960×540 → 1080p, DLSS SR | 8,9 |
+| 960×540 → 1080p, DLSS Ray Reconstruction | 12,0 |
+
+## Große Welten
+
+Eine Welt streamt Chunks um die Kamera: nah fein, fern grob (Octree über LOD-Stufen). Jeder Chunk hat 2^`chunk_log2` Voxel pro Kante; auf Stufe l ist ein Voxel 2^l Grundvoxel groß.
+
+```zig
+var wi = std.mem.zeroes(api.WorldInfo);   // Standard: 32³-Chunks, 8 Stufen, eingebautes Gelände
+var world: ?*anyopaque = null;
+_ = pyrit.pyr_world_create(ctx, &wi, &world);
+// pro Frame
+_ = pyrit.pyr_world_update(ctx, world, &kamera_welt, &origin);   // wartet nie auf die GPU
+_ = pyrit.pyr_commit(ctx, &.{ .time = t, .origin = origin });
+```
+
+- **Erzeugung auf der GPU:** Ein Generator-Kernel schreibt die Voxel eines Chunks direkt in der Auflösung seiner Stufe und nur die sichtbare Haut, nie ein volles Volumen. Eingebaut ist ein Höhenfeld-Gelände (`PyrTerrainInfo`, Höhe abfragbar mit `pyr_terrain_height`) mit Wasser bis `sea_level` (`attr_water`, Material mit `PYR_MATERIAL_TRANSPARENT`) und Bäumen (`attr_leaves`, `attr_wood`, `tree_density`). Eigene Generatoren setzen `info.generate`: Pyrit übergibt je Batch die Chunk-Schlüssel und Ausgabepuffer (`PyrWorldGenParams`) und den Stream.
+- **Bau:** Bis zu `chunks_per_update` Chunks entstehen in einem GPU-DAG-Bau (Teilbäume batchweit dedupliziert), alle GAS ohne Synchronisation. Erzeugen und Bauen laufen auf einem eigenen Thread und CUDA-Stream.
+- **Übergänge:** Grobe Chunks bleiben sichtbar, bis alle feineren fertig sind; es entstehen keine Löcher. Neue Chunks übernehmen den Verlauf von TAA und Denoiser (`PYR_INSTANCE_KEEP_HISTORY`).
+- **Speicher:** Nicht mehr gebrauchte Chunks werden nach `keep_frames` freigegeben. Leere Bereiche kosten nichts. Das Standardgelände mit etwa 20 000 Voxeln Sichtweite belegt rund 11 MiB.
+- **Genauigkeit:** Die Welt rechnet in f64 und legt Instanzen relativ zum Render-Ursprung ab. Diesen Ursprung in großen Schritten mitführen, zum Beispiel alle 1024 Voxel.
+- `pyr_world_wait` wartet auf den laufenden Batch (Ladebildschirm, Teleport). `PYR_WORLD_SYNC` baut ohne Thread.
+- **Messung:** 1063 Chunks in 114 ms aufgebaut; im Flug kostet das Update im Mittel 0,3 ms auf dem Hauptthread.
+
+## Animation
+
+**Starre Bewegung:** `pyr_instance_set_transform` genügt. Die Motion Vectors sind exakt.
+
+**Wasser und Laub** bewegen sich über `PYR_MATERIAL_WAVES` (zeitabhängige Normale), ohne dass sich Geometrie ändert.
+
+**Skelette mit Voxel-Teilen** laufen vollständig auf der GPU:
+
+```zig
+_ = pyrit.pyr_skeleton_create(ctx, &bones, n, &skel);     // Knochen: Eltern, Voxel-Teil, Ruhelage
+_ = pyrit.pyr_clip_create(ctx, skel, &keys, k, 2.0, PYR_CLIP_LOOP, &clip);
+_ = pyrit.pyr_actor_create(ctx, skel, &.{ .root = lage, .clip = clip, .speed = 1, ... }, &actor);
+// danach kein Aufruf pro Frame nötig: pyr_commit spielt ab
+```
+
+- Bei jedem `pyr_commit` rechnet ein Kernel für jeden Knochen aller Akteure die Lage aus der Szenenzeit. Dabei werden Keyframes interpoliert (Slerp), zwei Clips überblendet (`blend_clip`, `blend`) und die Kette bis zur Wurzel multipliziert. Das Ergebnis (Transformation, Inverse, AABB) schreibt der Kernel direkt in die Instanzen.
+- Der Vorframe liegt im zweiten Instanzpuffer, deshalb sind die Motion Vectors exakt. Auf den RT-Cores wird die IAS nur nachgeführt (Refit).
+- `pyr_actor_set` wechselt Clip, Überblendung, Lage, Maske oder Benutzerwert; `pyr_skeleton_destroy` und `pyr_clip_destroy` geben sie frei, sobald keine Akteure mehr darauf laufen.
+- **Messung:** 2000 Akteure mit je 3 Teilen kosten 0,09 ms pro `pyr_commit`, einschließlich IAS-Refit.
+
+**Voxel ändern:** `pyr_geometry_edit` baut auf der GPU neu. Mit dem Wechsel der Geometrie ändert sich die Vorgeschichte. Für Daumenkino-Animation schaltet `pyr_instance_set_geometry` zwischen Geometrien um.
+
+## Strahlen
+
+`pyr_trace(ctx, rays, hits, count, mask, flags)` nimmt `PyrRay[count]` als Gerätezeiger.
+
+| Flag | Wirkung |
+| --- | --- |
+| `PYR_TRACE_ANY_HIT` | der erste gefundene Treffer genügt (Schatten, Sichtbarkeit) |
+| `PYR_TRACE_NO_ATTRIBUTE` | spart die Attributbestimmung |
+| `PYR_TRACE_EXTENDED` | schreibt `PyrHitEx` mit Voxelkoordinate, Weltposition und Weltnormale, z. B. für Picking im Editor |
+
+## Eigene GPU-Kernel (Zig)
+
+Das Modul `pyrit_device` enthält Traversierung, Szene, Shading-Bausteine und Nachbearbeitung. Derselbe Code läuft auf CPU, NVIDIA (nvptx64) und AMD (amdgcn).
+
+```zig
+const pyr = @import("pyrit_device");
+
+export fn schatten(scene: *const pyr.Scene, ...) callconv(.nvptx_kernel) void {
+    const hit = pyr.trace(scene, ray, 0xFFFF_FFFF, pyr.trace_any_hit | pyr.trace_no_attribute);
+    const lit = hit.instance == pyr.no_hit;
+}
+```
+
+Den Szenenzeiger liefert `pyr_scene_device`. Er bleibt über alle Frames gleich, sein Inhalt wird bei `pyr_commit` in Stream-Reihenfolge aktualisiert. In eigenen Kerneln läuft die Traversierung auf den CUDA-Kernen.
+
+## Leistung
+
+Gemessen mit RTX 5070 Laptop bei 1920×1080, eine Geometrie mit 128³ Voxeln:
+
+| Szene | Nur Primärstrahlen | Volle Pipeline (Schatten, GI, TAA, Denoiser) |
+| --- | --- | --- |
+| 3 Instanzen | 0,8 ms | 10 ms |
+| 1000 Instanzen | 6,1 ms | 31 ms |
+
+Die Messungen der vollen Pipeline stammen aus einem Lauf ohne fremde GPU-Last. Die RT-Cores sind bei vielen Instanzen und bei Sekundärstrahlen deutlich schneller. Sie werden automatisch gewählt, siehe Abschnitt „Kontext“.
+
+**Flug über die gestreamte Welt, 1920×1080, Schatten + GI, 8 px je Voxel** (Anteile einzeln gemessen):
+
+| Einstellung | Rendern | Nachbearbeitung | gesamt je Frame |
+| --- | --- | --- | --- |
+| Standard | 10,7 ms | 2,8 ms | 14,8 ms |
+| `gi_distance = 64` | 8,4 ms | 2,8 ms | 12,5 ms |
+| zusätzlich grobe Fassung für Sekundärstrahlen | 7,6 ms | 2,8 ms | 11,7 ms |
+| 960×540 → 1080p (TAAU) | – | – | 5,3 ms |
+
+Der GI-Bounce macht etwa die Hälfte der Renderzeit aus (ohne GI: 5,4 ms). Die Nachbearbeitung besteht aus temporaler Akkumulation (~1,2 ms), À-trous (0,67 ms je Schritt) und TAAU mit Tonemapping.
+
+## Grenzen
+
+- **Transparenz:** Schatten- und GI-Strahlen sehen transparente Körper nicht; innere Totalreflexion wird angenähert (der Strahl läuft gerade weiter).
+- **Animation:** Knochen sind starr; weiche Verformung gibt es nur als Normalenstörung (`PYR_MATERIAL_WAVES`), nicht als echte Voxelverschiebung.
+- **DLSS Ray Reconstruction:** Jitter- und Matrixkonventionen sind nicht gegen eine NVIDIA-Referenz geprüft.
+- **DLSS Frame Generation:** braucht D3D12 oder Vulkan, daher die eigene CUDA-Frame-Generation.
+- **ROCm/HIP:** Die Kernel übersetzen bereits, die Laufzeitseite fehlt.

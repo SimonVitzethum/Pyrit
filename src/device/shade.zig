@@ -1,0 +1,602 @@
+//! Shading: Materialien, Sonne, Punktlichter, Emission, Himmel, Schatten,
+//! eine indirekte Reflexion (GI) oder Umgebungsverdeckung.
+//!
+//! Die Strahlverfolgung kommt über `tracer` (CUDA-Traversierung oder
+//! RT-Cores); derselbe Code läuft auf CPU und GPU.
+//!
+//! Konvention: Lambert-Anteil = Albedo · E · (n·l). Die Intensitäten in
+//! `Lighting` sind also bereits durch π geteilt; Glanz (GGX) wird passend
+//! mit π multipliziert.
+
+const std = @import("std");
+const types = @import("types.zig");
+const vec = @import("vec.zig");
+const tr = @import("trace.zig");
+const dag = @import("dag.zig");
+const fm = @import("fmath.zig");
+const Vec3 = vec.Vec3;
+const splat = vec.splat;
+
+const pi: f32 = std.math.pi;
+
+// ---------------------------------------------------------------------------
+// Zufallszahlen (PCG-Hash), reproduzierbar pro Pixel und Frame
+// ---------------------------------------------------------------------------
+
+pub const Rng = struct {
+    state: u32,
+
+    pub fn init(x: u32, y: u32, frame: u32, salt: u32) Rng {
+        return .{ .state = hash(x *% 1973 +% hash(y *% 9277 +% hash(frame *% 26699 +% salt))) };
+    }
+
+    pub fn hash(v: u32) u32 {
+        const state = v *% 747796405 +% 2891336453;
+        const word = ((state >> @intCast((state >> 28) + 4)) ^ state) *% 277803737;
+        return (word >> 22) ^ word;
+    }
+
+    pub fn next(self: *Rng) f32 {
+        self.state = hash(self.state);
+        return @as(f32, @floatFromInt(self.state >> 8)) * (1.0 / 16777216.0);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Attribute und Materialien
+// ---------------------------------------------------------------------------
+
+/// Farbe eines Attributs (0xRRGGBB in Bits 8..31), sRGB -> linear
+pub fn attributeColor(attribute: u32) Vec3 {
+    const c = Vec3{
+        @floatFromInt((attribute >> 24) & 0xFF),
+        @floatFromInt((attribute >> 16) & 0xFF),
+        @floatFromInt((attribute >> 8) & 0xFF),
+    } * splat(1.0 / 255.0);
+    return srgbToLinear(c);
+}
+
+pub fn srgbToLinear(c: Vec3) Vec3 {
+    // genau genug und schnell: c^2.2
+    return .{ fm.pow(@max(c[0], 1e-8), 2.2), fm.pow(@max(c[1], 1e-8), 2.2), fm.pow(@max(c[2], 1e-8), 2.2) };
+}
+
+pub const Surface = struct {
+    albedo: Vec3,
+    emission: Vec3,
+    roughness: f32,
+    metallic: f32,
+};
+
+pub fn surface(s: *const types.Scene, attribute: u32) Surface {
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    const m = &mats[attribute & 0xFF];
+    var albedo: Vec3 = m.base_color;
+    if (m.flags & types.material_voxel_color != 0) albedo *= attributeColor(attribute);
+    return .{ .albedo = albedo, .emission = m.emission, .roughness = @max(m.roughness, 0.02), .metallic = m.metallic };
+}
+
+// ---------------------------------------------------------------------------
+// Himmel
+// ---------------------------------------------------------------------------
+
+pub fn sky(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
+    const zen: Vec3 = l.sky_zenith;
+    const hor: Vec3 = l.sky_horizon;
+    const gnd: Vec3 = l.ground_color;
+    var c: Vec3 = undefined;
+    if (d[1] >= 0) {
+        const t = @sqrt(@min(d[1], 1.0));
+        c = hor + (zen - hor) * splat(t);
+    } else {
+        const t = @sqrt(@min(-d[1], 1.0));
+        c = hor + (gnd - hor) * splat(t);
+    }
+    c *= splat(l.sky_intensity);
+    if (with_sun and l.flags & types.lighting_sun_disk != 0) {
+        const sd = vec.normalize(l.sun_direction);
+        const cos_r = fm.cos(l.sun_angular_radius);
+        if (vec.dot(d, sd) > cos_r) {
+            const r = @max(l.sun_angular_radius, 1e-3);
+            c += @as(Vec3, l.sun_color) * splat(1.0 / (pi * r * r));
+        }
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// Hilfen
+// ---------------------------------------------------------------------------
+
+fn cross(a: Vec3, b: Vec3) Vec3 {
+    return .{ a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+}
+
+/// Orthonormalbasis um n (Duff et al. 2017)
+fn basis(n: Vec3) [2]Vec3 {
+    const sign: f32 = if (n[2] >= 0) 1 else -1;
+    const a = -1.0 / (sign + n[2]);
+    const b = n[0] * n[1] * a;
+    return .{
+        .{ 1.0 + sign * n[0] * n[0] * a, sign * b, -sign * n[0] },
+        .{ b, sign + n[1] * n[1] * a, -n[1] },
+    };
+}
+
+fn cosineSample(n: Vec3, rng: *Rng) Vec3 {
+    const r1 = rng.next();
+    const r2 = rng.next();
+    const r = @sqrt(r1);
+    const phi = 2.0 * pi * r2;
+    const t = basis(n);
+    return vec.normalize(t[0] * splat(r * fm.cos(phi)) + t[1] * splat(r * fm.sin(phi)) + n * splat(@sqrt(@max(0, 1 - r1))));
+}
+
+/// Richtung innerhalb eines Kegels um d (Halbwinkel mit tan = spread)
+fn coneSample(d: Vec3, spread: f32, rng: *Rng) Vec3 {
+    if (spread <= 0) return d;
+    const r = spread * @sqrt(rng.next());
+    const phi = 2.0 * pi * rng.next();
+    const t = basis(d);
+    return vec.normalize(d + t[0] * splat(r * fm.cos(phi)) + t[1] * splat(r * fm.sin(phi)));
+}
+
+/// Wellen: zwei gekreuzte Sinuszüge stören die Normale (Wasser). Ableitung
+/// der Höhenfunktion, daher exakt für die Spiegelung.
+pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3) Vec3 {
+    const wl = @max(m.wave_length, 1e-3);
+    const k = 6.2831853 / wl;
+    const t: f32 = @floatCast(s.time);
+    const ph = k * m.wave_speed * wl * t;
+    // Höhe h(x, z) = A · (sin(k·x + φ) + sin(0.7·k·(x + z) + 1.3·φ))
+    const a = m.wave_height;
+    const dhdx = a * k * (fm.cos(k * p[0] + ph) + 0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
+    const dhdz = a * k * (0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
+    // Störung senkrecht zur Fläche
+    var t1 = Vec3{ 1, 0, 0 };
+    if (@abs(n[0]) > 0.9) t1 = .{ 0, 1, 0 };
+    const b1 = vec.normalize(vec.cross(n, t1));
+    const b2 = vec.cross(n, b1);
+    return vec.normalize(n - b1 * splat(dhdx) - b2 * splat(dhdz));
+}
+
+pub fn worldNormal(inst: *const types.InstanceData, face: u32) Vec3 {
+    const f = face & types.hit_face_mask;
+    const sign: f32 = if (f & 1 != 0) -1 else 1;
+    const axis = f >> 1;
+    const n = Vec3{ if (axis == 0) sign else 0, if (axis == 1) sign else 0, if (axis == 2) sign else 0 };
+    return vec.normalize(vec.xformNormal(&inst.world_to_object, n));
+}
+
+/// Weltgröße eines Voxels (für den Versatz von Folgestrahlen)
+pub fn voxelSize(inst: *const types.InstanceData) f32 {
+    const m = &inst.object_to_world;
+    return vec.length(.{ m[0], m[4], m[8] });
+}
+
+/// Lambert + GGX, bereits mit π multipliziert (siehe Konvention oben)
+fn brdf(n: Vec3, v: Vec3, l: Vec3, sf: *const Surface) Vec3 {
+    const ndl = @max(vec.dot(n, l), 0);
+    const ndv = @max(vec.dot(n, v), 1e-4);
+    const h = vec.normalize(v + l);
+    const ndh = @max(vec.dot(n, h), 0);
+    const vdh = @max(vec.dot(v, h), 0);
+    const a = sf.roughness * sf.roughness;
+    const a2 = a * a;
+    const dd = ndh * ndh * (a2 - 1) + 1;
+    const d = a2 / (pi * dd * dd);
+    const k = a * 0.5;
+    const vis = 1.0 / (4.0 * (ndl * (1 - k) + k) * (ndv * (1 - k) + k));
+    const f0 = splat(0.04) + (sf.albedo - splat(0.04)) * splat(sf.metallic);
+    const q = 1 - vdh;
+    const fw = q * q * q * q * q;
+    const f = f0 + (splat(1) - f0) * splat(fw);
+    const spec = f * splat(@min(d * vis * pi, 64));
+    return sf.albedo * splat(1 - sf.metallic) + spec;
+}
+
+fn occluded(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: f32, mask: u32) bool {
+    // durchsichtige Voxel halten kein Licht auf; ihre Tönung rechnet transmission()
+    return tracer.trace(s, o, d, 0, tmax, mask, types.trace_any_hit | types.trace_skip_transparent) != null;
+}
+
+/// Gibt es überhaupt durchsichtige Instanzen oder Materialien?
+pub inline fn anyTransparent(s: *const types.Scene, trans_mask: u32) bool {
+    if (trans_mask != 0) return true;
+    return (s.transparent_materials[0] | s.transparent_materials[1] |
+        s.transparent_materials[2] | s.transparent_materials[3]) != 0;
+}
+
+/// Ist dieser Treffer durchsichtig – über die Instanzmaske oder das Material?
+pub inline fn hitTransparent(s: *const types.Scene, h: tr.TraceHit, trans_mask: u32) bool {
+    if (trans_mask != 0 and tr.instances(s)[h.instance].mask & trans_mask != 0) return true;
+    if (s.materials == 0) return false;
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    return mats[h.attribute & 0xFF].flags & types.material_transparent != 0;
+}
+
+/// Durchlässigkeit transparenter Körper entlang eines Schattenstrahls:
+/// je Grenzfläche (1 − Deckkraft) und Absorption im Medium bis zum Austritt.
+/// Damit werfen Wasser und Glas getönte Schatten statt gar keiner.
+/// Ergebnis eines Strahls, der durch durchsichtige Körper läuft
+pub const ThroughHit = struct {
+    /// erster undurchsichtiger Treffer (null = keiner)
+    hit: ?tr.TraceHit,
+    /// Abschwächung durch die durchquerten Körper
+    att: Vec3,
+};
+
+/// Ein Durchlauf statt zwei: läuft bis zum ersten undurchsichtigen Treffer und
+/// sammelt dabei die Abschwächung der durchsichtigen Körper ein. Ohne
+/// Transparenz in der Szene ist das ein gewöhnlicher Strahl.
+pub fn traceThrough(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmin: f32, tmax: f32, ray_mask: u32, trans_mask: u32) ThroughHit {
+    if (!anyTransparent(s, trans_mask)) {
+        return .{ .hit = tracer.trace(s, o, d, tmin, tmax, ray_mask, 0), .att = splat(1) };
+    }
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    var att = splat(@as(f32, 1));
+    var t0 = tmin;
+    var layer: u32 = 0;
+    while (layer < types.max_transparent_layers + 1) : (layer += 1) {
+        const h = tracer.trace(s, o, d, t0, tmax, ray_mask, 0) orelse return .{ .hit = null, .att = att };
+        if (!hitTransparent(s, h, trans_mask)) return .{ .hit = h, .att = att };
+        const inst = &tr.instances(s)[h.instance];
+        const m = &mats[h.attribute & 0xFF];
+        const sf = surface(s, h.attribute);
+        const eps = 1e-3 * voxelSize(inst);
+        att *= splat(1 - m.opacity);
+        const own = trans_mask != 0 and inst.mask & trans_mask != 0;
+        const rest = tmax - h.t;
+        var len = rest;
+        if (own) {
+            const g = tr.dagOf(s, &tr.geometries(s)[inst.geometry]);
+            const pin = o + d * splat(h.t + eps);
+            const oo = vec.xformPoint(&inst.world_to_object, pin);
+            const od = vec.xformVector(&inst.world_to_object, d);
+            if (dag.traceExit(&g, oo, od, 0, @min(rest, 1e6))) |e| len = e.t;
+        }
+        if (m.density > 0) att *= absorb(sf.albedo, m.density * @min(len, 1e4));
+        if (@reduce(.Max, att) < 1e-3) return .{ .hit = h, .att = splat(0) };
+        t0 = h.t + (if (own) len else 0) + eps;
+        if (!(t0 < tmax)) return .{ .hit = null, .att = att };
+    }
+    return .{ .hit = null, .att = att };
+}
+
+fn transmission(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: f32, ray_mask: u32, trans_mask: u32) Vec3 {
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    var att = splat(@as(f32, 1));
+    var t0: f32 = 0;
+    var layer: u32 = 0;
+    while (layer < types.max_transparent_layers) : (layer += 1) {
+        const h = tracer.trace(s, o, d, t0, tmax, ray_mask, 0) orelse break;
+        if (!hitTransparent(s, h, trans_mask)) break;
+        const inst = &tr.instances(s)[h.instance];
+        const m = &mats[h.attribute & 0xFF];
+        const sf = surface(s, h.attribute);
+        const eps = 1e-3 * voxelSize(inst);
+        att *= splat(1 - m.opacity);
+        // Weg durch das Medium bis zum Austritt (oder bis zum Licht)
+        const g = tr.dagOf(s, &tr.geometries(s)[inst.geometry]);
+        const pin = o + d * splat(h.t + eps);
+        const oo = vec.xformPoint(&inst.world_to_object, pin);
+        const od = vec.xformVector(&inst.world_to_object, d);
+        const rest = tmax - h.t;
+        // eigene Instanz: bis zum Austritt aus ihren Voxeln; nur über das
+        // Material markiert (Wasser im Bodenchunk): bis zum Ende des Strahls
+        const own = trans_mask != 0 and inst.mask & trans_mask != 0;
+        const ex = if (own) dag.traceExit(&g, oo, od, 0, @min(rest, 1e6)) else null;
+        const len = if (ex) |e| e.t else rest;
+        if (m.density > 0) att *= absorb(sf.albedo, m.density * @min(len, 1e4));
+        if (@reduce(.Max, att) < 1e-3) return splat(0);
+        t0 = h.t + len + eps;
+        if (!(t0 < tmax)) break;
+    }
+    return att;
+}
+
+/// Direktes Licht (Sonne + Punktlichter) an Punkt p mit Normale n
+fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
+    var c = splat(0);
+    const shadows = l.flags & types.lighting_shadows != 0;
+
+    const sd = vec.normalize(l.sun_direction);
+    const ld = if (shadows) coneSample(sd, fm.tan(l.sun_angular_radius), rng) else sd;
+    const ndl = vec.dot(n, ld);
+    if (ndl > 0) {
+        var tint = splat(@as(f32, 1));
+        var lit = true;
+        if (shadows) {
+            if (anyTransparent(s, trans_mask)) {
+                const r = traceThrough(tracer, s, p, ld, 0, types.flt_max, mask | trans_mask, trans_mask);
+                lit = r.hit == null;
+                tint = r.att;
+            } else lit = !occluded(tracer, s, p, ld, types.flt_max, mask);
+        }
+        if (lit) c += brdf(n, v, ld, sf) * @as(Vec3, l.sun_color) * splat(ndl) * tint;
+    }
+
+    var i: u32 = 0;
+    while (i < @min(l.light_count, types.max_lights)) : (i += 1) {
+        const light = &l.lights[i];
+        // Punkt auf der Lichtkugel für weiche Schatten
+        var target: Vec3 = light.position;
+        if (light.radius > 0) target += cosineSample(vec.normalize(p - target), rng) * splat(light.radius);
+        const to = target - p;
+        const dist2 = @max(vec.dot(to, to), 1e-8);
+        const dist = @sqrt(dist2);
+        if (light.range > 0 and dist > light.range) continue;
+        const dir = to * splat(1.0 / dist);
+        const nl = vec.dot(n, dir);
+        if (nl <= 0) continue;
+        var tint = splat(@as(f32, 1));
+        if (shadows) {
+            if (anyTransparent(s, trans_mask)) {
+                const r = traceThrough(tracer, s, p, dir, 0, dist * 0.999, mask | trans_mask, trans_mask);
+                if (r.hit != null) continue;
+                tint = r.att;
+            } else if (occluded(tracer, s, p, dir, dist * 0.999, mask)) continue;
+        }
+        const r2 = @max(light.radius * light.radius, 1e-4);
+        c += brdf(n, v, dir, sf) * @as(Vec3, light.color) * splat(nl / @max(dist2, r2)) * tint;
+    }
+    return c;
+}
+
+pub const Shaded = struct {
+    color: Vec3,
+    albedo: Vec3,
+    normal: Vec3,
+    /// diffuser Anteil (1 − metallic); der indirekte Durchgang multipliziert damit
+    diffuse: f32 = 1,
+    roughness: f32 = 1,
+};
+
+/// Farbe des Treffers h des Strahls o + t d.
+/// `mask`: Instanzen, die Sekundärstrahlen (Schatten, GI, Reflexion) sehen –
+/// ohne transparente Ebene.
+pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32) Shaded {
+    const l: *const types.Lighting = @ptrFromInt(s.lighting);
+    const inst = &tr.instances(s)[h.instance];
+    const n = worldNormal(inst, h.face);
+    const sf = surface(s, h.attribute);
+    const p = o + d * splat(h.t) + n * splat(1e-3 * voxelSize(inst));
+    // Sehen Sekundärstrahlen eine gröbere Fassung, müssen sie über deren
+    // Voxel hinaus starten (in Entfernung t etwa secondary_bias · t groß)
+    const ps = if (l.secondary_bias > 0) p + n * splat(l.secondary_bias * h.t) else p;
+    const v = -d;
+
+    var c = sf.emission + direct(tracer, s, l, ps, n, v, &sf, rng, mask, trans_mask);
+
+    // Indirekt: in halber Auflösung rechnet ein eigener Durchgang (gi_half),
+    // sonst hier. Der diffuse Faktor kommt in beiden Fällen dazu.
+    if (l.flags & types.lighting_gi_half == 0)
+        c += sf.albedo * splat(1 - sf.metallic) * indirect(tracer, s, l, ps, n, rng, mask, trans_mask);
+
+    if (l.flags & types.lighting_reflections != 0 and sf.roughness < 0.5) {
+        const f0 = splat(0.04) + (sf.albedo - splat(0.04)) * splat(sf.metallic);
+        const refl = reflection(tracer, s, l, ps, n, d, sf.roughness, rng, mask, trans_mask);
+        c += fresnel(f0, @max(vec.dot(n, v), 0)) * refl * splat(1 - 2 * sf.roughness);
+    }
+    return .{ .color = c, .albedo = sf.albedo, .normal = n, .diffuse = 1 - sf.metallic, .roughness = sf.roughness };
+}
+
+/// Günstige Beleuchtung ohne GI und Reflexionen – für den Untergrund hinter
+/// transparenten Körpern, wo der Aufwand nicht sichtbar wäre.
+pub fn shadeSimple(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
+    const l: *const types.Lighting = @ptrFromInt(s.lighting);
+    const inst = &tr.instances(s)[h.instance];
+    const n = worldNormal(inst, h.face);
+    const sf = surface(s, h.attribute);
+    const p = o + d * splat(h.t) + n * splat(1e-3 * voxelSize(inst));
+    return sf.emission + direct(tracer, s, l, p, n, -d, &sf, rng, mask, trans_mask) +
+        sf.albedo * splat(1 - sf.metallic) * sky(l, n, false) * splat(0.5 + 0.5 * n[1]);
+}
+
+/// Eintreffende indirekte Strahldichte an (p, n): ein Kosinus-Strahl (GI),
+/// Umgebungsverdeckung oder – ohne beides – der Himmel grob nach der Normalen.
+/// Das Ergebnis wird mit Albedo · (1 − metallic) multipliziert.
+pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
+    if (l.flags & types.lighting_gi != 0) {
+        const gd = cosineSample(n, rng);
+        const gi_max = if (l.gi_distance > 0) l.gi_distance else types.flt_max;
+        const r = traceThrough(tracer, s, p, gd, 0, gi_max, mask | trans_mask, trans_mask);
+        if (r.hit) |g| {
+            const ginst = &tr.instances(s)[g.instance];
+            const gn = worldNormal(ginst, g.face);
+            const gsf = surface(s, g.attribute);
+            const gp = p + gd * splat(g.t) + gn * splat(1e-3 * voxelSize(ginst));
+            return r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask));
+        }
+        return r.att * sky(l, gd, false);
+    }
+    if (l.flags & types.lighting_ao != 0) {
+        const ad = cosineSample(n, rng);
+        const vis: f32 = if (occluded(tracer, s, p, ad, @max(l.ao_radius, 1e-3), mask)) 0 else 1;
+        return sky(l, ad, false) * splat(vis);
+    }
+    // ohne Sekundärstrahlen: Himmel grob nach der Normalen
+    return sky(l, n, false) * splat(0.5 + 0.5 * n[1]);
+}
+
+fn fresnel(f0: Vec3, cos_theta: f32) Vec3 {
+    const q = 1 - cos_theta;
+    const q5 = q * q * q * q * q;
+    return f0 + (splat(1) - f0) * splat(q5);
+}
+
+fn reflect(d: Vec3, n: Vec3) Vec3 {
+    return d - n * splat(2 * vec.dot(d, n));
+}
+
+/// Licht aus der Spiegelrichtung (gestreut nach Rauheit): direktes Licht und
+/// Emission am Treffer, sonst Himmel
+fn reflection(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, d: Vec3, roughness: f32, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
+    var rd = coneSample(reflect(d, n), roughness * roughness, rng);
+    if (vec.dot(rd, n) <= 0) rd = reflect(d, n);
+    if (tracer.trace(s, p, rd, 0, types.flt_max, mask, 0)) |h| {
+        const inst = &tr.instances(s)[h.instance];
+        const hn = worldNormal(inst, h.face);
+        const hsf = surface(s, h.attribute);
+        const hp = p + rd * splat(h.t) + hn * splat(1e-3 * voxelSize(inst));
+        return hsf.emission + direct(tracer, s, l, hp, hn, -rd, &hsf, rng, mask, trans_mask) + hsf.albedo * sky(l, hn, false) * splat(0.5 + 0.5 * hn[1]);
+    }
+    return sky(l, rd, false);
+}
+
+/// Transparente Ebene (Wasser, Glas) über dem Untergrund `behind`:
+/// Fresnel-Reflexion, Deckkraft der Oberfläche, Absorption auf der Strecke
+/// bis zum Untergrund (dist). Brechung wird vernachlässigt (gerader Strahl).
+
+/// Brechung nach Snell (eta = n1 / n2); null bei Totalreflexion
+fn refract(d: Vec3, n: Vec3, eta: f32) ?Vec3 {
+    const cosi = -vec.dot(n, d);
+    const k = 1 - eta * eta * (1 - cosi * cosi);
+    if (k < 0) return null;
+    return vec.normalize(d * splat(eta) + n * splat(eta * cosi - @sqrt(k)));
+}
+
+/// Mehrere transparente Körper vor dem undurchsichtigen Untergrund.
+/// Je Körper: Eintrittsfläche (Fresnel-Spiegelung, Deckkraft, Brechung mit
+/// material_refract) → Absorption im Medium (density, getönt mit base_color)
+/// bis zum echten Austritt (dag.traceExit) → Austrittsfläche (Fresnel,
+/// Rückbrechung) → weiter zum nächsten Körper. Reicht ein Medium bis an den
+/// Untergrund (Wasser auf Boden), endet es dort.
+/// `behind`: fertige Farbe des Untergrunds entlang des ungebrochenen Strahls
+/// (bis `t_opaque`), wiederverwendet, solange nichts gebrochen hat.
+pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: Vec3, tmin: f32, t_opaque: f32, behind: Vec3, ray_mask: u32, trans_mask: u32, opaque_mask: u32, secondary_mask: u32, rng: *Rng) Vec3 {
+    const l: *const types.Lighting = @ptrFromInt(s.lighting);
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    // aktueller Strahl o + t d mit t in [0, t_end); t_end = Untergrund (flt_max: Himmel)
+    var o = o0 + d0 * splat(tmin);
+    var d = d0;
+    var t_end = t_opaque - tmin;
+    var bent = false;
+    var result: Vec3 = splat(0);
+    var throughput: Vec3 = splat(1);
+
+    // Startet die Kamera schon in einem Medium (Blick von unter Wasser), gilt
+    // dessen Absorption ab dem ersten Schritt; die Grenzfläche kommt beim
+    // Austritt.
+    if (tracer.trace(s, o, d, 0, t_end, ray_mask, 0)) |first| {
+        if (first.face & types.hit_inside != 0 and hitTransparent(s, first, trans_mask)) {
+            const m0 = &mats[first.attribute & 0xFF];
+            const sf0 = surface(s, first.attribute);
+            const inst0 = &tr.instances(s)[first.instance];
+            const own0 = trans_mask != 0 and inst0.mask & trans_mask != 0;
+            var len = t_end;
+            if (own0) {
+                const g0 = tr.dagOf(s, &tr.geometries(s)[inst0.geometry]);
+                const oo0 = vec.xformPoint(&inst0.world_to_object, o);
+                const od0 = vec.xformVector(&inst0.world_to_object, d);
+                if (dag.traceExit(&g0, oo0, od0, 0, @min(t_end, 1e6))) |e0| len = e0.t;
+            }
+            if (m0.density > 0) throughput *= absorb(sf0.albedo, m0.density * @min(len, 1e4));
+            if (len < t_end) {
+                // Austritt: Fresnel und Rückbrechung an der Grenzfläche
+                const r0 = (m0.ior - 1) / (m0.ior + 1);
+                const f0 = splat(r0 * r0);
+                const p0 = o + d * splat(len);
+                var n0 = worldNormal(inst0, first.face);
+                if (vec.dot(n0, d) < 0) n0 = -n0; // zeigt nach außen
+                throughput *= splat(1) - fresnel(f0, @max(vec.dot(n0, d), 0));
+                if (m0.flags & types.material_refract != 0) {
+                    if (refract(d, -n0, m0.ior)) |dr| {
+                        d = dr;
+                        bent = true;
+                    } else return result; // Totalreflexion an der Wasseroberfläche
+                }
+                o = p0 + d * splat(1e-3 * voxelSize(inst0));
+                t_end = if (bent) (if (tracer.trace(s, o, d, 0, types.flt_max, opaque_mask, types.trace_skip_transparent)) |oh| oh.t else types.flt_max) else t_end - len;
+            }
+        }
+    }
+
+    var layer: u32 = 0;
+    while (layer < types.max_transparent_layers) : (layer += 1) {
+        const th = tracer.trace(s, o, d, 0, t_end, ray_mask, 0) orelse break;
+        if (!hitTransparent(s, th, trans_mask)) break;
+        if (th.face & types.hit_inside != 0) break; // schon im Medium: oben behandelt
+        const inst = &tr.instances(s)[th.instance];
+        // Eigene Instanz: der Körper endet, wo seine Voxel enden. Nur über das
+        // Material markiert (Wasser im selben Chunk wie der Boden): das Medium
+        // reicht bis zum Untergrund.
+        const own_instance = trans_mask != 0 and inst.mask & trans_mask != 0;
+        const m = &mats[th.attribute & 0xFF];
+        const sf = surface(s, th.attribute);
+        var n = worldNormal(inst, th.face);
+        if (m.flags & types.material_waves != 0) n = waveNormal(s, m, o + d * splat(th.t), n);
+        if (vec.dot(n, d) > 0) n = -n;
+        const eps = 1e-3 * voxelSize(inst);
+        const p = o + d * splat(th.t);
+        const r0 = (m.ior - 1) / (m.ior + 1);
+        const f0 = splat(r0 * r0);
+        const f = fresnel(f0, @max(vec.dot(n, -d), 0));
+
+        // Eintrittsfläche: Spiegelung und (nach Deckkraft) diffuse Oberfläche
+        const pv = p + n * splat(eps);
+        var refl = sky(l, reflect(d, n), true);
+        if (l.flags & types.lighting_reflections != 0) refl = reflection(tracer, s, l, pv, n, d, sf.roughness, rng, secondary_mask, trans_mask);
+        const surface_col = sf.emission + direct(tracer, s, l, pv, n, -d, &sf, rng, secondary_mask, trans_mask) + sf.albedo * sky(l, n, false) * splat(0.5 + 0.5 * n[1]);
+        result += throughput * (refl * f + surface_col * splat(m.opacity) * (splat(1) - f));
+        throughput *= (splat(1) - f) * splat(1 - m.opacity);
+        if (@reduce(.Max, throughput) < 1e-3) return result;
+
+        const refracts = m.flags & types.material_refract != 0 and m.ior > 0;
+        var din = d;
+        if (refracts) din = refract(d, n, 1.0 / m.ior) orelse return result; // Totalreflexion
+        const pin = p - n * splat(eps);
+        const turned = @reduce(.Or, din != d);
+        var remaining = t_end - th.t; // bis zum Untergrund (nur gültig ohne Knick)
+        if (turned) {
+            bent = true;
+            remaining = if (tracer.trace(s, pin, din, 0, types.flt_max, opaque_mask, types.trace_skip_transparent)) |oh| oh.t else types.flt_max;
+        }
+
+        // Austritt aus dem Medium (im Objektraum; t bleibt gleich)
+        const g = tr.dagOf(s, &tr.geometries(s)[inst.geometry]);
+        const oo = vec.xformPoint(&inst.world_to_object, pin);
+        const od = vec.xformVector(&inst.world_to_object, din);
+        // Austritt erst kurz vor dem Untergrund zählt als "Medium liegt auf"
+        const ex_raw = if (own_instance) dag.traceExit(&g, oo, od, 0, @min(remaining, 1e6)) else null;
+        const ex = if (ex_raw) |x| (if (x.t < remaining - 2 * eps) x else null) else null;
+        const inside_len = if (ex) |e| e.t else remaining;
+        if (m.density > 0) throughput *= absorb(sf.albedo, m.density * @min(inside_len, 1e4));
+        const e = ex orelse {
+            // Medium reicht bis an den Untergrund
+            o = pin;
+            d = din;
+            t_end = remaining;
+            break;
+        };
+
+        // Austrittsfläche: Transmission und Rückbrechung
+        const n_out = worldNormal(inst, e.face); // zeigt in Laufrichtung
+        const pout = pin + din * splat(e.t);
+        throughput *= splat(1) - fresnel(f0, @max(vec.dot(n_out, din), 0));
+        var dout = din;
+        if (refracts) dout = refract(din, -n_out, m.ior) orelse din; // innere Totalreflexion: gerade weiter (Näherung)
+        o = pout + n_out * splat(eps);
+        // auch eine parallel versetzte Richtung (Scheibe) macht `behind` ungültig
+        bent = bent or @reduce(.Or, dout != din);
+        if (bent) {
+            d = dout;
+            t_end = if (tracer.trace(s, o, d, 0, types.flt_max, opaque_mask, types.trace_skip_transparent)) |oh| oh.t else types.flt_max;
+        } else {
+            t_end = remaining - e.t - eps;
+        }
+    }
+
+    // Untergrund
+    var bg = behind;
+    if (bent) {
+        if (tracer.trace(s, o, d, 0, types.flt_max, opaque_mask, types.trace_skip_transparent)) |h| {
+            bg = shadeSimple(tracer, s, o, d, h, rng, secondary_mask, trans_mask);
+        } else bg = sky(l, d, true);
+    }
+    return result + throughput * bg;
+}
+
+inline fn absorb(color: Vec3, k: f32) Vec3 {
+    return .{ fm.pow(@max(color[0], 1e-4), k), fm.pow(@max(color[1], 1e-4), k), fm.pow(@max(color[2], 1e-4), k) };
+}
