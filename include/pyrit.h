@@ -132,6 +132,13 @@ typedef struct PyrInstanceData {
     uint32_t reserved;
 } PyrInstanceData;
 
+/* Eine Textur auf dem Gerät: dicht gepackte RGBA8-Zeilen */
+typedef struct PyrTextureData {
+    uint64_t data;
+    uint32_t width;
+    uint32_t height;
+} PyrTextureData;
+
 typedef struct PyrScene {
     uint64_t nodes, leaves, attributes, geometries;   /* Gerätezeiger */
     uint64_t instances, instances_prev;               /* aktueller Frame, Vorframe */
@@ -142,6 +149,9 @@ typedef struct PyrScene {
     uint64_t materials;                               /* const PyrMaterial[PYR_MAX_MATERIALS] */
     uint64_t lighting;                                /* const PyrLighting* */
     uint64_t transparent_materials[4];                /* Bit je Material: PYR_MATERIAL_TRANSPARENT */
+    uint64_t textures;                                /* const PyrTextureData[texture_count], 1-basiert */
+    uint32_t texture_count;
+    uint32_t reserved_tex;
 } PyrScene;
 
 /* ---------------------------------------------------------------------------
@@ -181,8 +191,25 @@ typedef struct PyrMaterial {
     /* PYR_MATERIAL_WAVES: Höhe und Wellenlänge der Normalenstörung
      * (Welteinheiten), Geschwindigkeit in Wellenlängen je Sekunde */
     float    wave_height, wave_length, wave_speed;
-    uint32_t reserved;         /* transparente Ebene: Absorption pro Welteinheit, getönt mit base_color */
+    /* Klarlack: zweite, glatte Schicht darüber (Lack, Nässe) */
+    float    clearcoat;
+    float    clearcoat_roughness;
+    /* Streuung unter der Oberfläche: Licht wickelt sich um die Kante
+     * (Haut, Laub, Wachs). 0 = aus. */
+    float    subsurface;
+    float    subsurface_color[3];
+    /* Texturen (1-basiert, 0 = keine) und Kantenlänge einer Kachel in
+     * Welteinheiten. Voxelflächen sind achsenparallel, es wird genau eine
+     * Ebene projiziert. */
+    uint32_t texture;
+    uint32_t normal_texture;
+    float    texture_scale;
+    /* Ohne Normalentextur: Stärke und Wellenlänge einer erzeugten Detailnormale */
+    float    normal_strength;
+    float    normal_scale;
+    uint32_t reserved;
 } PyrMaterial;
+
 
 #define PYR_MAX_LIGHTS 16u
 
@@ -287,6 +314,7 @@ typedef struct PyrCreateInfo {
     uint32_t max_instances;        /* 0 = 65536 */
     uint32_t max_geometries;       /* 0 = 4096 */
     uint32_t max_views;            /* 0 = 16 */
+    uint32_t max_textures;         /* 0 = 256 */
     uint32_t rt_leaf_log2;         /* Kantenlänge der RT-AABB-Primitive als log2, 0 = 7 (128^3) */
     uint64_t node_pool_bytes;      /* 0 = 256 MiB */
     uint64_t leaf_pool_bytes;      /* 0 = 256 MiB */
@@ -455,6 +483,12 @@ PYR_API PyrResult pyr_trace(PyrContext* ctx, uint64_t rays, uint64_t hits, uint3
 
 PYR_API void      pyr_material_default(PyrMaterial* material);
 PYR_API PyrResult pyr_material_set(PyrContext* ctx, uint32_t index, const PyrMaterial* material);
+/* Textur: dicht gepackte RGBA8-Zeilen. Gefiltert wird von Hand (bilinear,
+ * wiederholend) – keine Texturhardware, damit derselbe Code später auch auf
+ * AMD läuft. Der zurückgegebene Index geht 1-basiert ins Material. */
+PYR_API PyrResult pyr_texture_create(PyrContext* ctx, uint32_t width, uint32_t height,
+                                     const void* rgba8, uint32_t* out_index);
+PYR_API PyrResult pyr_texture_destroy(PyrContext* ctx, uint32_t index);
 PYR_API void      pyr_lighting_default(PyrLighting* lighting);
 PYR_API PyrResult pyr_set_lighting(PyrContext* ctx, const PyrLighting* lighting);
 PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g, uint32_t b);

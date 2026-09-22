@@ -26,6 +26,7 @@ test "Strukturlayouts" {
     try expectSameLayout(types.Ray, c.PyrRay);
     try expectSameLayout(api.WorldEdit, c.PyrWorldEdit);
     try expectSameLayout(api.PostFx, c.PyrPostFx);
+    try expectSameLayout(types.TextureData, c.PyrTextureData);
     try expectSameLayout(types.HitEx, c.PyrHitEx);
     try expectSameLayout(types.Hit, c.PyrHit);
     try expectSameLayout(types.Camera, c.PyrCamera);
@@ -129,5 +130,5 @@ test "Funktionssignaturen" {
         try testing.expectEqual(@sizeOf(cf.return_type.?), @sizeOf(zf.return_type.?));
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 67), count);
+    try testing.expectEqual(@as(usize, 69), count);
 }

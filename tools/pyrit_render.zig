@@ -145,6 +145,7 @@ pub fn main(init: std.process.Init) !void {
     var flicker = false;
     var edit_test = false;
     var fx_flags: u32 = 0;
+    var materials = false;
     var chunk_capacity: u32 = 0;
     var edit_load = false;
     var edit_stream = false;
@@ -214,6 +215,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--chunk-capacity") and i + 1 < args.len) {
             i += 1;
             chunk_capacity = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--materials")) {
+            materials = true;
         } else if (std.mem.eql(u8, a, "--fx")) {
             fx_flags |= api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade;
         } else if (std.mem.eql(u8, a, "--bloom")) {
@@ -278,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -386,7 +389,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -404,6 +407,43 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     water.density = 0.08;
     water.opacity = 0.05;
     req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &water));
+
+    // Materialprobe: Textur auf dem Boden, Detailnormale auf dem Fels,
+    // Streuung im Laub, Klarlack auf dem Wasser.
+    if (materials) {
+        // kleine Kacheltextur: unregelmäßige Flecken, damit man das Filtern sieht
+        const tw: u32 = 64;
+        const tex = try init.gpa.alloc(u8, tw * tw * 4);
+        defer init.gpa.free(tex);
+        for (0..tw) |ty| for (0..tw) |tx| {
+            const nz = (tx *% 73 +% ty *% 151) ^ ((tx *% 19) >> 2);
+            const v: u8 = @intCast(180 + (nz % 76));
+            const o = (ty * tw + tx) * 4;
+            tex[o + 0] = v;
+            tex[o + 1] = @intCast(@min(@as(u32, v) + 12, 255));
+            tex[o + 2] = @intCast(@as(u32, v) * 3 / 4);
+            tex[o + 3] = 255;
+        };
+        var tex_index: u32 = 0;
+        req(pyrit.pyr_texture_create(@ptrCast(ctx), tw, tw, tex.ptr, &tex_index));
+
+        var ground: types.Material = undefined;
+        pyrit.pyr_material_default(&ground);
+        ground.flags = types.material_voxel_color;
+        ground.texture = tex_index;
+        ground.texture_scale = 8; // eine Kachel je 8 Voxel
+        ground.normal_strength = 0.35;
+        ground.normal_scale = 2;
+        ground.subsurface = 0.25; // Laub liegt auf demselben Material
+        ground.subsurface_color = .{ 0.4, 0.8, 0.3 };
+        req(pyrit.pyr_material_set(@ptrCast(ctx), 0, &ground));
+
+        water.clearcoat = 1;
+        water.clearcoat_roughness = 0.03;
+        req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &water));
+        std.debug.print("Materialprobe: Textur {d} ({d}x{d}), Detailnormale, Streuung, Klarlack\n", .{ tex_index, tw, tw });
+    }
+
     var wi = std.mem.zeroes(api.WorldInfo);
     wi.terrain = &terrain;
     wi.voxel_pixels = voxel_px;

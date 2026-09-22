@@ -66,6 +66,13 @@ pub const Surface = struct {
     emission: Vec3,
     roughness: f32,
     metallic: f32,
+    clearcoat: f32 = 0,
+    clearcoat_roughness: f32 = 0.1,
+    /// Licht wickelt sich um die Kante (Haut, Laub, Wachs)
+    subsurface: f32 = 0,
+    subsurface_color: Vec3 = .{ 1, 1, 1 },
+    /// gestörte Normale; {0,0,0} = die geometrische behalten
+    normal: Vec3 = .{ 0, 0, 0 },
 };
 
 pub fn surface(s: *const types.Scene, attribute: u32) Surface {
@@ -73,7 +80,136 @@ pub fn surface(s: *const types.Scene, attribute: u32) Surface {
     const m = &mats[attribute & 0xFF];
     var albedo: Vec3 = m.base_color;
     if (m.flags & types.material_voxel_color != 0) albedo *= attributeColor(attribute);
-    return .{ .albedo = albedo, .emission = m.emission, .roughness = @max(m.roughness, 0.02), .metallic = m.metallic };
+    return .{
+        .albedo = albedo,
+        .emission = m.emission,
+        .roughness = @max(m.roughness, 0.02),
+        .metallic = m.metallic,
+        .clearcoat = m.clearcoat,
+        .clearcoat_roughness = @max(m.clearcoat_roughness, 0.02),
+        .subsurface = m.subsurface,
+        .subsurface_color = m.subsurface_color,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Texturen: von Hand bilinear aus einem dicht gepackten RGBA8-Puffer. Keine
+// Texturhardware, damit derselbe Code später auch auf AMD läuft.
+// ---------------------------------------------------------------------------
+
+fn texel(t: *const types.TextureData, x: i32, y: i32) Vec3 {
+    const w: i32 = @intCast(t.width);
+    const h: i32 = @intCast(t.height);
+    const cx: u32 = @intCast(@mod(x, w));
+    const cy: u32 = @intCast(@mod(y, h));
+    const px = @as([*]const [4]u8, @ptrFromInt(t.data))[@as(u64, cy) * t.width + cx];
+    const inv = 1.0 / 255.0;
+    return .{ @as(f32, @floatFromInt(px[0])) * inv, @as(f32, @floatFromInt(px[1])) * inv, @as(f32, @floatFromInt(px[2])) * inv };
+}
+
+fn sampleTexture(s: *const types.Scene, index: u32, u: f32, v: f32) Vec3 {
+    if (index == 0 or index >= s.texture_count) return .{ 1, 1, 1 };
+    const tt: [*]const types.TextureData = @ptrFromInt(s.textures);
+    const t = &tt[index];
+    if (t.data == 0) return .{ 1, 1, 1 };
+    const fx = u * @as(f32, @floatFromInt(t.width)) - 0.5;
+    const fy = v * @as(f32, @floatFromInt(t.height)) - 0.5;
+    const x0: i32 = @intFromFloat(@floor(fx));
+    const y0: i32 = @intFromFloat(@floor(fy));
+    const tx = fx - @floor(fx);
+    const ty = fy - @floor(fy);
+    const a = texel(t, x0, y0);
+    const b = texel(t, x0 + 1, y0);
+    const c = texel(t, x0, y0 + 1);
+    const d = texel(t, x0 + 1, y0 + 1);
+    const top = a + (b - a) * splat(tx);
+    const bot = c + (d - c) * splat(tx);
+    return top + (bot - top) * splat(ty);
+}
+
+/// Flächenparameter eines Voxeltreffers: welche zwei Weltachsen die Fläche
+/// aufspannen. Voxelflächen sind achsenparallel, deshalb genügt eine Ebene –
+/// Triplanar-Mischen wäre hier reine Verschwendung.
+fn faceUv(p: Vec3, n: Vec3, scale: f32) [2]f32 {
+    const inv = 1.0 / @max(scale, 1e-4);
+    const ax = @abs(n[0]);
+    const ay = @abs(n[1]);
+    const az = @abs(n[2]);
+    if (ax >= ay and ax >= az) return .{ p[2] * inv, p[1] * inv };
+    if (ay >= az) return .{ p[0] * inv, p[2] * inv };
+    return .{ p[0] * inv, p[1] * inv };
+}
+
+/// Zwei Tangenten der Fläche, passend zu faceUv
+fn faceTangents(n: Vec3) [2]Vec3 {
+    const ax = @abs(n[0]);
+    const ay = @abs(n[1]);
+    const az = @abs(n[2]);
+    if (ax >= ay and ax >= az) return .{ .{ 0, 0, 1 }, .{ 0, 1, 0 } };
+    if (ay >= az) return .{ .{ 1, 0, 0 }, .{ 0, 0, 1 } };
+    return .{ .{ 1, 0, 0 }, .{ 0, 1, 0 } };
+}
+
+fn hash2(x: i32, y: i32) f32 {
+    var h: u32 = @as(u32, @bitCast(x)) *% 0x8da6b343 +% @as(u32, @bitCast(y)) *% 0xd8163841;
+    h ^= h >> 15;
+    h *%= 0x2c1b3c6d;
+    h ^= h >> 12;
+    return @as(f32, @floatFromInt(h >> 8)) * (1.0 / 16777216.0);
+}
+
+fn valueNoise2(x: f32, y: f32) f32 {
+    const fx = @floor(x);
+    const fy = @floor(y);
+    const ix: i32 = @intFromFloat(fx);
+    const iy: i32 = @intFromFloat(fy);
+    const tx = x - fx;
+    const ty = y - fy;
+    const sx = tx * tx * (3 - 2 * tx);
+    const sy = ty * ty * (3 - 2 * ty);
+    const a = hash2(ix, iy);
+    const b = hash2(ix + 1, iy);
+    const c = hash2(ix, iy + 1);
+    const d = hash2(ix + 1, iy + 1);
+    const top = a + (b - a) * sx;
+    const bot = c + (d - c) * sx;
+    return top + (bot - top) * sy;
+}
+
+/// Oberfläche am Treffer: wie `surface`, zusätzlich mit Textur und
+/// Detailnormale. `p` ist der Weltpunkt, `n` die geometrische Normale.
+pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3) Surface {
+    var sf = surface(s, attribute);
+    const mats: [*]const types.Material = @ptrFromInt(s.materials);
+    const m = &mats[attribute & 0xFF];
+    if (m.texture == 0 and m.normal_texture == 0 and m.normal_strength == 0) return sf;
+
+    const scale = if (m.texture_scale > 0) m.texture_scale else 1;
+    const uv = faceUv(p, n, scale);
+    if (m.texture != 0) sf.albedo *= sampleTexture(s, m.texture, uv[0], uv[1]);
+
+    // Detailnormale: aus der Normalentextur oder erzeugt
+    var du: f32 = 0;
+    var dv: f32 = 0;
+    if (m.normal_texture != 0) {
+        const t = sampleTexture(s, m.normal_texture, uv[0], uv[1]);
+        du = (t[0] * 2 - 1) * @max(m.normal_strength, 1);
+        dv = (t[1] * 2 - 1) * @max(m.normal_strength, 1);
+    } else if (m.normal_strength != 0) {
+        const ns = if (m.normal_scale > 0) m.normal_scale else 1;
+        const nu = p[0] / ns;
+        const nv = p[1] / ns;
+        const nw = p[2] / ns;
+        const e: f32 = 0.5;
+        // Steigung des Rauschens in den beiden Flächenrichtungen
+        du = (valueNoise2(nu + e, nv + nw) - valueNoise2(nu - e, nv + nw)) * m.normal_strength;
+        dv = (valueNoise2(nu, nv + nw + e) - valueNoise2(nu, nv + nw - e)) * m.normal_strength;
+    }
+    if (du != 0 or dv != 0) {
+        const tg = faceTangents(n);
+        sf.normal = vec.normalize(n - tg[0] * splat(du) - tg[1] * splat(dv));
+    }
+    return sf;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +311,13 @@ pub fn voxelSize(inst: *const types.InstanceData) f32 {
 }
 
 /// Lambert + GGX, bereits mit π multipliziert (siehe Konvention oben)
+fn ggx(ndh: f32, rough: f32) f32 {
+    const a = rough * rough;
+    const a2 = a * a;
+    const dd = ndh * ndh * (a2 - 1) + 1;
+    return a2 / (pi * dd * dd);
+}
+
 fn brdf(n: Vec3, v: Vec3, l: Vec3, sf: *const Surface) Vec3 {
     const ndl = @max(vec.dot(n, l), 0);
     const ndv = @max(vec.dot(n, v), 1e-4);
@@ -192,7 +335,25 @@ fn brdf(n: Vec3, v: Vec3, l: Vec3, sf: *const Surface) Vec3 {
     const fw = q * q * q * q * q;
     const f = f0 + (splat(1) - f0) * splat(fw);
     const spec = f * splat(@min(d * vis * pi, 64));
-    return sf.albedo * splat(1 - sf.metallic) + spec;
+    var out = sf.albedo * splat(1 - sf.metallic) + spec;
+
+    // Klarlack: eine zweite, glatte Schicht darüber. Was sie reflektiert,
+    // fehlt darunter – sonst würde das Material heller als sein Licht.
+    if (sf.clearcoat > 0) {
+        const dc = ggx(ndh, sf.clearcoat_roughness);
+        const kc = sf.clearcoat_roughness * 0.5;
+        const visc = 1.0 / (4.0 * (ndl * (1 - kc) + kc) * (ndv * (1 - kc) + kc));
+        const fc = (0.04 + 0.96 * fw) * sf.clearcoat;
+        out = out * splat(1 - fc) + splat(@min(dc * visc * pi, 64) * fc);
+    }
+
+    return out;
+}
+
+/// Licht, das durch das Material hindurch zur Vorderseite kommt
+/// (Unterflächenstreuung). Getrennt vom BRDF, damit es nicht doppelt zählt.
+fn transmit(sf: *const Surface) Vec3 {
+    return sf.albedo * @as(Vec3, sf.subsurface_color) * splat(sf.subsurface * (1 - sf.metallic));
 }
 
 fn occluded(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: f32, mask: u32) bool {
@@ -303,7 +464,9 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
     const sd = vec.normalize(l.sun_direction);
     const ld = if (shadows) coneSample(sd, fm.tan(l.sun_angular_radius), rng) else sd;
     const ndl = vec.dot(n, ld);
-    if (ndl > 0) {
+    // Mit Unterflächenstreuung zählt auch Licht von hinten (es wandert durch
+    // das Material); brdf() liefert dafür den Rückseitenanteil.
+    if (ndl > 0 or (sf.subsurface > 0 and ndl > -1)) {
         var tint = splat(@as(f32, 1));
         var lit = true;
         if (shadows) {
@@ -313,7 +476,11 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
                 tint = r.att;
             } else lit = !occluded(tracer, s, p, ld, types.flt_max, mask);
         }
-        if (lit) c += brdf(n, v, ld, sf) * @as(Vec3, l.sun_color) * splat(ndl) * tint;
+        if (lit) {
+            if (ndl > 0) c += brdf(n, v, ld, sf) * @as(Vec3, l.sun_color) * splat(ndl) * tint;
+            if (sf.subsurface > 0 and ndl < 0)
+                c += transmit(sf) * @as(Vec3, l.sun_color) * splat(-ndl) * tint;
+        }
     }
 
     var i: u32 = 0;
@@ -328,7 +495,7 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
         if (light.range > 0 and dist > light.range) continue;
         const dir = to * splat(1.0 / dist);
         const nl = vec.dot(n, dir);
-        if (nl <= 0) continue;
+        if (nl <= 0 and sf.subsurface <= 0) continue;
         var tint = splat(@as(f32, 1));
         if (shadows) {
             if (anyTransparent(s, trans_mask)) {
@@ -338,7 +505,10 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
             } else if (occluded(tracer, s, p, dir, dist * 0.999, mask)) continue;
         }
         const r2 = @max(light.radius * light.radius, 1e-4);
-        c += brdf(n, v, dir, sf) * @as(Vec3, light.color) * splat(nl / @max(dist2, r2)) * tint;
+        const falloff = 1.0 / @max(dist2, r2);
+        if (nl > 0) c += brdf(n, v, dir, sf) * @as(Vec3, light.color) * splat(nl * falloff) * tint;
+        if (sf.subsurface > 0 and nl < 0)
+            c += transmit(sf) * @as(Vec3, light.color) * splat(-nl * falloff) * tint;
     }
     return c;
 }
@@ -359,25 +529,32 @@ pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.
     const l: *const types.Lighting = @ptrFromInt(s.lighting);
     const inst = &tr.instances(s)[h.instance];
     const n = worldNormal(inst, h.face);
-    const sf = surface(s, h.attribute);
     const p = o + d * splat(h.t) + n * splat(1e-3 * voxelSize(inst));
+    const sf = surfaceAt(s, h.attribute, p, n);
+    // Beleuchtet wird mit der gestörten Normale, versetzt und weiterverfolgt
+    // mit der geometrischen – sonst würden Strahlen in die Fläche laufen.
+    const ns = if (sf.normal[0] != 0 or sf.normal[1] != 0 or sf.normal[2] != 0) sf.normal else n;
     // Sehen Sekundärstrahlen eine gröbere Fassung, müssen sie über deren
     // Voxel hinaus starten (in Entfernung t etwa secondary_bias · t groß)
     const ps = if (l.secondary_bias > 0) p + n * splat(l.secondary_bias * h.t) else p;
     const v = -d;
 
-    var c = sf.emission + direct(tracer, s, l, ps, n, v, &sf, rng, mask, trans_mask);
+    var c = sf.emission + direct(tracer, s, l, ps, ns, v, &sf, rng, mask, trans_mask);
 
     // Indirekt: in halber Auflösung rechnet ein eigener Durchgang (gi_half),
     // sonst hier. Der diffuse Faktor kommt in beiden Fällen dazu.
     if (l.flags & types.lighting_gi_half == 0)
-        c += sf.albedo * splat(1 - sf.metallic) * indirect(tracer, s, l, ps, n, rng, mask, trans_mask);
+        c += sf.albedo * splat(1 - sf.metallic) * indirect(tracer, s, l, ps, ns, rng, mask, trans_mask);
 
-    if (l.flags & types.lighting_reflections != 0 and sf.roughness < 0.5) {
+    const refl_rough = if (sf.clearcoat > 0) @min(sf.roughness, sf.clearcoat_roughness) else sf.roughness;
+    if (l.flags & types.lighting_reflections != 0 and refl_rough < 0.5) {
         const f0 = splat(0.04) + (sf.albedo - splat(0.04)) * splat(sf.metallic);
-        const refl = reflection(tracer, s, l, ps, n, d, sf.roughness, rng, mask, trans_mask);
-        c += fresnel(f0, @max(vec.dot(n, v), 0)) * refl * splat(1 - 2 * sf.roughness);
+        const refl = reflection(tracer, s, l, ps, ns, d, refl_rough, rng, mask, trans_mask);
+        const fr = fresnel(f0, @max(vec.dot(ns, v), 0)) + splat(0.04 * sf.clearcoat);
+        c += fr * refl * splat(1 - 2 * refl_rough);
     }
+    // Die Normale im Ziel bleibt die geometrische: Denoiser, TAA und
+    // Reprojektion brauchen sie stabil, nicht mit Detail überlagert.
     return .{ .color = c, .albedo = sf.albedo, .normal = n, .diffuse = 1 - sf.metallic, .roughness = sf.roughness };
 }
 

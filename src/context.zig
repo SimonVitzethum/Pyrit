@@ -231,6 +231,10 @@ pub const Context = struct {
     leaf_pool: cuda.CUdeviceptr = 0,
     attr_pool: cuda.CUdeviceptr = 0,
     geometry_table: cuda.CUdeviceptr = 0,
+    /// Texturen: Tabelle auf dem Gerät und die Datenpuffer je Platz
+    texture_table: cuda.CUdeviceptr = 0,
+    texture_data: []cuda.CUdeviceptr = &.{},
+    texture_high: u32 = 0,
     instance_buf: [2]cuda.CUdeviceptr = .{ 0, 0 },
     update_scratch: cuda.CUdeviceptr = 0,
     scene_dev: cuda.CUdeviceptr = 0,
@@ -367,6 +371,12 @@ pub const Context = struct {
         self.leaf_pool = try self.devAlloc(leaf_bytes, "Blattpool");
         self.attr_pool = try self.devAlloc(attr_bytes, "Attributpool");
         self.geometry_table = try self.devAlloc(@as(u64, max_geometries) * @sizeOf(types.GeometryData), "Geometrietabelle");
+        const max_textures: u32 = if (info.max_textures == 0) 256 else info.max_textures;
+        // Platz 0 bleibt frei: 0 bedeutet im Material "keine Textur"
+        self.texture_table = try self.devAlloc(@as(u64, max_textures + 1) * @sizeOf(types.TextureData), "Texturtabelle");
+        try self.check(self.drv.cuMemsetD8Async(self.texture_table, 0, @as(u64, max_textures + 1) * @sizeOf(types.TextureData), self.stream), "cuMemsetD8Async");
+        self.texture_data = try oom(self.gpa.alloc(cuda.CUdeviceptr, max_textures + 1));
+        @memset(self.texture_data, 0);
         const inst_bytes = @as(u64, max_instances) * @sizeOf(types.InstanceData);
         self.instance_buf[0] = try self.devAlloc(inst_bytes, "Instanzzustand");
         self.instance_buf[1] = try self.devAlloc(inst_bytes, "Instanzzustand");
@@ -493,7 +503,11 @@ pub const Context = struct {
         for ([_]cuda.CUdeviceptr{ self.materials_dev, self.lighting_dev }) |p| {
             if (p != 0) _ = drv.cuMemFree_v2(p);
         }
-        for ([_]cuda.CUdeviceptr{ self.node_pool, self.leaf_pool, self.attr_pool, self.geometry_table, self.instance_buf[0], self.instance_buf[1], self.update_scratch, self.scene_dev }) |p| {
+        for (self.texture_data) |t| {
+            if (t != 0) _ = self.drv.cuMemFree_v2(t);
+        }
+        if (self.texture_data.len != 0) self.gpa.free(self.texture_data);
+        for ([_]cuda.CUdeviceptr{ self.node_pool, self.leaf_pool, self.attr_pool, self.geometry_table, self.texture_table, self.instance_buf[0], self.instance_buf[1], self.update_scratch, self.scene_dev }) |p| {
             if (p != 0) _ = drv.cuMemFree_v2(p);
         }
         if (self.staging.len != 0) _ = drv.cuMemFreeHost(self.staging.ptr);
@@ -607,6 +621,9 @@ pub const Context = struct {
             .materials = self.materials_dev,
             .lighting = self.lighting_dev,
             .transparent_materials = self.transparentMaterials(),
+            .textures = self.texture_table,
+            .texture_count = self.texture_high,
+            .reserved_tex = 0,
         };
         try self.uploadValue(self.scene_dev, &scene);
     }
@@ -1422,6 +1439,15 @@ pub const Context = struct {
             .wave_height = 0.15,
             .wave_length = 12,
             .wave_speed = 0.35,
+            .clearcoat = 0,
+            .clearcoat_roughness = 0.1,
+            .subsurface = 0,
+            .subsurface_color = .{ 1, 1, 1 },
+            .texture = 0,
+            .normal_texture = 0,
+            .texture_scale = 1,
+            .normal_strength = 0,
+            .normal_scale = 1,
             .reserved = 0,
         };
     }
@@ -1453,6 +1479,35 @@ pub const Context = struct {
         if (index >= types.max_materials) return fail(error.InvalidArgument, "Materialindex {d} >= {d}", .{ index, types.max_materials });
         self.materials[index] = m.*;
         try self.uploadValue(self.materials_dev + @as(u64, index) * @sizeOf(types.Material), m);
+    }
+
+    /// Textur anlegen: RGBA8, dicht gepackt, `width * height * 4` Bytes.
+    /// Der Index geht 1-basiert ins Material (0 = keine Textur).
+    pub fn textureCreate(self: *Context, w: u32, h: u32, pixels: []const u8) Error!u32 {
+        if (w == 0 or h == 0) return fail(error.InvalidArgument, "Textur braucht Breite und Höhe", .{});
+        const need = @as(u64, w) * h * 4;
+        if (pixels.len < need) return fail(error.InvalidArgument, "Textur {d}x{d} braucht {d} Bytes, bekommen {d}", .{ w, h, need, pixels.len });
+        var slot: u32 = 1;
+        while (slot < self.texture_data.len and self.texture_data[slot] != 0) slot += 1;
+        if (slot >= self.texture_data.len) return fail(error.Capacity, "keine Texturplätze mehr (max_textures erhöhen)", .{});
+        const buf = try self.devAlloc(need, "Textur");
+        errdefer _ = self.drv.cuMemFree_v2(buf);
+        try self.upload(buf, pixels[0..@intCast(need)]);
+        const entry = types.TextureData{ .data = buf, .width = w, .height = h };
+        try self.uploadValue(self.texture_table + @as(u64, slot) * @sizeOf(types.TextureData), &entry);
+        self.texture_data[slot] = buf;
+        if (slot >= self.texture_high) self.texture_high = slot + 1;
+        return slot;
+    }
+
+    pub fn textureDestroy(self: *Context, index: u32) Error!void {
+        if (index == 0 or index >= self.texture_data.len or self.texture_data[index] == 0)
+            return fail(error.InvalidHandle, "Textur {d} gibt es nicht", .{index});
+        try self.check(self.drv.cuStreamSynchronize(self.stream), "cuStreamSynchronize");
+        _ = self.drv.cuMemFree_v2(self.texture_data[index]);
+        self.texture_data[index] = 0;
+        const entry = std.mem.zeroes(types.TextureData);
+        try self.uploadValue(self.texture_table + @as(u64, index) * @sizeOf(types.TextureData), &entry);
     }
 
     pub fn setLighting(self: *Context, l: *const types.Lighting) Error!void {

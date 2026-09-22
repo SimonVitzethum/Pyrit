@@ -147,6 +147,10 @@ pub const Scene = extern struct {
     lighting: u64,
     /// Bit je Material: gesetzt = material_transparent (für trace_skip_transparent)
     transparent_materials: [4]u64,
+    /// const TextureData[texture_count], 1-basiert angesprochen
+    textures: u64,
+    texture_count: u32,
+    reserved_tex: u32,
 };
 
 // ---------------------------------------------------------------------------
@@ -193,7 +197,32 @@ pub const Material = extern struct {
     wave_height: f32,
     wave_length: f32,
     wave_speed: f32,
+    /// Klarlack: zweite, glatte Schicht über dem Grundmaterial (Lack, Nässe)
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    /// Lichtstreuung unter der Oberfläche: das Licht wickelt sich um die Kante
+    /// (Haut, Laub, Wachs). 0 = aus.
+    subsurface: f32,
+    subsurface_color: [3]f32,
+    /// Texturen (1-basiert, 0 = keine) und Kantenlänge einer Kachel in
+    /// Welteinheiten. Auf Voxelflächen wird achsenparallel projiziert, also
+    /// genau eine Ebene je Fläche – kein Triplanar-Mischen nötig.
+    texture: u32,
+    normal_texture: u32,
+    texture_scale: f32,
+    /// Stärke und Wellenlänge einer erzeugten Detailnormale (ohne Textur)
+    normal_strength: f32,
+    normal_scale: f32,
     reserved: u32,
+};
+
+/// Eine Textur: dicht gepackte RGBA8-Zeilen. Gefiltert wird von Hand
+/// (bilinear, wiederholend) – keine Texturhardware, damit derselbe Code
+/// später auch auf AMD läuft.
+pub const TextureData = extern struct {
+    data: u64,
+    width: u32,
+    height: u32,
 };
 
 pub const max_lights: u32 = 16;

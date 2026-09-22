@@ -586,6 +586,28 @@ pub export fn pyr_world_wait(ctx: ?*PyrContext, world: ?*PyrWorld, camera: ?*con
     return call(ctx, worldWait, .{ w, cam.* });
 }
 
+fn textureCreate(self: *Context, w: u32, h: u32, pixels: []const u8, out: *u32) diag.Error!void {
+    out.* = try self.textureCreate(w, h, pixels);
+}
+
+pub export fn pyr_texture_create(ctx: ?*PyrContext, width: u32, height: u32, rgba8: ?*const anyopaque, out_index: ?*u32) Result {
+    diag.clear();
+    const p = rgba8 orelse return code(diag.fail(error.InvalidArgument, "rgba8 ist NULL", .{}));
+    const o = out_index orelse return code(diag.fail(error.InvalidArgument, "out_index ist NULL", .{}));
+    const n = @as(usize, width) * height * 4;
+    const bytes = @as([*]const u8, @ptrCast(p))[0..n];
+    return call(ctx, textureCreate, .{ width, height, bytes, o });
+}
+
+fn textureDestroy(self: *Context, index: u32) diag.Error!void {
+    try self.textureDestroy(index);
+}
+
+pub export fn pyr_texture_destroy(ctx: ?*PyrContext, index: u32) Result {
+    diag.clear();
+    return call(ctx, textureDestroy, .{index});
+}
+
 fn worldEdit(self: *Context, w: *World, list: []const api.WorldEdit) diag.Error!void {
     if (w.ctx != self) return diag.fail(error.InvalidArgument, "Welt gehört zu einem anderen Kontext", .{});
     try w.edit(list);

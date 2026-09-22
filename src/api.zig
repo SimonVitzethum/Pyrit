@@ -49,6 +49,8 @@ pub const CreateInfo = extern struct {
     max_geometries: u32,
     /// 0 = 16
     max_views: u32,
+    /// Texturplätze, 0 = 256
+    max_textures: u32,
     /// Kantenlänge der AABB-Primitive der RT-Cores als log2 (3..), 0 = 7 (128^3)
     rt_leaf_log2: u32,
     /// 0 = 256 MiB
