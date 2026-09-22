@@ -172,7 +172,7 @@ pub const Feature = struct {
 
         const p = ngx.params;
         c.NVSDK_NGX_Parameter_SetVoidPointer(p, c.NVSDK_NGX_Parameter_Input1, ctx.cu_ctx);
-        c.NVSDK_NGX_Parameter_SetVoidPointer(p, c.NVSDK_NGX_Parameter_Input2, ctx.stream);
+        c.NVSDK_NGX_Parameter_SetVoidPointer(p, c.NVSDK_NGX_Parameter_Input2, ctx.postStream());
         c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_Parameter_Width, in_w);
         c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_Parameter_Height, in_h);
         c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_Parameter_OutWidth, out_w);
@@ -228,8 +228,8 @@ pub const Feature = struct {
             .WidthInBytes = pitch,
             .Height = h,
         };
-        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.stream), "cuMemcpy2DAsync");
-        try ctx.check(ctx.drv.cuStreamSynchronize(ctx.stream), "cuStreamSynchronize");
+        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.postStream()), "cuMemcpy2DAsync");
+        try ctx.check(ctx.drv.cuStreamSynchronize(ctx.postStream()), "cuStreamSynchronize");
     }
 
     fn copyIn(self: *Feature, ctx: *Context, slot: Slot, src: u64) Error!void {
@@ -243,7 +243,7 @@ pub const Feature = struct {
             .WidthInBytes = self.in_w * fm.bytes,
             .Height = self.in_h,
         };
-        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.stream), "cuMemcpy2DAsync");
+        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.postStream()), "cuMemcpy2DAsync");
     }
 
     /// Auswerten auf dem Stream des Kontexts; Ergebnis in `output`.
@@ -309,6 +309,6 @@ pub const Feature = struct {
             .WidthInBytes = self.out_w * 16,
             .Height = self.out_h,
         };
-        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.stream), "cuMemcpy2DAsync");
+        try ctx.check(ctx.drv.cuMemcpy2DAsync_v2(&cp, ctx.postStream()), "cuMemcpy2DAsync");
     }
 };

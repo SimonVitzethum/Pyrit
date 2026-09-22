@@ -173,6 +173,16 @@ pub const Context = struct {
     owns_stream: bool,
     /// zweiter Stream für Hintergrundbauten (Welt): wartet nie auf das Rendern
     aux_stream: cuda.CUstream = null,
+    /// Nachbearbeitung läuft auf einem eigenen Stream: DLSS und TAA arbeiten
+    /// auf den Tensorkernen, während der nächste Frame schon auf den
+    /// Shader-Einheiten rendert. Ereignisse halten die Reihenfolge ein.
+    post_stream: cuda.CUstream = null,
+    render_done: cuda.CUevent = null,
+    post_done: cuda.CUevent = null,
+    post_pending: bool = false,
+    async_post: bool = false,
+    /// true, solange die Nachbearbeitung Kernel einreiht
+    on_post: bool = false,
     aux_event: cuda.CUevent = null,
     exec_main: ExecState = undefined,
     exec_aux: ExecState = undefined,
@@ -339,6 +349,10 @@ pub const Context = struct {
         const drv = &self.drv;
         if (self.owns_stream) try self.check(drv.cuStreamCreate(&self.stream, cuda.CU_STREAM_NON_BLOCKING), "cuStreamCreate");
         try self.check(drv.cuStreamCreate(&self.aux_stream, cuda.CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+        try self.check(drv.cuStreamCreate(&self.post_stream, cuda.CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+        try self.check(drv.cuEventCreate(&self.render_done, cuda.CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        try self.check(drv.cuEventCreate(&self.post_done, cuda.CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        self.async_post = info.flags & api.create_async_post != 0;
         try self.check(drv.cuEventCreate(&self.aux_event, cuda.CU_EVENT_DISABLE_TIMING), "cuEventCreate");
         self.exec_main = .{ .ctx = self, .stream = self.stream };
         self.exec_aux = .{ .ctx = self, .stream = self.aux_stream };
@@ -472,6 +486,7 @@ pub const Context = struct {
     pub fn destroy(self: *Context) void {
         self.enter() catch {};
         if (self.stream != null) _ = self.drv.cuStreamSynchronize(self.stream);
+        if (self.post_stream != null) _ = self.drv.cuStreamSynchronize(self.post_stream);
         if (self.aux_stream != null) _ = self.drv.cuStreamSynchronize(self.aux_stream);
         self.freeResources();
         self.leave();
@@ -523,6 +538,9 @@ pub const Context = struct {
         if (self.module != null) _ = drv.cuModuleUnload(self.module);
         if (self.owns_stream and self.stream != null) _ = drv.cuStreamDestroy_v2(self.stream);
         if (self.aux_stream != null) _ = drv.cuStreamDestroy_v2(self.aux_stream);
+        if (self.post_stream != null) _ = drv.cuStreamDestroy_v2(self.post_stream);
+        if (self.render_done != null) _ = drv.cuEventDestroy_v2(self.render_done);
+        if (self.post_done != null) _ = drv.cuEventDestroy_v2(self.post_done);
         if (self.aux_event != null) _ = drv.cuEventDestroy_v2(self.aux_event);
         self.node_alloc.deinit(self.gpa);
         self.leaf_alloc.deinit(self.gpa);
@@ -604,9 +622,21 @@ pub const Context = struct {
         try self.upload(dst, std.mem.asBytes(value));
     }
 
+    /// Stream, auf den die Kernel gerade laufen (die Nachbearbeitung schaltet
+    /// ihn auf post_stream um, damit sie mit dem nächsten Frame überlappt)
+    /// Stream der Nachbearbeitung (für DLSS und andere Fremdaufrufe)
+    pub fn postStream(self: *Context) cuda.CUstream {
+        return self.activeStream();
+    }
+
+    fn activeStream(self: *Context) cuda.CUstream {
+        return if (self.on_post) self.post_stream else self.stream;
+    }
+
     pub fn launch(self: *Context, f: cuda.CUfunction, grid: [3]u32, block: [3]u32, params: []const ?*anyopaque) Error!void {
-        try self.check(self.drv.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, self.stream, @constCast(params.ptr), null), "cuLaunchKernel");
-        if (self.debug) try self.check(self.drv.cuStreamSynchronize(self.stream), "Kernel");
+        const st = self.activeStream();
+        try self.check(self.drv.cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, st, @constCast(params.ptr), null), "cuLaunchKernel");
+        if (self.debug) try self.check(self.drv.cuStreamSynchronize(st), "Kernel");
     }
 
     fn uploadScene(self: *Context) Error!void {
@@ -1877,6 +1907,24 @@ pub const Context = struct {
     }
 
     pub fn postprocess(self: *Context, view: usize, in: *const api.Targets, info: *const api.PostInfo) Error!void {
+        // Nachbearbeitung auf einem eigenen Stream: sie hängt nur am Rendern
+        // *dieses* Frames, nicht am nächsten. DLSS und TAA laufen dann auf den
+        // Tensorkernen, während die Shader-Einheiten schon den nächsten Frame
+        // rechnen. Ohne PYR_CREATE_ASYNC_POST wartet der nächste Frame
+        // trotzdem, weil er sonst in dieselben Ziele schreiben würde.
+        if (self.post_stream != null) {
+            try self.check(self.drv.cuEventRecord(self.render_done, self.stream), "cuEventRecord");
+            try self.check(self.drv.cuStreamWaitEvent(self.post_stream, self.render_done, 0), "cuStreamWaitEvent");
+            self.on_post = true;
+        }
+        defer if (self.on_post) {
+            self.on_post = false;
+            _ = self.drv.cuEventRecord(self.post_done, self.post_stream);
+            self.post_pending = true;
+            // Ohne eigene Zielsätze muss der nächste Frame warten: sonst
+            // überschreibt er die Ziele, aus denen hier noch gelesen wird.
+            if (!self.async_post) _ = self.drv.cuStreamWaitEvent(self.stream, self.post_done, 0);
+        };
         const v = try self.viewSlot(view);
         if (!v.has_last) return fail(error.InvalidArgument, "pyr_postprocess vor dem ersten pyr_render dieser Ansicht", .{});
         if (in.color == 0 or in.normal == 0 or in.albedo == 0 or in.motion == 0 or in.hits == 0)
@@ -2188,6 +2236,15 @@ pub const Context = struct {
 
     /// Zwischenbild zwischen den letzten beiden TAAU-Ausgaben
     pub fn frameGenerate(self: *Context, view: usize, info: *const api.FrameGenInfo) Error!void {
+        // gehört zur Ausgabekette, läuft also auf demselben Stream wie die
+        // Nachbearbeitung und überlappt mit dem nächsten Frame
+        if (self.post_stream != null) self.on_post = true;
+        defer if (self.on_post) {
+            self.on_post = false;
+            _ = self.drv.cuEventRecord(self.post_done, self.post_stream);
+            self.post_pending = true;
+            if (!self.async_post) _ = self.drv.cuStreamWaitEvent(self.stream, self.post_done, 0);
+        };
         const v = try self.viewSlot(view);
         if (!v.up_valid or v.up_frames < 2)
             return fail(error.InvalidArgument, "Frame Generation braucht zwei aufeinanderfolgende pyr_postprocess mit TAAU", .{});
@@ -2254,6 +2311,10 @@ pub const Context = struct {
 
     pub fn synchronize(self: *Context) Error!void {
         try self.check(self.drv.cuStreamSynchronize(self.stream), "cuStreamSynchronize");
+        if (self.post_pending) {
+            try self.check(self.drv.cuStreamSynchronize(self.post_stream), "cuStreamSynchronize");
+            self.post_pending = false;
+        }
         try self.releaseDeferred(false);
     }
 };

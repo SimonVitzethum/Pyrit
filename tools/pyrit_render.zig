@@ -149,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
     var use_env = false;
     var bounces: u32 = 0;
     var fog: f32 = 0;
+    var async_post = false;
     var chunk_capacity: u32 = 0;
     var edit_load = false;
     var edit_stream = false;
@@ -224,6 +225,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--fog") and i + 1 < args.len) {
             i += 1;
             fog = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--async-post")) {
+            async_post = true;
         } else if (std.mem.eql(u8, a, "--env")) {
             use_env = true;
         } else if (std.mem.eql(u8, a, "--materials")) {
@@ -279,6 +282,7 @@ pub fn main(init: std.process.Init) !void {
     ci.struct_size = @sizeOf(api.CreateInfo);
     ci.version = api.version;
     ci.flags = flags;
+    if (async_post) ci.flags |= api.create_async_post;
     if (world_mode) {
         // feines LOD braucht viele Chunks
         if (std.c.getenv("PYRIT_LOG") != null or std.c.getenv("PYRIT_WORLD_PROFILE") != null) ci.log = logCb;
@@ -292,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, bounces, fog);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -449,7 +453,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, bounces: u32, fog: f32) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, bounces: u32, fog: f32, async_post: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -578,22 +582,33 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var view: api.Handle = null;
     req(pyrit.pyr_view_create(@ptrCast(ctx), &view));
     const n: usize = @as(usize, w) * h;
-    var tg = std.mem.zeroes(api.Targets);
-    tg.hits = devAlloc(n * 16);
-    tg.motion = devAlloc(n * 8);
-    tg.color = devAlloc(n * 16);
-    tg.normal = devAlloc(n * 16);
-    tg.albedo = devAlloc(n * 16);
-    // DLSS Ray Reconstruction bekommt Rauheit und Metall je Pixel
-    if (upscaler == api.upscaler_dlss_rr) tg.material = devAlloc(n * 8);
-    tg.ray_mask = 0x1;
-    if (coarse_secondary) tg.secondary_mask = 0x2;
+    // Mit überlappender Nachbearbeitung braucht es zwei Zielsätze: der nächste
+    // Frame rendert schon, während aus dem vorigen noch gelesen wird.
+    const sets: usize = if (async_post) 2 else 1;
+    var tgs: [2]api.Targets = .{ std.mem.zeroes(api.Targets), std.mem.zeroes(api.Targets) };
+    for (0..sets) |si| {
+        tgs[si].hits = devAlloc(n * 16);
+        tgs[si].motion = devAlloc(n * 8);
+        tgs[si].color = devAlloc(n * 16);
+        tgs[si].normal = devAlloc(n * 16);
+        tgs[si].albedo = devAlloc(n * 16);
+        // DLSS Ray Reconstruction bekommt Rauheit und Metall je Pixel
+        if (upscaler == api.upscaler_dlss_rr) tgs[si].material = devAlloc(n * 8);
+        tgs[si].ray_mask = 0x1;
+        if (coarse_secondary) tgs[si].secondary_mask = 0x2;
+    }
+    var tg = tgs[0];
     const n_out: usize = @as(usize, out_w) * out_h;
     const ldr = devAlloc(n_out * 4);
     const ldr_fg = devAlloc(n_out * 4);
-    defer for ([_]u64{ tg.hits, tg.motion, tg.color, tg.normal, tg.albedo, ldr, ldr_fg }) |b| {
-        _ = drv.cuMemFree_v2(b);
-    };
+    defer {
+        for (0..sets) |si| {
+            for ([_]u64{ tgs[si].hits, tgs[si].motion, tgs[si].color, tgs[si].normal, tgs[si].albedo }) |b| {
+                if (b != 0) _ = drv.cuMemFree_v2(b);
+            }
+        }
+        for ([_]u64{ ldr, ldr_fg }) |b| _ = drv.cuMemFree_v2(b);
+    }
     var post = std.mem.zeroes(api.PostInfo);
     post.output_ldr = ldr;
     post.denoise_iterations = denoise;
@@ -740,6 +755,8 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         req(pyrit.pyr_commit(@ptrCast(ctx), &fi));
         if (profile) req(pyrit.pyr_synchronize(@ptrCast(ctx)));
         const tp1 = std.Io.Timestamp.now(init.io, .awake);
+        tg = tgs[if (sets == 2) f % 2 else 0];
+        tg = tgs[if (sets == 2) f % 2 else 0];
         req(pyrit.pyr_render(@ptrCast(ctx), view, &cam, &tg));
         if (profile) req(pyrit.pyr_synchronize(@ptrCast(ctx)));
         const tp2 = std.Io.Timestamp.now(init.io, .awake);

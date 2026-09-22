@@ -183,6 +183,14 @@ Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über diesel
 
 4. **Tonemapping:** ACES, Reinhard oder keines. Ausgabe als HDR (`output_hdr`) und/oder RGBA8 sRGB (`output_ldr`).
 
+### Überlappung mit dem nächsten Frame
+
+Die Nachbearbeitung läuft auf einem eigenen CUDA-Stream, angebunden an das Rendern *dieses* Frames über ein Ereignis. DLSS und TAA arbeiten damit auf den Tensorkernen, während die Shader- und RT-Einheiten schon den nächsten Frame rechnen können. Voraussetzung ist `PYR_CREATE_ASYNC_POST`: ohne das Flag wartet der nächste Frame auf die Nachbearbeitung des vorigen, weil er sonst in dieselben Ziele schreiben würde, aus denen noch gelesen wird.
+
+Mit dem Flag muss die Anwendung **zwei Sätze von `PyrTargets` abwechselnd** benutzen und darf nicht nach jedem Frame synchronisieren – sonst gibt es nichts zu überlappen. `pyr_synchronize` wartet auf beide Ströme.
+
+Nachgemessen: das überlappende Bild ist **pixelgleich** zum seriellen (RMSE 0,000), die Synchronisation stimmt also. Ein Geschwindigkeitsgewinn ließ sich bisher nicht messen, weil die Test-GPU zu 99 % von einem anderen Prozess belegt war – ohne freie Einheiten kann Überlappung nichts gewinnen. Die Zahl steht noch aus.
+
 Für TAAU und DLSS gehört pro Frame ein Jitter in die Kamera (`pyr_jitter_halton(frame)` → `camera.jitter`). Die Verlaufspuffer gehören der Ansicht. `PYR_POST_RESET` verwirft den Verlauf, etwa bei einem Kameraschnitt.
 
 **Frame Generation** (`pyr_frame_generate(ctx, view, &info)`), reines CUDA: Nach `pyr_postprocess` von Frame N entsteht ein Zwischenbild zwischen N−1 und N (`info.t`, Standard 0,5; für mehrere Zwischenbilder mehrfach mit 1/3, 2/3 …). Grundlage sind die exakten Motion Vectors und die Tiefe: Jedes Pixel wirft seinen Bewegungsvektor in das Zwischenbild (die kleinste Tiefe gewinnt, also die richtige Verdeckung); wo nichts ankommt, sucht ein Fixpunktverfahren. Das Zwischenbild wird vor Frame N angezeigt. Eigene Verfahren hängt man über `info.generate` ein: Pyrit ruft die Funktion mit allen Eingaben (`PyrFrameGenParams`: beide Frames in HDR, MV und Tiefe in Ausgabeauflösung) und dem Stream auf. Funktioniert hinter TAAU und hinter DLSS. DLSS-FG selbst ist ohne D3D12/Vulkan nicht nutzbar.

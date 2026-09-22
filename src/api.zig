@@ -25,6 +25,11 @@ pub const LogFn = ?*const fn (user: ?*anyopaque, level: i32, message: [*:0]const
 
 /// zusätzliche Prüfungen, synchrone Fehlerberichte
 pub const create_debug: u32 = 0x1;
+/// Nachbearbeitung überlappt mit dem nächsten Frame: DLSS und TAA laufen auf
+/// den Tensorkernen, während die Shader-Einheiten schon weiterrechnen. Dafür
+/// muss die Anwendung zwei Sätze von PyrTargets abwechselnd benutzen, sonst
+/// überschreibt der nächste Frame, woraus die Nachbearbeitung noch liest.
+pub const create_async_post: u32 = 0x40;
 /// RT-Cores nicht verwenden, immer CUDA-Traversierung
 pub const create_no_rt: u32 = 0x2;
 /// RT-Cores immer verwenden (sonst erst ab einigen Instanzen, wo sie schneller sind)

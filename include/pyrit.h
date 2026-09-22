@@ -322,6 +322,11 @@ PYR_API const char* pyr_error_message(void);
  * Kontext
  * ------------------------------------------------------------------------- */
 
+/* Nachbearbeitung überlappt mit dem nächsten Frame: DLSS und TAA laufen auf
+ * den Tensorkernen, während die Shader-Einheiten schon weiterrechnen. Dafür
+ * muss die Anwendung zwei Saetze von PyrTargets abwechselnd benutzen, sonst
+ * ueberschreibt der naechste Frame, woraus die Nachbearbeitung noch liest. */
+#define PYR_CREATE_ASYNC_POST 0x40u
 #define PYR_CREATE_DEBUG 0x1u  /* zusätzliche Prüfungen, synchrone Fehlerberichte */
 #define PYR_CREATE_NO_RT    0x2u  /* RT-Cores nicht verwenden, immer CUDA-Traversierung */
 #define PYR_CREATE_FORCE_RT 0x4u  /* RT-Cores immer verwenden (sonst erst ab einigen Instanzen) */
