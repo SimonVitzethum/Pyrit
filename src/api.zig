@@ -157,6 +157,56 @@ pub const PostInfo = extern struct {
     upscaler: u32,
     /// Stärke der Varianzführung im Denoiser, 0 = 4 (kleiner = glatter)
     denoise_phi: f32,
+    /// Kamera- und Bildeffekte; NULL = keine
+    fx: ?*const PostFx,
+};
+
+// Kamera- und Bildeffekte (PyrPostFx.flags)
+pub const postfx_bloom: u32 = 0x1;
+pub const postfx_dof: u32 = 0x2;
+pub const postfx_motion_blur: u32 = 0x4;
+pub const postfx_auto_exposure: u32 = 0x8;
+pub const postfx_grade: u32 = 0x10;
+/// Schärfeebene aus der Tiefe in der Bildmitte nachführen
+pub const postfx_autofocus: u32 = 0x20;
+
+/// Kamera- und Bildeffekte auf dem fertigen Bild. Alle 0 = aus; die Werte
+/// unten sind die Vorgaben, wenn ein Feld 0 bleibt.
+pub const PostFx = extern struct {
+    /// postfx_*
+    flags: u32,
+    /// Bloom
+    bloom_strength: f32 = 0,
+    bloom_threshold: f32 = 0,
+    bloom_knee: f32 = 0,
+    bloom_levels: u32 = 0,
+    /// Tiefenschärfe: Entfernung der Schärfeebene (mit postfx_autofocus egal),
+    /// Zerstreuungskreis in Pixeln bei unendlich (0 = 3) und dessen Obergrenze
+    focus_distance: f32 = 0,
+    dof_strength: f32 = 0,
+    dof_max_coc: f32 = 0,
+    /// Bewegungsunschärfe: Verschlussanteil, größte Strecke, Abtastungen
+    motion_blur_scale: f32 = 0,
+    motion_blur_max: f32 = 0,
+    motion_blur_samples: u32 = 0,
+    /// Belichtungsautomatik
+    exposure_speed: f32 = 0,
+    exposure_min: f32 = 0,
+    exposure_max: f32 = 0,
+    /// Korrektur in Blendenstufen
+    exposure_compensation: f32 = 0,
+    /// Farbkorrektur (nur mit postfx_grade)
+    temperature: f32 = 0,
+    tint: f32 = 0,
+    contrast: f32 = 0,
+    saturation: f32 = 0,
+    lift: [3]f32 = .{ 0, 0, 0 },
+    gamma: [3]f32 = .{ 1, 1, 1 },
+    gain: [3]f32 = .{ 1, 1, 1 },
+    /// 3D-LUT im Anzeigeraum: RGBA8, Kantenlänge lut_size, Reihenfolge x+y·n+z·n²
+    lut: u64 = 0,
+    lut_size: u32 = 0,
+    reserved_fx: u32 = 0,
 };
 
 /// TAAU (auch ohne Skalierung: TAA mit Subpixel-Rekonstruktion)

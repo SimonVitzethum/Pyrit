@@ -86,6 +86,17 @@ const ViewSlot = struct {
     post_buf: [6]cuda.CUdeviceptr = .{ 0, 0, 0, 0, 0, 0 },
     /// Helligkeitsmomente je Parität und Varianz (Akkumulation + Filter-Pingpong)
     post_mom: [2]cuda.CUdeviceptr = .{ 0, 0 },
+    /// Kamera- und Bildeffekte: zwei HDR-Puffer, Bewegung/Tiefe, Bloom-Pyramide,
+    /// Belichtungszustand (bleibt über Frames stehen)
+    fx_buf: [2]cuda.CUdeviceptr = .{ 0, 0 },
+    fx_mvd: cuda.CUdeviceptr = 0,
+    fx_bloom: [8]cuda.CUdeviceptr = .{0} ** 8,
+    fx_bloom_w: [8]u32 = .{0} ** 8,
+    fx_bloom_h: [8]u32 = .{0} ** 8,
+    fx_levels: u32 = 0,
+    fx_expose: cuda.CUdeviceptr = 0,
+    fx_w: u32 = 0,
+    fx_h: u32 = 0,
     post_var: [3]cuda.CUdeviceptr = .{ 0, 0, 0 },
     post_parity: u1 = 0,
     post_valid: bool = false,
@@ -193,6 +204,15 @@ pub const Context = struct {
     fn_fg_splat_mv: cuda.CUfunction = null,
     fn_build: cuda.CUfunction = null,
     fn_gen_terrain: cuda.CUfunction = null,
+    fn_fx_pack_mvd: cuda.CUfunction = null,
+    fn_fx_dof: cuda.CUfunction = null,
+    fn_fx_motion: cuda.CUfunction = null,
+    fn_fx_bloom_pre: cuda.CUfunction = null,
+    fn_fx_bloom_down: cuda.CUfunction = null,
+    fn_fx_bloom_up: cuda.CUfunction = null,
+    fn_fx_expose_scan: cuda.CUfunction = null,
+    fn_fx_expose_apply: cuda.CUfunction = null,
+    fn_fx_resolve: cuda.CUfunction = null,
     fn_edit_apply: cuda.CUfunction = null,
     fn_edit_compact: cuda.CUfunction = null,
     fn_edit_append: cuda.CUfunction = null,
@@ -414,6 +434,19 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat_mv, self.module, "pyr_k_fg_splat_mv"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_build, self.module, "pyr_k_build"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gen_terrain, self.module, "pyr_k_gen_terrain"), "cuModuleGetFunction");
+        inline for (.{
+            .{ "fn_fx_pack_mvd", "pyr_k_fx_pack_mvd" },
+            .{ "fn_fx_dof", "pyr_k_fx_dof" },
+            .{ "fn_fx_motion", "pyr_k_fx_motion" },
+            .{ "fn_fx_bloom_pre", "pyr_k_fx_bloom_pre" },
+            .{ "fn_fx_bloom_down", "pyr_k_fx_bloom_down" },
+            .{ "fn_fx_bloom_up", "pyr_k_fx_bloom_up" },
+            .{ "fn_fx_expose_scan", "pyr_k_fx_expose_scan" },
+            .{ "fn_fx_expose_apply", "pyr_k_fx_expose_apply" },
+            .{ "fn_fx_resolve", "pyr_k_fx_resolve" },
+        }) |f| {
+            try self.check(self.drv.cuModuleGetFunction(&@field(self, f[0]), self.module, f[1]), "cuModuleGetFunction");
+        }
         try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_apply, self.module, "pyr_k_edit_apply"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_compact, self.module, "pyr_k_edit_compact"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_append, self.module, "pyr_k_edit_append"), "cuModuleGetFunction");
@@ -1459,6 +1492,7 @@ pub const Context = struct {
         v.gi_w = 0;
         v.gi_h = 0;
         freeUpscale(drv, v);
+        freeFx(drv, v);
     }
 
     /// Puffer (Verlauf 2x, Normale/Tiefe 2x, Filter 2x) passend zur Auflösung
@@ -1473,6 +1507,210 @@ pub const Context = struct {
         for (&v.post_var) |*b| b.* = try self.devAlloc(@as(u64, w) * h * 2, "Nachbearbeitung");
         v.post_w = w;
         v.post_h = h;
+    }
+
+    // -----------------------------------------------------------------------
+    // Kamera- und Bildeffekte (src/device/postfx.zig)
+    // -----------------------------------------------------------------------
+
+    fn freeFx(drv: *const cuda.Driver, v: *ViewSlot) void {
+        for (&v.fx_buf) |*b| {
+            if (b.* != 0) _ = drv.cuMemFree_v2(b.*);
+            b.* = 0;
+        }
+        for (&v.fx_bloom) |*b| {
+            if (b.* != 0) _ = drv.cuMemFree_v2(b.*);
+            b.* = 0;
+        }
+        for ([_]*cuda.CUdeviceptr{ &v.fx_mvd, &v.fx_expose }) |b| {
+            if (b.* != 0) _ = drv.cuMemFree_v2(b.*);
+            b.* = 0;
+        }
+        v.fx_w = 0;
+        v.fx_h = 0;
+        v.fx_levels = 0;
+    }
+
+    fn ensureFx(self: *Context, v: *ViewSlot, w: u32, h: u32, levels: u32) Error!void {
+        if (v.fx_w == w and v.fx_h == h and v.fx_levels == levels) return;
+        try self.check(self.drv.cuStreamSynchronize(self.stream), "cuStreamSynchronize");
+        freeFx(&self.drv, v);
+        const n = @as(u64, w) * h;
+        for (&v.fx_buf) |*b| b.* = try self.devAlloc(n * 16, "Bildeffekte");
+        v.fx_mvd = try self.devAlloc(n * 16, "Bildeffekte: Bewegung und Tiefe");
+        // Belichtung: 2 x u32 Zähler, 2 x f32 Zustand. Der Zustand überlebt
+        // Frames, deshalb hier auf 0 setzen (0 = noch keine Messung).
+        v.fx_expose = try self.devAlloc(16, "Bildeffekte: Belichtung");
+        try self.check(self.drv.cuMemsetD8Async(v.fx_expose, 0, 16, self.stream), "cuMemsetD8Async");
+        var lw = @max(w / 2, 1);
+        var lh = @max(h / 2, 1);
+        var i: u32 = 0;
+        while (i < levels and i < v.fx_bloom.len) : (i += 1) {
+            v.fx_bloom[i] = try self.devAlloc(@as(u64, lw) * lh * 8, "Bildeffekte: Bloom");
+            v.fx_bloom_w[i] = lw;
+            v.fx_bloom_h[i] = lh;
+            lw = @max(lw / 2, 1);
+            lh = @max(lh / 2, 1);
+        }
+        v.fx_w = w;
+        v.fx_h = h;
+        v.fx_levels = levels;
+    }
+
+    fn fxLaunch(self: *Context, f: cuda.CUfunction, p: *types.PostFxParams, count: u64) Error!void {
+        const b = types.postfx_block;
+        const grid: u32 = @intCast((count + b - 1) / b);
+        const params = [_]?*anyopaque{@ptrCast(p)};
+        try self.launch(f, .{ @max(grid, 1), 1, 1 }, .{ b, 1, 1 }, &params);
+    }
+
+    /// Die Effektkette auf einem HDR-Bild in Ausgabeauflösung. `hdr` ist die
+    /// Quelle (4 x f32); `mvd` liefert Bewegung und Tiefe, oder 0, dann wird
+    /// beides aus der Renderauflösung gepackt.
+    fn runFx(self: *Context, v: *ViewSlot, in: *const api.Targets, info: *const api.PostInfo, fx: *const api.PostFx, w: u32, h: u32, hdr: cuda.CUdeviceptr, mvd_in: cuda.CUdeviceptr) Error!void {
+        const levels: u32 = if (fx.flags & api.postfx_bloom != 0)
+            @min(if (fx.bloom_levels == 0) 5 else fx.bloom_levels, v.fx_bloom.len)
+        else
+            0;
+        try self.ensureFx(v, w, h, levels);
+        const n = @as(u64, w) * h;
+
+        var p = std.mem.zeroes(types.PostFxParams);
+        p.width = w;
+        p.height = h;
+        p.dst_width = w;
+        p.dst_height = h;
+        p.tonemap = info.tonemap;
+        p.bgra = @intFromBool(info.flags & api.post_bgra != 0);
+        p.exposure = if (info.exposure > 0) info.exposure else 1;
+
+        // Bewegung und Tiefe
+        var mvd = mvd_in;
+        if (mvd == 0) {
+            p.mvd = v.fx_mvd;
+            p.mv_src = in.motion;
+            p.normal_src = in.normal;
+            p.dst_width = v.last.camera.width;
+            p.dst_height = v.last.camera.height;
+            try self.fxLaunch(self.fn_fx_pack_mvd, &p, n);
+            p.dst_width = w;
+            p.dst_height = h;
+            mvd = v.fx_mvd;
+        }
+        p.mvd = mvd;
+
+        var src = hdr;
+        var other = if (hdr == v.fx_buf[0]) v.fx_buf[1] else v.fx_buf[0];
+
+        if (fx.flags & api.postfx_dof != 0) {
+            p.dof_autofocus = @intFromBool(fx.flags & api.postfx_autofocus != 0);
+            p.dof_focus = if (fx.focus_distance > 0) fx.focus_distance else 10;
+            p.dof_strength = if (fx.dof_strength > 0) fx.dof_strength else 3;
+            p.dof_max_coc = if (fx.dof_max_coc > 0) fx.dof_max_coc else 12;
+            p.color = src;
+            p.dst = other;
+            try self.fxLaunch(self.fn_fx_dof, &p, n);
+            const t = src;
+            src = other;
+            other = t;
+        }
+
+        if (fx.flags & api.postfx_motion_blur != 0) {
+            p.blur_scale = if (fx.motion_blur_scale > 0) fx.motion_blur_scale else 0.5;
+            p.blur_max = if (fx.motion_blur_max > 0) fx.motion_blur_max else 64;
+            p.blur_samples = if (fx.motion_blur_samples > 0) fx.motion_blur_samples else 12;
+            p.color = src;
+            p.dst = other;
+            try self.fxLaunch(self.fn_fx_motion, &p, n);
+            const t = src;
+            src = other;
+            other = t;
+        }
+
+        if (levels > 0) {
+            p.bloom_threshold = if (fx.bloom_threshold > 0) fx.bloom_threshold else 1;
+            p.bloom_knee = if (fx.bloom_knee > 0) fx.bloom_knee else 0.5;
+            // Abschöpfen und halbieren
+            p.color = src;
+            p.src_half = 0;
+            p.width = w;
+            p.height = h;
+            p.dst = v.fx_bloom[0];
+            p.dst_width = v.fx_bloom_w[0];
+            p.dst_height = v.fx_bloom_h[0];
+            try self.fxLaunch(self.fn_fx_bloom_pre, &p, @as(u64, p.dst_width) * p.dst_height);
+            p.src_half = 1;
+            var i: u32 = 1;
+            while (i < levels) : (i += 1) {
+                p.color = v.fx_bloom[i - 1];
+                p.width = v.fx_bloom_w[i - 1];
+                p.height = v.fx_bloom_h[i - 1];
+                p.dst = v.fx_bloom[i];
+                p.dst_width = v.fx_bloom_w[i];
+                p.dst_height = v.fx_bloom_h[i];
+                try self.fxLaunch(self.fn_fx_bloom_down, &p, @as(u64, p.dst_width) * p.dst_height);
+            }
+            // und wieder hoch, jede Stufe in ihre größere addiert
+            i = levels - 1;
+            while (i > 0) : (i -= 1) {
+                p.color = v.fx_bloom[i];
+                p.width = v.fx_bloom_w[i];
+                p.height = v.fx_bloom_h[i];
+                p.dst = v.fx_bloom[i - 1];
+                p.dst_width = v.fx_bloom_w[i - 1];
+                p.dst_height = v.fx_bloom_h[i - 1];
+                try self.fxLaunch(self.fn_fx_bloom_up, &p, @as(u64, p.dst_width) * p.dst_height);
+            }
+            p.bloom = v.fx_bloom[0];
+            p.bloom_width = v.fx_bloom_w[0];
+            p.bloom_height = v.fx_bloom_h[0];
+            p.bloom_strength = if (fx.bloom_strength > 0) fx.bloom_strength else 0.05;
+            p.width = w;
+            p.height = h;
+            p.dst_width = w;
+            p.dst_height = h;
+            p.src_half = 0;
+        }
+
+        if (fx.flags & api.postfx_auto_exposure != 0) {
+            p.expose_acc = v.fx_expose;
+            p.expose_state = v.fx_expose + 8;
+            p.expose_speed = if (fx.exposure_speed > 0) fx.exposure_speed else 0.05;
+            p.expose_min = if (fx.exposure_min > 0) fx.exposure_min else 0.03;
+            p.expose_max = if (fx.exposure_max > 0) fx.exposure_max else 30;
+            p.expose_compensation = fx.exposure_compensation;
+            p.color = src;
+            const step: u64 = 4;
+            const sw = (@as(u64, w) + step - 1) / step;
+            const sh = (@as(u64, h) + step - 1) / step;
+            try self.fxLaunch(self.fn_fx_expose_scan, &p, sw * sh);
+            try self.fxLaunch(self.fn_fx_expose_apply, &p, 1);
+        }
+
+        if (fx.flags & api.postfx_grade != 0) {
+            p.grade = 1;
+            p.temperature = fx.temperature;
+            p.tint = fx.tint;
+            p.contrast = if (fx.contrast > 0) fx.contrast else 1;
+            p.saturation = if (fx.saturation > 0) fx.saturation else 1;
+            p.lift = fx.lift;
+            p.gamma = .{
+                if (fx.gamma[0] > 0) fx.gamma[0] else 1,
+                if (fx.gamma[1] > 0) fx.gamma[1] else 1,
+                if (fx.gamma[2] > 0) fx.gamma[2] else 1,
+            };
+            p.gain = .{
+                if (fx.gain[0] > 0) fx.gain[0] else 1,
+                if (fx.gain[1] > 0) fx.gain[1] else 1,
+                if (fx.gain[2] > 0) fx.gain[2] else 1,
+            };
+        }
+        p.lut = fx.lut;
+        p.lut_size = fx.lut_size;
+        p.color = src;
+        p.out_hdr = info.output_hdr;
+        p.out_ldr = info.output_ldr;
+        try self.fxLaunch(self.fn_fx_resolve, &p, n);
     }
 
     fn freeDlss(self: *Context, v: *ViewSlot) void {
@@ -1576,8 +1814,20 @@ pub const Context = struct {
         p.var_src = 0;
         p.var_dst = 0;
         p.src = src;
+        const fx: ?*const api.PostFx = if (info.fx) |f| (if (f.flags != 0) f else null) else null;
         if (mode == api.upscaler_none) {
-            try self.launch(self.fn_resolve, grid, block, &params_ptr);
+            if (fx) |f| {
+                // Erst HDR in den Effektpuffer, dann die Kette; sie schreibt
+                // die endgültige Ausgabe.
+                try self.ensureFx(v, w, h, if (f.flags & api.postfx_bloom != 0) @min(if (f.bloom_levels == 0) 5 else f.bloom_levels, 8) else 0);
+                p.out_hdr = v.fx_buf[0];
+                p.hdr_half = 0;
+                p.out_ldr = 0;
+                try self.launch(self.fn_resolve, grid, block, &params_ptr);
+                try self.runFx(v, in, info, f, w, h, v.fx_buf[0], 0);
+            } else {
+                try self.launch(self.fn_resolve, grid, block, &params_ptr);
+            }
         } else {
             // entrauschte HDR-Farbe in Renderauflösung, dann TAAU in Ausgabeauflösung
             if (v.lr_buf == 0) v.lr_buf = try self.devAlloc(@as(u64, w) * h * 8, "Nachbearbeitung");
@@ -1585,7 +1835,7 @@ pub const Context = struct {
             p.hdr_half = 1;
             p.out_ldr = 0;
             try self.launch(self.fn_resolve, grid, block, &params_ptr);
-            try self.upscale(v, in, info, out_w, out_h, temporal_ok);
+            try self.upscale(v, in, info, out_w, out_h, temporal_ok, fx);
         }
 
         v.post_parity = prev;
@@ -1737,7 +1987,7 @@ pub const Context = struct {
         v2c.* = .{ sx, 0, 0, 0, 0, sy, 0, 0, cam.shift[0], cam.shift[1], 0, -1, 0, 0, near, 0 };
     }
 
-    fn upscale(self: *Context, v: *ViewSlot, in: *const api.Targets, info: *const api.PostInfo, out_w: u32, out_h: u32, history_ok: bool) Error!void {
+    fn upscale(self: *Context, v: *ViewSlot, in: *const api.Targets, info: *const api.PostInfo, out_w: u32, out_h: u32, history_ok: bool, fx: ?*const api.PostFx) Error!void {
         const w = v.last.camera.width;
         const h = v.last.camera.height;
         if (v.up_w != out_w or v.up_h != out_h) {
@@ -1773,9 +2023,17 @@ pub const Context = struct {
         u.bgra = @intFromBool(info.flags & api.post_bgra != 0);
         u.out_hdr = info.output_hdr;
         u.out_ldr = info.output_ldr;
+        if (fx) |f| {
+            // TAAU liefert HDR und (in mvd_out) Bewegung und Tiefe in
+            // Ausgabeauflösung – genau, was die Effektkette braucht.
+            try self.ensureFx(v, out_w, out_h, if (f.flags & api.postfx_bloom != 0) @min(if (f.bloom_levels == 0) 5 else f.bloom_levels, 8) else 0);
+            u.out_hdr = v.fx_buf[0];
+            u.out_ldr = 0;
+        }
         const b = types.upscale_block;
         const params_ptr = [_]?*anyopaque{@ptrCast(&u)};
         try self.launch(self.fn_taau, .{ (out_w + b - 1) / b, (out_h + b - 1) / b, 1 }, .{ b, b, 1 }, &params_ptr);
+        if (fx) |f| try self.runFx(v, in, info, f, out_w, out_h, v.fx_buf[0], v.up_buf[2]);
         v.up_parity = cur ^ 1;
         v.up_frames = if (ok) v.up_frames + 1 else 1;
         v.up_valid = true;

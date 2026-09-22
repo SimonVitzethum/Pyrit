@@ -147,6 +147,46 @@ export fn pyr_k_edit_append(p: types.WorldEditParams) callconv(kernel) void {
 // Hochskalieren und Frame Generation (Logik in src/device/upscale.zig)
 // ---------------------------------------------------------------------------
 
+fn fxIndex() u64 {
+    return @as(u64, @workGroupId(0)) * types.postfx_block + @workItemId(0);
+}
+
+export fn pyr_k_fx_pack_mvd(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.packMvd(&p, fxIndex());
+}
+
+export fn pyr_k_fx_dof(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.dof(&p, fxIndex());
+}
+
+export fn pyr_k_fx_motion(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.motionBlur(&p, fxIndex());
+}
+
+export fn pyr_k_fx_bloom_pre(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.bloomPrefilter(&p, fxIndex());
+}
+
+export fn pyr_k_fx_bloom_down(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.bloomDown(&p, fxIndex());
+}
+
+export fn pyr_k_fx_bloom_up(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.bloomUp(&p, fxIndex());
+}
+
+export fn pyr_k_fx_expose_scan(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.exposeScan(&p, fxIndex());
+}
+
+export fn pyr_k_fx_expose_apply(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.exposeApply(&p, fxIndex());
+}
+
+export fn pyr_k_fx_resolve(p: types.PostFxParams) callconv(kernel) void {
+    pyr.postfx.resolveFx(&p, fxIndex());
+}
+
 export fn pyr_k_taau(p: types.UpscaleParams) callconv(kernel) void {
     const x = @workGroupId(0) * types.upscale_block + @workItemId(0);
     const y = @workGroupId(1) * types.upscale_block + @workItemId(1);

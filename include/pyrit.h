@@ -482,6 +482,44 @@ PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g,
 #define PYR_TONEMAP_REINHARD 1u
 #define PYR_TONEMAP_NONE     2u
 
+/* Kamera- und Bildeffekte (PyrPostFx.flags) */
+#define PYR_POSTFX_BLOOM          0x1u
+#define PYR_POSTFX_DOF            0x2u
+#define PYR_POSTFX_MOTION_BLUR    0x4u
+#define PYR_POSTFX_AUTO_EXPOSURE  0x8u
+#define PYR_POSTFX_GRADE          0x10u
+#define PYR_POSTFX_AUTOFOCUS      0x20u
+
+/* Kamera- und Bildeffekte auf dem fertigen Bild in Ausgabeauflösung.
+ * Felder auf 0 nehmen die jeweilige Vorgabe. */
+typedef struct PyrPostFx {
+    uint32_t flags;                 /* PYR_POSTFX_* */
+    float    bloom_strength;        /* 0 = 0.05 */
+    float    bloom_threshold;       /* 0 = 1.0 */
+    float    bloom_knee;            /* 0 = 0.5 */
+    uint32_t bloom_levels;          /* 0 = 5 */
+    float    focus_distance;        /* 0 = 10; mit AUTOFOCUS egal */
+    float    dof_strength;          /* Zerstreuungskreis in Pixeln bei unendlich, 0 = 3 */
+    float    dof_max_coc;           /* 0 = 12 Pixel */
+    float    motion_blur_scale;     /* 0 = 0.5 (Verschlusswinkel 180 Grad) */
+    float    motion_blur_max;       /* 0 = 64 Pixel */
+    uint32_t motion_blur_samples;   /* 0 = 12 */
+    float    exposure_speed;        /* 0 = 0.05 je Frame */
+    float    exposure_min;          /* 0 = 0.03 */
+    float    exposure_max;          /* 0 = 30 */
+    float    exposure_compensation; /* Blendenstufen */
+    float    temperature;           /* warm > 0, kalt < 0 */
+    float    tint;                  /* gruen > 0, magenta < 0 */
+    float    contrast;              /* 0 = 1 */
+    float    saturation;            /* 0 = 1 */
+    float    lift[3];
+    float    gamma[3];              /* 0 = 1 */
+    float    gain[3];               /* 0 = 1 */
+    uint64_t lut;                   /* 3D-LUT (RGBA8) im Anzeigeraum, 0 = keine */
+    uint32_t lut_size;              /* Kantenlaenge */
+    uint32_t reserved_fx;
+} PyrPostFx;
+
 typedef struct PyrPostInfo {
     uint64_t output_hdr;          /* float[4 * w * h] oder 0 */
     uint64_t output_ldr;          /* uint8[4 * w * h] (sRGB RGBA) oder 0 */
@@ -495,6 +533,7 @@ typedef struct PyrPostInfo {
     uint32_t output_height;
     uint32_t upscaler;            /* PYR_UPSCALER_* */
     float    denoise_phi;         /* Varianzführung des Denoisers, 0 = 4 (kleiner = glatter) */
+    const PyrPostFx* fx;          /* Kamera- und Bildeffekte, NULL = keine */
 } PyrPostInfo;
 
 PYR_API PyrResult pyr_postprocess(PyrContext* ctx, PyrView view, const PyrTargets* input, const PyrPostInfo* info);

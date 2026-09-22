@@ -606,6 +606,79 @@ pub const TerrainParams = extern struct {
 // Hochskalieren (TAAU) und Frame Generation
 // ---------------------------------------------------------------------------
 
+/// Kamera- und Bildeffekte (src/device/postfx.zig). Ein Aufruf je Stufe; die
+/// Stufen teilen sich die Struktur, nicht benutzte Felder bleiben 0.
+pub const PostFxParams = extern struct {
+    /// Auflösung der Quelle
+    width: u32,
+    height: u32,
+    /// Auflösung des Ziels (Bloom-Stufen halbieren)
+    dst_width: u32,
+    dst_height: u32,
+    /// HDR-Quelle (4 x f32, außer in der Bloom-Pyramide)
+    color: u64,
+    /// Ziel der laufenden Stufe
+    dst: u64,
+    /// Quelle liegt halbgenau vor
+    src_half: u32,
+    reserved0: u32,
+    /// Bewegung (xy, Ausgabepixel) und Tiefe, in Ausgabeauflösung
+    mvd: u64,
+    /// Quellen für packMvd: Bewegung (2 x f32) und Normale+Tiefe (4 x f32) in
+    /// Renderauflösung (dst_width x dst_height)
+    mv_src: u64,
+    normal_src: u64,
+
+    /// Tiefenschärfe
+    dof_focus: f32,
+    dof_strength: f32,
+    dof_max_coc: f32,
+    /// Schärfeebene aus der Tiefe in der Bildmitte nehmen
+    dof_autofocus: u32,
+    /// Bewegungsunschärfe
+    blur_scale: f32,
+    blur_max: f32,
+    blur_samples: u32,
+
+    /// Bloom
+    bloom: u64,
+    bloom_width: u32,
+    bloom_height: u32,
+    bloom_strength: f32,
+    bloom_threshold: f32,
+    bloom_knee: f32,
+    reserved1: u32,
+
+    /// Belichtungsautomatik: Zähler (2 x u32) und Zustand (Ziel, aktuell)
+    expose_acc: u64,
+    expose_state: u64,
+    expose_speed: f32,
+    expose_min: f32,
+    expose_max: f32,
+    expose_compensation: f32,
+
+    /// Farbkorrektur
+    grade: u32,
+    temperature: f32,
+    tint: f32,
+    contrast: f32,
+    saturation: f32,
+    lift: [3]f32,
+    gamma: [3]f32,
+    gain: [3]f32,
+    lut: u64,
+    lut_size: u32,
+
+    /// Ausgabe
+    exposure: f32,
+    tonemap: u32,
+    bgra: u32,
+    out_hdr: u64,
+    out_ldr: u64,
+};
+
+pub const postfx_block: u32 = 256;
+
 pub const UpscaleParams = extern struct {
     in_width: u32,
     in_height: u32,

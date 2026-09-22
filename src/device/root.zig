@@ -23,6 +23,7 @@ pub const anim = @import("anim.zig");
 pub const gbuild = @import("gbuild.zig");
 pub const worldgen = @import("worldgen.zig");
 pub const worldedit = @import("worldedit.zig");
+pub const postfx = @import("postfx.zig");
 pub const fmath = @import("fmath.zig");
 /// RT-Pfad: Teil-DAG-Verfolgung (Host und GPU)
 pub const rt = @import("rt.zig");

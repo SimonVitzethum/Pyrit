@@ -144,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
     var turn: f32 = 0;
     var flicker = false;
     var edit_test = false;
+    var fx_flags: u32 = 0;
     var chunk_capacity: u32 = 0;
     var edit_load = false;
     var edit_stream = false;
@@ -213,6 +214,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--chunk-capacity") and i + 1 < args.len) {
             i += 1;
             chunk_capacity = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--fx")) {
+            fx_flags |= api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade;
+        } else if (std.mem.eql(u8, a, "--bloom")) {
+            fx_flags |= api.postfx_bloom;
+        } else if (std.mem.eql(u8, a, "--dof")) {
+            fx_flags |= api.postfx_dof | api.postfx_autofocus;
+        } else if (std.mem.eql(u8, a, "--motion-blur")) {
+            fx_flags |= api.postfx_motion_blur;
+        } else if (std.mem.eql(u8, a, "--auto-exposure")) {
+            fx_flags |= api.postfx_auto_exposure;
+        } else if (std.mem.eql(u8, a, "--grade")) {
+            fx_flags |= api.postfx_grade;
         } else if (std.mem.eql(u8, a, "--edit")) {
             edit_test = true;
         } else if (std.mem.eql(u8, a, "--edit-file") and i + 1 < args.len) {
@@ -265,7 +278,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -373,7 +386,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -440,6 +453,11 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     post.output_width = out_w;
     post.upscaler = upscaler;
     post.output_height = out_h;
+    var fxi = std.mem.zeroes(api.PostFx);
+    fxi.flags = fx_flags;
+    fxi.saturation = 1.05;
+    fxi.contrast = 1.05;
+    if (fx_flags != 0) post.fx = &fxi;
     var fgi = std.mem.zeroes(api.FrameGenInfo);
     fgi.output_ldr = ldr_fg;
     var fg_frames: u32 = 0;

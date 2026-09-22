@@ -25,6 +25,7 @@ fn expectSameLayout(comptime Z: type, comptime C: type) !void {
 test "Strukturlayouts" {
     try expectSameLayout(types.Ray, c.PyrRay);
     try expectSameLayout(api.WorldEdit, c.PyrWorldEdit);
+    try expectSameLayout(api.PostFx, c.PyrPostFx);
     try expectSameLayout(types.HitEx, c.PyrHitEx);
     try expectSameLayout(types.Hit, c.PyrHit);
     try expectSameLayout(types.Camera, c.PyrCamera);
