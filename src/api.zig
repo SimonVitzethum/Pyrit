@@ -272,6 +272,18 @@ pub const WorldInfo = extern struct {
     terrain: ?*const TerrainInfo,
 };
 
+/// Eine Änderung an der Welt: ein Grundvoxel setzen oder entfernen.
+/// Koordinaten in Grundvoxeln (volle Auflösung), unabhängig von der Stufe,
+/// in der der Chunk gerade vorliegt.
+pub const WorldEdit = extern struct {
+    x: i64,
+    y: i64,
+    z: i64,
+    /// Voxelattribut; 0 entfernt den Voxel
+    attribute: u32,
+    reserved: u32 = 0,
+};
+
 pub const WorldStats = extern struct {
     visible_chunks: u32,
     resident_chunks: u32,

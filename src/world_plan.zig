@@ -36,6 +36,26 @@ pub const Key = struct {
     }
 };
 
+/// Streuung des Schlüssels: ein 64-Bit-Mix ist hier deutlich billiger als die
+/// allgemeine, bytefweise Streuung von AutoHashMap – der Planer schlägt je
+/// Frame Zehntausende Knoten nach.
+pub const KeyContext = struct {
+    pub fn hash(_: KeyContext, k: Key) u64 {
+        var h: u64 = @as(u64, @as(u32, @bitCast(k.x)));
+        h = (h << 21) ^ @as(u64, @as(u32, @bitCast(k.y)));
+        h = (h << 21) ^ @as(u64, @as(u32, @bitCast(k.z)));
+        h ^= @as(u64, k.lod) << 60;
+        h *%= 0x9e3779b97f4a7c15;
+        h ^= h >> 29;
+        h *%= 0xbf58476d1ce4e5b9;
+        h ^= h >> 32;
+        return h;
+    }
+    pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+        return a.lod == b.lod and a.x == b.x and a.y == b.y and a.z == b.z;
+    }
+};
+
 pub const State = enum { requested, building, ready, empty };
 
 pub const Node = struct {
@@ -67,7 +87,7 @@ pub const Config = struct {
 pub const Plan = struct {
     cfg: Config,
     gpa: Allocator,
-    nodes: std.AutoHashMapUnmanaged(Key, Node) = .empty,
+    nodes: std.HashMapUnmanaged(Key, Node, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
     visible: std.ArrayList(Key) = .empty,
     /// zweite, gröbere Auswahl für Sekundärstrahlen (Schatten, GI)
     visible_coarse: std.ArrayList(Key) = .empty,
@@ -133,25 +153,38 @@ pub const Plan = struct {
     }
 
     fn visit(self: *Plan, k: Key, cam: [3]f64) Allocator.Error!void {
-        if (!self.inRange(k)) return;
-        const state = (try self.touch(k)).state; // Zeiger nicht halten: Tabelle wächst
+        return self.visitKnown(k, cam, null);
+    }
+
+    /// `known`: Zustand des Knotens, falls er schon nachgeschlagen *und*
+    /// gestempelt wurde. Beim Absteigen ist das immer der Fall – die acht
+    /// Kinder werden zum Prüfen ohnehin angefasst, ein zweites Nachschlagen
+    /// beim Rekursionsschritt wäre reine Verschwendung (es war der größte
+    /// Einzelposten im Planer).
+    fn visitKnown(self: *Plan, k: Key, cam: [3]f64, known: ?State) Allocator.Error!void {
+        if (known == null and !self.inRange(k)) return;
+        const state = known orelse (try self.touch(k)).state; // Zeiger nicht halten: Tabelle wächst
         if (state == .empty) return; // leerer Bereich: Kinder ebenfalls leer
         const dist = self.distance(k, cam);
         if (dist > self.cfg.view_distance) return; // hinter der Sichtweite
         // Bildschirmmaß: verfeinern, solange ein Voxel zu groß erschiene
         const refine = k.lod > 0 and dist < self.cfg.refine_k * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(k.lod)));
         if (refine and state == .ready) {
+            var child_state: [8]?State = .{null} ** 8;
             var all_ready = true;
             var i: u32 = 0;
             while (i < 8) : (i += 1) {
                 const ck = k.child(i);
                 if (!self.inRange(ck)) continue;
-                const c = try self.touch(ck);
-                if (c.state != .ready and c.state != .empty) all_ready = false;
+                const st = (try self.touch(ck)).state;
+                child_state[i] = st;
+                if (st != .ready and st != .empty) all_ready = false;
             }
             if (all_ready) {
                 i = 0;
-                while (i < 8) : (i += 1) try self.visit(k.child(i), cam);
+                while (i < 8) : (i += 1) {
+                    if (child_state[i]) |st| try self.visitKnown(k.child(i), cam, st);
+                }
                 return;
             }
         }

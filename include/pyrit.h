@@ -732,6 +732,29 @@ PYR_API PyrResult pyr_world_update(PyrContext* ctx, PyrWorld* world, const doubl
 /* Wartet auf den Chunk-Batch, der gerade im Hintergrund entsteht, und
  * übernimmt ihn (Ladebildschirm, Teleport). */
 PYR_API PyrResult pyr_world_wait(PyrContext* ctx, PyrWorld* world, const double camera[3]);
+/* Eine Änderung an der Welt: ein Grundvoxel setzen oder entfernen.
+ * Koordinaten in Grundvoxeln (volle Auflösung), unabhängig davon, in welcher
+ * LOD-Stufe der Chunk gerade vorliegt. */
+typedef struct PyrWorldEdit {
+    int64_t  x, y, z;
+    uint32_t attribute;   /* 0 entfernt den Voxel */
+    uint32_t reserved;
+} PyrWorldEdit;
+
+/* Grundvoxel setzen oder entfernen. Die Änderungen liegen als Überlagerung
+ * über dem Generator: betroffene Chunks werden sofort neu gebaut, und jede
+ * spätere Neuerzeugung (Verdrängung, LOD-Wechsel) trägt sie wieder auf.
+ * Auf gröberen Stufen gilt: Hinzufügen füllt die Zelle immer, Entfernen wirkt
+ * erst, wenn alle Grundvoxel der Zelle entfernt sind. */
+PYR_API PyrResult pyr_world_edit(PyrContext* ctx, PyrWorld* world, const PyrWorldEdit* edits, uint32_t count);
+
+/* Änderungen sichern und zurückladen. Pyrit fasst keine Dateien an: der
+ * Aufrufer legt den Puffer ab, wo er will. Das Gelände wird nicht gespeichert,
+ * das erzeugt der Generator jederzeit wieder. */
+PYR_API uint64_t  pyr_world_edits_bytes(PyrWorld* world);
+PYR_API PyrResult pyr_world_edits_save(PyrWorld* world, void* dst, uint64_t size);
+PYR_API PyrResult pyr_world_edits_load(PyrContext* ctx, PyrWorld* world, const void* src, uint64_t size);
+
 PYR_API PyrResult pyr_world_stats(PyrWorld* world, PyrWorldStats* out);
 /* Standardgelände und seine Höhe an (x, z), z. B. für die Kamera */
 PYR_API void      pyr_terrain_default(PyrTerrainInfo* out);

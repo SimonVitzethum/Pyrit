@@ -193,6 +193,9 @@ pub const Context = struct {
     fn_fg_splat_mv: cuda.CUfunction = null,
     fn_build: cuda.CUfunction = null,
     fn_gen_terrain: cuda.CUfunction = null,
+    fn_edit_apply: cuda.CUfunction = null,
+    fn_edit_compact: cuda.CUfunction = null,
+    fn_edit_append: cuda.CUfunction = null,
 
     // Materialien und Licht (Host-Kopie + Gerät)
     materials: [types.max_materials]types.Material = undefined,
@@ -411,6 +414,9 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat_mv, self.module, "pyr_k_fg_splat_mv"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_build, self.module, "pyr_k_build"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gen_terrain, self.module, "pyr_k_gen_terrain"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_apply, self.module, "pyr_k_edit_apply"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_compact, self.module, "pyr_k_edit_compact"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_edit_append, self.module, "pyr_k_edit_append"), "cuModuleGetFunction");
     }
 
     pub fn destroy(self: *Context) void {

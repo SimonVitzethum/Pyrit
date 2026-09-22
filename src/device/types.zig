@@ -554,6 +554,24 @@ pub const WorldGenParams = extern struct {
 
 pub const gen_block: u32 = 128;
 
+/// Änderungen an einer gestreamten Welt (src/device/worldedit.zig).
+/// Die Einträge liegen je Chunk gruppiert, `edit_offsets` hat count+1 Werte;
+/// ein Eintrag ist [x, y, z, attribut] in Chunk-lokalen Koordinaten der Stufe,
+/// Attribut 0 bedeutet entfernen.
+pub const WorldEditParams = extern struct {
+    voxels: u64,
+    counts: u64,
+    out_voxels: u64,
+    out_counts: u64,
+    edits: u64,
+    edit_offsets: u64,
+    edit_used: u64,
+    count: u32,
+    capacity: u32,
+};
+
+pub const edit_block: u32 = 128;
+
 /// Eingebauter Geländegenerator (Höhenfeld aus fBm-Rauschen); nur die Haut
 /// der Oberfläche wird erzeugt, das Innere bleibt leer.
 pub const TerrainParams = extern struct {

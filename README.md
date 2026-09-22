@@ -1,69 +1,76 @@
 # Pyrit
 
-Ein Renderer für **Sparse Voxel DAGs** – vollständig in Zig geschrieben, von der
-Host-Bibliothek über die GPU-Kernel bis zu den Tests. Keine Grafik-API: Pyrit
-rechnet in reinem CUDA (NVIDIA, RT-Cores über OptiX) und gibt CUDA-Puffer aus.
-Der C-Header `include/pyrit.h` beschreibt nur die ABI für andere Sprachen.
+A renderer for **sparse voxel DAGs**, written entirely in Zig — host library,
+GPU kernels and tests alike. No graphics API: Pyrit runs on plain CUDA (NVIDIA,
+RT cores through OptiX) and hands back CUDA buffers. The C header
+`include/pyrit.h` only describes the ABI for other languages.
 
-![Gestreamte Voxelwelt, 1920x1080](docs/bilder/pyrit.png)
+![Streamed voxel world, 1920x1080](docs/bilder/pyrit.png)
 
-## Was drin ist
+## What it does
 
-- **Sparse Voxel DAGs**, gebaut auf der GPU; keine Meshes, keine Vertices.
-- **Große Welten**, gestreamt mit **dynamischem LOD**: keine festen Stufen,
-  verfeinert wird nach der Größe eines Voxels auf dem Bildschirm. Ein
-  Speicherbudget regelt die Zielgröße gleitend nach.
-- **Raytracing** über RT-Cores (OptiX, Anbindung selbst in Zig geschrieben) mit
-  Software-Rückfallweg.
-- **Globale Beleuchtung**, Schatten, Reflexionen, Transparenz mit Brechung und
-  getönten Schatten, Wellen auf Wasser.
-- **Motion Vectors pro Pixel** als Kernziel – Grundlage für TAA, TAAU, Frame
-  Generation und DLSS.
-- **Vollständige Ausgabekette**: temporale Akkumulation, varianzgeführter
-  À-trous-Denoiser, TAAU (bis 4x), optional NVIDIA DLSS Super Resolution und
-  Ray Reconstruction über NGX-CUDA, sowie Frame Generation in reinem CUDA.
-- **GPU-Skelettanimation** mit Keyframe-Interpolation und Windschwingen.
+- **Sparse voxel DAGs**, built on the GPU. No meshes, no vertices.
+- **Large worlds**, streamed with **dynamic LOD**: no fixed levels — a chunk is
+  refined based on how large one of its voxels is on screen. A memory budget
+  slides that target up or down as needed.
+- **Editable worlds**: `pyr_world_edit` sets or removes individual base voxels.
+  Edits are an overlay on top of the generator, so they survive eviction and LOD
+  changes, and they can be saved and restored as a buffer.
+- **Ray tracing** on RT cores through a hand-written OptiX binding, with a
+  software fallback path.
+- **Global illumination**, shadows, reflections, transparency with refraction
+  and tinted shadows, waves on water.
+- **Per-pixel motion vectors** as a core goal — the basis for TAA, TAAU, frame
+  generation and DLSS.
+- **A complete output chain**: temporal accumulation, a variance-guided à-trous
+  denoiser, TAAU (up to 4x), optional NVIDIA DLSS Super Resolution and Ray
+  Reconstruction through NGX-CUDA, and frame generation in plain CUDA.
+- **Skeletal animation on the GPU** with keyframe interpolation and wind sway.
 
-## Bauen
+## Building
 
-Gebraucht wird Zig 0.16. Eine GPU ist zum Bauen nicht nötig.
+Needs Zig 0.16. No GPU is required to build.
 
 ```sh
-zig build                 # Bibliothek (statisch + dynamisch), Header, PTX
-zig build test            # Unit-, CPU- und ABI-Tests, AMD-Übersetzung (ohne GPU)
-zig build kernel-check    # PTX mit ptxas prüfen (CUDA-Toolkit, keine GPU)
-zig build gpu-test        # GPU gegen CPU-Referenz (braucht eine freie NVIDIA-GPU)
-zig build --release=fast  # optimiert
+zig build                 # static + shared library, headers, PTX
+zig build test            # unit, CPU and ABI tests, AMD compile check (no GPU)
+zig build kernel-check    # verify PTX with ptxas (CUDA toolkit, no GPU)
+zig build gpu-test        # GPU against the CPU reference (needs a free NVIDIA GPU)
+zig build --release=fast  # optimised
 ```
 
-Die GPU-Kernel entstehen aus demselben Zig-Code für `nvptx64-cuda` (nach PTX)
-und `amdgcn-amdhsa` (bisher nur als Übersetzungsprüfung; ein HIP-Backend folgt).
+The GPU kernels are compiled from the same Zig source for `nvptx64-cuda` (to
+PTX) and for `amdgcn-amdhsa` (so far only as a compile check; a HIP backend is
+to follow).
 
-DLSS ist optional und braucht das nicht mitgelieferte SDK:
-`zig build -Ddlss-sdk=/pfad/zum/DLSS`.
+DLSS is optional and needs the SDK, which is not bundled:
+`zig build -Ddlss-sdk=/path/to/DLSS`.
 
-## Werkzeuge
+## Tools
 
 ```sh
-zig build render -- --world --size 1920x1080 --frames 30 --out bild.ppm
+zig build render -- --world --size 1920x1080 --frames 30 --out image.ppm
 zig build view   -- --size 1280x720
 ```
 
-`pyrit-view` ist ein Betrachter **ohne jede Grafik-API**: Pyrit rendert in einen
-CUDA-Puffer, der Betrachter kopiert ihn in einen Shared-Memory-Puffer und zeigt
-ihn über **Wayland** (xdg-shell) an. `libwayland-client` wird dynamisch geladen,
-die xdg-shell-Tabellen stehen in `tools/wayland.zig`. Steuerung: W/A/S/D, Maus
-dreht, Leertaste hoch, Q/E rollen die Sonne, +/− ändern die Zielgröße der Voxel.
+`pyrit-view` is a viewer with **no graphics API at all**: Pyrit renders into a
+CUDA buffer, the viewer copies it into a shared-memory buffer and shows it over
+**Wayland** (xdg-shell). `libwayland-client` is loaded dynamically and the
+xdg-shell tables live in `tools/wayland.zig`. Controls: W/A/S/D to move, mouse
+drag to look, space to rise, Q/E to roll the sun, +/− to change the target voxel
+size.
 
-`pyrit-render` misst mit: `--profile` schlüsselt die Frame-Zeit auf, `--flicker`
-misst zeitliches Flimmern, `--turn` dreht die Kamera im Testflug, `--view` setzt
-die Sichtweite.
+`pyrit-render` also measures: `--profile` breaks the frame time down, `--flicker`
+measures temporal flicker, `--turn` rotates the camera along the test flight and
+`--view` sets the view distance.
 
-## Dokumentation
+## Documentation
 
-- [`docs/API.md`](docs/API.md) – die API im Detail
-- [`pyrit-plan.md`](pyrit-plan.md) – Aufbau, Entscheidungen und Messwerte
+The documentation is in German.
 
-## Lizenz
+- [`docs/API.md`](docs/API.md) — the API in detail
+- [`pyrit-plan.md`](pyrit-plan.md) — structure, decisions and measurements
 
-Noch nicht festgelegt.
+## License
+
+Not decided yet.

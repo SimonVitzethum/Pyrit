@@ -200,8 +200,28 @@ _ = pyrit.pyr_commit(ctx, &.{ .time = t, .origin = origin });
 - **Übergänge:** Grobe Chunks bleiben sichtbar, bis alle feineren fertig sind; es entstehen keine Löcher. Neue Chunks übernehmen den Verlauf von TAA und Denoiser (`PYR_INSTANCE_KEEP_HISTORY`).
 - **Speicher:** Nicht mehr gebrauchte Chunks werden nach `keep_frames` freigegeben. Leere Bereiche kosten nichts. Das Standardgelände mit etwa 20 000 Voxeln Sichtweite belegt rund 11 MiB.
 - **Genauigkeit:** Die Welt rechnet in f64 und legt Instanzen relativ zum Render-Ursprung ab. Diesen Ursprung in großen Schritten mitführen, zum Beispiel alle 1024 Voxel.
+- **Überlauf gibt es nicht:** Passt ein Chunk nicht in `chunk_capacity`, wird die Kapazität erhöht und der Auftrag wiederholt, statt Voxel abzuschneiden. Damit der Generatorpuffer dabei nicht wächst, sinkt im Gegenzug die Zahl der Chunks je Auftrag – das Produkt bleibt konstant. Nachgemessen: mit `chunk_capacity = 256` wächst die Kapazität in vier Schritten auf 6672 (Chunks je Auftrag 64 → 2), und das fertig geladene Bild ist **pixelgleich** zu dem mit der Vorgabe. `PyrWorldStats.overflow_chunks` zählt die Vergrößerungen.
 - `pyr_world_wait` wartet auf den laufenden Batch (Ladebildschirm, Teleport). `PYR_WORLD_SYNC` baut ohne Thread.
-- **Messung:** 1063 Chunks in 114 ms aufgebaut; im Flug kostet das Update im Mittel 0,3 ms auf dem Hauptthread.
+- **Messung:** 1063 Chunks in 114 ms aufgebaut. Im Flug (1080p, 512 Minecraft-Chunks Sichtweite, 6500 Chunks resident) kostet `pyr_world_update` auf dem Hauptthread im Mittel 5,3 ms, aufgeteilt in Planer 1,8 ms, Auftrag 1,3 ms, Sichtbarkeit 0,7 ms, Übernahme 0,04 ms, Verdrängung 0,1 ms. (Vorher 25,1 ms: der Planer schlug jeden Knoten neunmal in der Hashtabelle nach – acht Kinder prüfen, dieselben acht beim Absteigen erneut – und benutzte die allgemeine, bytefweise Streuung. Beides behoben: 8,4 → 1,8 ms.)
+
+### Die Welt verändern
+
+`pyr_world_edit(ctx, world, edits, count)` setzt oder entfernt einzelne Grundvoxel:
+
+```c
+PyrWorldEdit e[2] = {
+    { .x = 100, .y = 70, .z = -3, .attribute = PYR_VOXEL(0, 220, 40, 40) },  /* setzen */
+    { .x = 101, .y = 70, .z = -3, .attribute = 0 },                          /* entfernen */
+};
+pyr_world_edit(ctx, world, e, 2);
+```
+
+- Koordinaten sind **Grundvoxel**, unabhängig davon, in welcher Stufe der Chunk gerade vorliegt.
+- Die Änderungen liegen als **Überlagerung** über dem Generator und sind die Wahrheit: betroffene Chunks werden sofort neu gebaut (mit Vorrang vor dem Nachladen, und der alte Chunk bleibt sichtbar, bis der neue fertig ist – kein Loch), und jede spätere Neuerzeugung trägt sie wieder auf. Damit überleben sie Verdrängung und LOD-Wechsel, ohne dass ein Chunk-Cache nötig wäre.
+- **Auf gröberen Stufen** füllt Hinzufügen die Zelle immer (eine grobe Zelle gilt als belegt, sobald irgendetwas darin liegt). Entfernen wirkt erst, wenn *alle* Grundvoxel der Zelle entfernt sind – sonst risse ein einzelnes abgebautes Voxel in der Ferne ein ganzes Loch. Bis Stufe 8 wird mitgezählt, darüber sind es über 2^24 Grundvoxel je Zelle.
+- **Ablauf auf der GPU:** Nach dem Generator bekommt jeder Chunk seine Änderungsliste bereits in seiner Stufenauflösung. Drei Durchgänge: vorhandene Voxel überschreiben oder als entfernt markieren, überlebende dicht in einen zweiten Puffer schreiben (dabei entstehen die Zähler neu, die Präfixsummen bleiben exakt), unverbrauchte Änderungen anhängen.
+
+`pyr_world_edits_bytes` / `pyr_world_edits_save` / `pyr_world_edits_load` sichern die Überlagerung in einen Puffer und zurück. Pyrit fasst keine Dateien an – wohin der Puffer geht, entscheidet der Aufrufer. Gespeichert werden nur die Änderungen, nicht das Gelände: das erzeugt der Generator jederzeit wieder. Nachgemessen: gesichert, in eine **frische** Welt geladen und gerendert ergibt ein pixelgleiches Bild.
 
 ## Animation
 

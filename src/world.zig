@@ -62,6 +62,52 @@ const Chunk = struct {
     voxels: u32,
 };
 
+/// Ein geänderter Grundvoxel
+pub const EditPos = struct { x: i64, y: i64, z: i64 };
+
+/// Zelle einer gröberen Stufe (für die Zählung entfernter Grundvoxel)
+const CellKey = struct { lod: u8, x: i64, y: i64, z: i64 };
+
+/// Chunk, in dem ein Grundvoxel auf Stufe `lod` liegt; null, wenn die Position
+/// außerhalb des darstellbaren Bereichs liegt.
+fn chunkKeyFor(chunk_log2: u32, p: EditPos, lod: u32) ?Key {
+    const shift: u6 = @intCast(chunk_log2 + lod);
+    const cx = p.x >> shift;
+    const cy = p.y >> shift;
+    const cz = p.z >> shift;
+    if (cx < std.math.minInt(i32) or cx > std.math.maxInt(i32) or
+        cy < std.math.minInt(i32) or cy > std.math.maxInt(i32) or
+        cz < std.math.minInt(i32) or cz > std.math.maxInt(i32)) return null;
+    return .{ .lod = @intCast(lod), .x = @intCast(cx), .y = @intCast(cy), .z = @intCast(cz) };
+}
+
+/// Chunk-lokale Zelle auf Stufe `lod`
+fn localCell(chunk_log2: u32, p: EditPos, lod: u32) [3]u32 {
+    const mask: i64 = (@as(i64, 1) << @intCast(chunk_log2)) - 1;
+    const s: u6 = @intCast(lod);
+    return .{
+        @intCast((p.x >> s) & mask),
+        @intCast((p.y >> s) & mask),
+        @intCast((p.z >> s) & mask),
+    };
+}
+
+/// Zelle der Stufe `lod`, in der ein Grundvoxel liegt
+fn cellOf(p: EditPos, lod: u32) CellKey {
+    const s: u6 = @intCast(lod);
+    return .{ .lod = @intCast(lod), .x = p.x >> s, .y = p.y >> s, .z = p.z >> s };
+}
+
+/// Wie viele Grundvoxel eine Zelle der Stufe `lod` enthält
+fn cellVoxels(lod: u32) u64 {
+    return @as(u64, 1) << @intCast(3 * lod);
+}
+
+/// Entfernen schlägt auf eine gröbere Stufe erst durch, wenn *alle* darin
+/// liegenden Grundvoxel entfernt sind. Ab dieser Stufe sind das mehr als 2^24
+/// Voxel – das kommt nicht vor, also wird dort nicht mehr gezählt.
+const rm_track_max: u32 = 8;
+
 pub const World = struct {
     ctx: *Context,
     plan: world_plan.Plan,
@@ -116,6 +162,40 @@ pub const World = struct {
     job_roots: []u32 = &.{},
     job_error: ?Error = null,
     job_message: [512]u8 = undefined,
+    /// Auftrag war zu groß für die neue Kapazität: verwerfen und kleiner erneut
+    job_retry: bool = false,
+
+    // Änderungen an der Welt (Setzen und Entfernen einzelner Grundvoxel).
+    // Die Überlagerung ist die Wahrheit: sie wird bei jeder Erzeugung eines
+    // Chunks erneut angewandt, überlebt also Verdrängung und LOD-Wechsel.
+    edits: std.AutoHashMapUnmanaged(EditPos, u32) = .empty,
+    /// je Chunk (über alle Stufen) die darin liegenden Änderungen
+    edit_chunks: std.AutoHashMapUnmanaged(Key, std.ArrayListUnmanaged(EditPos)) = .empty,
+    /// entfernte Grundvoxel je gröberer Zelle
+    rm_counts: std.AutoHashMapUnmanaged(CellKey, u32) = .empty,
+    /// Chunks, die wegen einer Änderung neu gebaut werden müssen
+    dirty: std.ArrayList(Key) = .empty,
+    dirty_set: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// vom Hauptthread für den laufenden Auftrag vorbereitet (der Arbeiter
+    /// fasst die Überlagerung nicht an: sie gehört dem Hauptthread)
+    job_edits: std.ArrayList([4]u32) = .empty,
+    job_edit_off: std.ArrayList(u32) = .empty,
+    /// Gerätepuffer der Änderungen, wachsen nach Bedarf
+    edits_dev: cuda.CUdeviceptr = 0,
+    edit_off_dev: cuda.CUdeviceptr = 0,
+    edit_used_dev: cuda.CUdeviceptr = 0,
+    edits_dev_cap: u32 = 0,
+    /// zweiter Voxelpuffer: Ziel der Verdichtung nach dem Anwenden
+    voxels2_dev: cuda.CUdeviceptr = 0,
+    counts2_dev: cuda.CUdeviceptr = 0,
+    /// Chunks je Auftrag; sinkt, wenn die Kapazität je Chunk wachsen muss,
+    /// damit der Generatorpuffer nie neu (und größer) angelegt werden muss
+    job_limit: u32 = 0,
+    /// Gesamtplätze im Generatorpuffer (batch_max · Anfangskapazität)
+    voxel_slots: u64 = 0,
+    /// Zeitmessung der Update-Phasen (PYRIT_WORLD_PROFILE=1)
+    prof: ?*[6]f64 = null,
+    prof_frames: u64 = 0,
 
     pub fn create(ctx: *Context, info: *const api.WorldInfo) Error!*World {
         const cl: u32 = if (info.chunk_log2 == 0) 5 else info.chunk_log2;
@@ -172,8 +252,10 @@ pub const World = struct {
         // Platzgrenze: die Welt bleibt unter den Geometrieplätzen des Kontexts
         w.chunk_limit = @intCast(ctx.geometries.len * 3 / 4);
         errdefer w.freeBuffers();
+        w.job_limit = batch;
+        w.voxel_slots = @as(u64, batch) * cap;
         w.keys_dev = try ctx.devAlloc(@as(u64, batch) * @sizeOf(types.ChunkKey), "Welt: Chunkliste");
-        w.voxels_dev = try ctx.devAlloc(@as(u64, batch) * cap * 16, "Welt: Generatorpuffer");
+        w.voxels_dev = try ctx.devAlloc(w.voxel_slots * 16, "Welt: Generatorpuffer");
         w.counts_dev = try ctx.devAlloc(@as(u64, batch) * 4, "Welt: Zähler");
         w.offsets_dev = try ctx.devAlloc(@as(u64, batch + 1) * 4, "Welt: Präfixe");
         try ctx.check(ctx.drv.cuMemHostAlloc(&w.pinned, @as(u64, batch) * (@sizeOf(types.ChunkKey) + 8) + 4, 0), "cuMemHostAlloc");
@@ -188,7 +270,11 @@ pub const World = struct {
     fn freeBuffers(self: *World) void {
         if (self.job_roots.len != 0) self.ctx.gpa.free(self.job_roots);
         self.job_roots = &.{};
-        for ([_]cuda.CUdeviceptr{ self.keys_dev, self.voxels_dev, self.counts_dev, self.offsets_dev }) |p| {
+        for ([_]cuda.CUdeviceptr{
+            self.keys_dev,      self.voxels_dev,   self.counts_dev,    self.offsets_dev,
+            self.voxels2_dev,   self.counts2_dev,  self.edits_dev,     self.edit_off_dev,
+            self.edit_used_dev,
+        }) |p| {
             if (p != 0) _ = self.ctx.drv.cuMemFree_v2(p);
         }
         if (self.pinned != null) _ = self.ctx.drv.cuMemFreeHost(self.pinned);
@@ -212,12 +298,171 @@ pub const World = struct {
         // Puffer erst freigeben, wenn die GPU mit laufenden Generatoren fertig ist
         _ = self.ctx.drv.cuStreamSynchronize(self.ctx.aux_stream);
         self.freeBuffers();
+        if (self.prof) |p| self.ctx.gpa.destroy(p);
         self.plan.deinit();
         self.chunks.deinit(self.ctx.gpa);
         self.chunk_free.deinit(self.ctx.gpa);
         self.requests.deinit(self.ctx.gpa);
         self.evicted.deinit(self.ctx.gpa);
+        self.edits.deinit(self.ctx.gpa);
+        var it = self.edit_chunks.valueIterator();
+        while (it.next()) |l| l.deinit(self.ctx.gpa);
+        self.edit_chunks.deinit(self.ctx.gpa);
+        self.rm_counts.deinit(self.ctx.gpa);
+        self.dirty.deinit(self.ctx.gpa);
+        self.dirty_set.deinit(self.ctx.gpa);
+        self.job_edits.deinit(self.ctx.gpa);
+        self.job_edit_off.deinit(self.ctx.gpa);
         self.ctx.gpa.destroy(self);
+    }
+
+    // -----------------------------------------------------------------------
+    // Änderungen an der Welt
+    //
+    // Die Überlagerung in Grundvoxel-Koordinaten ist die Wahrheit. Ein Chunk
+    // bekommt seine Änderungen bei *jeder* Erzeugung aufgeprägt, also überleben
+    // sie Verdrängung, LOD-Wechsel und Neustart (mit save/load).
+    //
+    // Auf gröberen Stufen: Hinzufügen setzt die Zelle immer (eine Zelle gilt
+    // als gefüllt, sobald irgendetwas darin liegt). Entfernen wirkt erst, wenn
+    // *alle* Grundvoxel der Zelle entfernt sind – sonst würde ein einzelnes
+    // abgebautes Voxel in der Ferne ein ganzes Loch reißen.
+    // -----------------------------------------------------------------------
+
+    fn chunkKeyOf(self: *const World, p: EditPos, lod: u32) Error!Key {
+        return chunkKeyFor(self.chunk_log2, p, lod) orelse
+            fail(error.InvalidArgument, "Position liegt außerhalb der Welt", .{});
+    }
+
+    fn markDirty(self: *World, key: Key) Error!void {
+        if (self.plan.nodes.get(key) == null) return; // noch nicht gebaut
+        const gop = try oom(self.dirty_set.getOrPut(self.ctx.gpa, key));
+        if (gop.found_existing) return;
+        try oom(self.dirty.append(self.ctx.gpa, key));
+    }
+
+    /// Grundvoxel setzen (`attribute` != 0) oder entfernen (`attribute` == 0)
+    pub fn edit(self: *World, list: []const api.WorldEdit) Error!void {
+        for (list) |ed| {
+            const pos = EditPos{ .x = ed.x, .y = ed.y, .z = ed.z };
+            const gop = try oom(self.edits.getOrPut(self.ctx.gpa, pos));
+            const prev: ?u32 = if (gop.found_existing) gop.value_ptr.* else null;
+            if (prev) |q| if (q == ed.attribute) continue;
+            gop.value_ptr.* = ed.attribute;
+
+            // Entfernte Grundvoxel je grober Zelle mitzählen
+            const was_removed = if (prev) |q| q == 0 else false;
+            const now_removed = ed.attribute == 0;
+            if (was_removed != now_removed) {
+                var lod: u32 = 1;
+                while (lod <= rm_track_max) : (lod += 1) {
+                    const cell = cellOf(pos, lod);
+                    const c = try oom(self.rm_counts.getOrPut(self.ctx.gpa, cell));
+                    if (!c.found_existing) c.value_ptr.* = 0;
+                    if (now_removed) c.value_ptr.* += 1 else c.value_ptr.* -|= 1;
+                }
+            }
+
+            var lod: u32 = 0;
+            while (lod <= self.plan.cfg.max_lod) : (lod += 1) {
+                const key = try self.chunkKeyOf(pos, lod);
+                if (!gop.found_existing) {
+                    const l = try oom(self.edit_chunks.getOrPut(self.ctx.gpa, key));
+                    if (!l.found_existing) l.value_ptr.* = .empty;
+                    try oom(l.value_ptr.append(self.ctx.gpa, pos));
+                }
+                try self.markDirty(key);
+            }
+        }
+    }
+
+    // Speicherformat der Änderungen: Kopf "PYRE", Version, Anzahl, dann je
+    // Eintrag x, y, z (i64) und Attribut (u32) mit Füllwort. Das Gelände selbst
+    // steht nicht darin – der Generator liefert es jederzeit wieder.
+    const edits_magic: u32 = 0x45525950; // "PYRE"
+    const edits_version: u32 = 1;
+    const edits_header: usize = 16;
+    const edits_entry: usize = 32;
+
+    pub fn editsBytes(self: *const World) u64 {
+        return edits_header + @as(u64, self.edits.count()) * edits_entry;
+    }
+
+    pub fn editsSave(self: *const World, dst: []u8) Error!void {
+        if (dst.len < self.editsBytes()) return fail(error.Capacity, "Puffer zu klein: {d} Bytes nötig", .{self.editsBytes()});
+        std.mem.writeInt(u32, dst[0..4], edits_magic, .little);
+        std.mem.writeInt(u32, dst[4..8], edits_version, .little);
+        std.mem.writeInt(u64, dst[8..16], self.edits.count(), .little);
+        var o: usize = edits_header;
+        var it = self.edits.iterator();
+        while (it.next()) |kv| {
+            std.mem.writeInt(i64, dst[o..][0..8], kv.key_ptr.x, .little);
+            std.mem.writeInt(i64, dst[o + 8 ..][0..8], kv.key_ptr.y, .little);
+            std.mem.writeInt(i64, dst[o + 16 ..][0..8], kv.key_ptr.z, .little);
+            std.mem.writeInt(u32, dst[o + 24 ..][0..4], kv.value_ptr.*, .little);
+            std.mem.writeInt(u32, dst[o + 28 ..][0..4], 0, .little);
+            o += edits_entry;
+        }
+    }
+
+    pub fn editsLoad(self: *World, src: []const u8) Error!void {
+        if (src.len < edits_header) return fail(error.InvalidArgument, "Änderungsdaten zu kurz", .{});
+        if (std.mem.readInt(u32, src[0..4], .little) != edits_magic)
+            return fail(error.InvalidArgument, "keine Pyrit-Änderungsdaten", .{});
+        const version = std.mem.readInt(u32, src[4..8], .little);
+        if (version != edits_version)
+            return fail(error.InvalidArgument, "Änderungsdaten Version {d}, erwartet {d}", .{ version, edits_version });
+        const n = std.mem.readInt(u64, src[8..16], .little);
+        if (src.len < edits_header + n * edits_entry)
+            return fail(error.InvalidArgument, "Änderungsdaten unvollständig ({d} Einträge angekündigt)", .{n});
+        var o: usize = edits_header;
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            const one = [1]api.WorldEdit{.{
+                .x = std.mem.readInt(i64, src[o..][0..8], .little),
+                .y = std.mem.readInt(i64, src[o + 8 ..][0..8], .little),
+                .z = std.mem.readInt(i64, src[o + 16 ..][0..8], .little),
+                .attribute = std.mem.readInt(u32, src[o + 24 ..][0..4], .little),
+            }};
+            try self.edit(&one);
+            o += edits_entry;
+        }
+    }
+
+    /// Änderungen des Auftrags in Chunk-lokale Einträge umrechnen
+    fn prepareEdits(self: *World) Error!void {
+        self.job_edits.clearRetainingCapacity();
+        self.job_edit_off.clearRetainingCapacity();
+        try oom(self.job_edit_off.append(self.ctx.gpa, 0));
+        for (self.requests.items) |key| {
+            if (self.edit_chunks.get(key)) |list| {
+                for (list.items) |pos| {
+                    const attr = self.edits.get(pos) orelse continue;
+                    if (attr == 0 and key.lod > 0) {
+                        // Entfernen wirkt grob erst, wenn die Zelle ganz leer ist
+                        if (key.lod > rm_track_max) continue;
+                        const need = cellVoxels(key.lod);
+                        const cell = cellOf(pos, key.lod);
+                        if ((self.rm_counts.get(cell) orelse 0) < need) continue;
+                    }
+                    const cell = localCell(self.chunk_log2, pos, key.lod);
+                    try oom(self.job_edits.append(self.ctx.gpa, .{ cell[0], cell[1], cell[2], attr }));
+                }
+            }
+            try oom(self.job_edit_off.append(self.ctx.gpa, @intCast(self.job_edits.items.len)));
+        }
+    }
+
+    /// Geänderte Chunks zum Neubau vormerken (vor den neuen Chunks)
+    fn takeDirty(self: *World) Error!void {
+        self.requests.clearRetainingCapacity();
+        const max = @min(self.batch_max, self.job_limit);
+        while (self.requests.items.len < max) {
+            const key = self.dirty.pop() orelse break;
+            _ = self.dirty_set.remove(key);
+            if (self.plan.nodes.get(key) == null) continue; // inzwischen verdrängt
+            try oom(self.requests.append(self.ctx.gpa, key));
+        }
     }
 
     fn chunkSize(self: *const World, lod: u32) f64 {
@@ -240,8 +485,26 @@ pub const World = struct {
     /// der auch an pyr_commit geht (Instanzen liegen relativ dazu).
     /// Erzeugen und Bauen laufen auf einem Hintergrund-Thread und -Stream; der
     /// Aufrufer wartet nie auf die GPU (außer mit world_sync).
+    fn tick() i64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
+    }
+
+    fn lap(self: *World, slot: usize, t0: *i64) void {
+        const p = self.prof orelse return;
+        const now = tick();
+        p[slot] += @as(f64, @floatFromInt(now - t0.*)) / 1e6;
+        t0.* = now;
+    }
+
     pub fn update(self: *World, camera: [3]f64, origin: [3]f64, cam: ?*const types.Camera) Error!void {
         const ctx = self.ctx;
+        if (self.prof == null and std.c.getenv("PYRIT_WORLD_PROFILE") != null) {
+            self.prof = ctx.gpa.create([6]f64) catch null;
+            if (self.prof) |p| p.* = .{ 0, 0, 0, 0, 0, 0 };
+        }
+        var t0: i64 = if (self.prof != null) tick() else 0;
         // LOD aus dem Bildschirmmaß: Pixel je Einheit in Entfernung 1
         if (cam) |c| {
             const h: f64 = @floatFromInt(@max(c.height, 1));
@@ -277,26 +540,43 @@ pub const World = struct {
                 if (c.instance != 0) try ctx.instanceSetTransform(c.instance, &self.transformOf(c.key));
             }
         }
+        self.lap(0, &t0); // Budget, Instanz-Transformationen
         try oom(self.plan.update(camera));
+        self.lap(1, &t0); // Planer
         self.stats.built_chunks = 0;
         self.stats.built_voxels = 0;
 
         if (self.pollJob()) try self.finishJob();
+        self.lap(2, &t0); // Ergebnis übernehmen (Pools, GAS, Instanzen)
         if (self.job_idle) {
-            try oom(self.plan.takeRequests(camera, self.batch_max, &self.requests));
+            // Geänderte Chunks haben Vorrang: der Spieler soll seine Änderung
+            // sofort sehen, nicht erst wenn das Nachladen zur Ruhe kommt.
+            try self.takeDirty();
+            if (self.requests.items.len == 0)
+                try oom(self.plan.takeRequests(camera, @min(self.batch_max, self.job_limit), &self.requests));
             if (self.requests.items.len > 0) {
-                self.submitJob();
+                try self.submitJob();
                 if (self.thread == null) {
                     self.gpuWork();
                     try self.finishJob();
                 }
             }
         }
+        self.lap(3, &t0); // Auftrag stellen
         if (self.stats.built_chunks > 0) try oom(self.plan.collect(camera));
         // gröbere Auswahl für Schatten und GI (Vorfahren, schon im Speicher)
         if (self.secondary_mask != 0) try oom(self.plan.collectCoarse(camera, self.secondary_factor));
         try self.applyVisibility();
+        self.lap(4, &t0); // Auswahl und Sichtbarkeit
         try self.evict();
+        self.lap(5, &t0); // Verdrängung
+        if (self.prof) |p| {
+            self.prof_frames += 1;
+            if (self.prof_frames % 30 == 0) {
+                const n: f64 = @floatFromInt(self.prof_frames);
+                ctx.logf(1, "Welt je Update: Budget {d:.2} ms, Planer {d:.2}, Übernahme {d:.2}, Auftrag {d:.2}, Sichtbarkeit {d:.2}, Verdrängung {d:.2} ms", .{ p[0] / n, p[1] / n, p[2] / n, p[3] / n, p[4] / n, p[5] / n });
+            }
+        }
     }
 
     /// Wartet, bis der laufende Auftrag fertig ist, und übernimmt ihn
@@ -327,7 +607,10 @@ pub const World = struct {
         return @ptrCast(@alignCast(pin + @as(usize, self.batch_max) * @sizeOf(types.ChunkKey)));
     }
 
-    fn submitJob(self: *World) void {
+    fn submitJob(self: *World) Error!void {
+        // Die Überlagerung gehört dem Hauptthread: hier umrechnen, der
+        // Arbeiter lädt nur noch hoch.
+        try self.prepareEdits();
         const k = self.requests.items.len;
         for (self.requests.items, self.pinnedKeys()[0..k]) |r, *d| d.* = .{ .x = r.x, .y = r.y, .z = r.z, .lod = r.lod };
         self.job_count = @intCast(k);
@@ -378,6 +661,91 @@ pub const World = struct {
         };
     }
 
+    /// Kapazität je Chunk erhöhen, ohne den Generatorpuffer zu vergrößern:
+    /// dafür passen weniger Chunks in einen Auftrag. Reicht der Puffer nicht
+    /// einmal für einen Chunk, wird er (einmalig) vergrößert.
+    /// Rückgabe: true, wenn der laufende Auftrag mit `k` Chunks weitermachen kann.
+    fn growCapacity(self: *World, need: u32, k: u32) Error!bool {
+        const n: u32 = @as(u32, 1) << @intCast(self.chunk_log2);
+        const max_cap: u64 = @as(u64, n) * n * n;
+        var new_cap: u64 = @max(@as(u64, self.capacity) * 2, need);
+        new_cap = @min(new_cap, max_cap);
+        if (new_cap <= self.capacity) return true; // schon am Maximum: unmöglich
+        self.capacity = @intCast(new_cap);
+        var fit: u64 = self.voxel_slots / new_cap;
+        if (fit == 0) {
+            // Ein Chunk muss immer hineinpassen: Puffer einmalig vergrößern.
+            _ = self.ctx.drv.cuMemFree_v2(self.voxels_dev);
+            self.voxels_dev = 0;
+            self.voxel_slots = new_cap;
+            self.voxels_dev = try self.ctx.devAlloc(self.voxel_slots * 16, "Welt: Generatorpuffer");
+            if (self.voxels2_dev != 0) {
+                _ = self.ctx.drv.cuMemFree_v2(self.voxels2_dev);
+                self.voxels2_dev = try self.ctx.devAlloc(self.voxel_slots * 16, "Welt: Änderungspuffer");
+            }
+            fit = 1;
+        }
+        self.job_limit = @intCast(@max(@min(fit, self.batch_max), 1));
+        self.ctx.logf(3, "Welt: Kapazität je Chunk auf {d} erhöht, {d} Chunks je Auftrag", .{ self.capacity, self.job_limit });
+        return k <= self.job_limit;
+    }
+
+    fn ensureEditBuffers(self: *World, entries: u32) Error!void {
+        if (self.voxels2_dev == 0) {
+            self.voxels2_dev = try self.ctx.devAlloc(self.voxel_slots * 16, "Welt: Änderungspuffer");
+            self.counts2_dev = try self.ctx.devAlloc(@as(u64, self.batch_max) * 4, "Welt: Änderungszähler");
+        }
+        if (self.edit_off_dev == 0)
+            self.edit_off_dev = try self.ctx.devAlloc(@as(u64, self.batch_max + 1) * 4, "Welt: Änderungsgrenzen");
+        if (entries > self.edits_dev_cap) {
+            const cap = @max(entries, @max(self.edits_dev_cap * 2, 256));
+            if (self.edits_dev != 0) _ = self.ctx.drv.cuMemFree_v2(self.edits_dev);
+            if (self.edit_used_dev != 0) _ = self.ctx.drv.cuMemFree_v2(self.edit_used_dev);
+            self.edits_dev = 0;
+            self.edit_used_dev = 0;
+            self.edits_dev = try self.ctx.devAlloc(@as(u64, cap) * 16, "Welt: Änderungen");
+            self.edit_used_dev = try self.ctx.devAlloc(@as(u64, cap) * 4, "Welt: Änderungen (verbraucht)");
+            self.edits_dev_cap = cap;
+        }
+    }
+
+    /// Änderungen des Auftrags anwenden; liefert den Voxelpuffer für den Bau.
+    /// Die Zähler des Ziels entstehen dabei neu (`counts` wird überschrieben).
+    fn applyEdits(self: *World, k: u32, counts: [*]u32) Error!cuda.CUdeviceptr {
+        const ctx = self.ctx;
+        const aux = ctx.aux_stream;
+        const entries: u32 = @intCast(self.job_edits.items.len);
+        try self.ensureEditBuffers(entries);
+        try ctx.check(ctx.drv.cuMemcpyHtoDAsync_v2(self.edits_dev, self.job_edits.items.ptr, @as(u64, entries) * 16, aux), "cuMemcpyHtoDAsync");
+        try ctx.check(ctx.drv.cuMemcpyHtoDAsync_v2(self.edit_off_dev, self.job_edit_off.items.ptr, (@as(u64, k) + 1) * 4, aux), "cuMemcpyHtoDAsync");
+        try ctx.check(ctx.drv.cuMemsetD8Async(self.edit_used_dev, 0, @as(u64, entries) * 4, aux), "cuMemsetD8Async");
+        try ctx.check(ctx.drv.cuMemsetD8Async(self.counts2_dev, 0, @as(u64, k) * 4, aux), "cuMemsetD8Async");
+
+        var p = types.WorldEditParams{
+            .voxels = self.voxels_dev,
+            .counts = self.counts_dev,
+            .out_voxels = self.voxels2_dev,
+            .out_counts = self.counts2_dev,
+            .edits = self.edits_dev,
+            .edit_offsets = self.edit_off_dev,
+            .edit_used = self.edit_used_dev,
+            .count = k,
+            .capacity = self.capacity,
+        };
+        const params = [_]?*anyopaque{@ptrCast(&p)};
+        const b = types.edit_block;
+        const cells = @as(u64, k) * self.capacity;
+        const grid_cells: u32 = @intCast((cells + b - 1) / b);
+        const grid_edits: u32 = @intCast((@as(u64, entries) + b - 1) / b);
+        try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_edit_apply, grid_cells, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Änderungen)");
+        try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_edit_compact, grid_cells, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Änderungen: verdichten)");
+        if (grid_edits > 0)
+            try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_edit_append, grid_edits, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Änderungen: anhängen)");
+        const e = ctx.gpuExecAux();
+        try e.read(e.ctx, std.mem.sliceAsBytes(counts[0..k]), self.counts2_dev);
+        return self.voxels2_dev;
+    }
+
     fn gpuWorkImpl(self: *World) Error!void {
         const ctx = self.ctx;
         const k = self.job_count;
@@ -386,54 +754,73 @@ pub const World = struct {
         const sums = counts + self.batch_max;
         self.job_total = 0;
         self.job_overflow = 0;
+        self.job_retry = false;
         self.job_built = null;
         try ctx.check(ctx.drv.cuMemcpyHtoDAsync_v2(self.keys_dev, self.pinnedKeys(), @as(u64, k) * @sizeOf(types.ChunkKey), aux), "cuMemcpyHtoDAsync");
-        try ctx.check(ctx.drv.cuMemsetD8Async(self.counts_dev, 0, @as(u64, k) * 4, aux), "cuMemsetD8Async");
 
-        // 1. Erzeugen
-        var gp = types.WorldGenParams{
-            .chunks = self.keys_dev,
-            .voxels = self.voxels_dev,
-            .counts = self.counts_dev,
-            .count = k,
-            .capacity = self.capacity,
-            .chunk_log2 = self.chunk_log2,
-            .reserved = 0,
-            .user = @intFromPtr(self.user),
-        };
-        if (self.generate) |gen| {
-            gen(self.user, &gp, @ptrCast(aux));
-        } else {
-            var tp = self.terrain;
-            const threads = k << @intCast(2 * self.chunk_log2);
-            const params = [_]?*anyopaque{ @ptrCast(&gp), @ptrCast(&tp) };
-            const b = types.gen_block;
-            try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_gen_terrain, (threads + b - 1) / b, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Gelände)");
+        const e = ctx.gpuExecAux();
+        var voxels = self.voxels_dev;
+        while (true) {
+            try ctx.check(ctx.drv.cuMemsetD8Async(self.counts_dev, 0, @as(u64, k) * 4, aux), "cuMemsetD8Async");
+
+            // 1. Erzeugen
+            var gp = types.WorldGenParams{
+                .chunks = self.keys_dev,
+                .voxels = self.voxels_dev,
+                .counts = self.counts_dev,
+                .count = k,
+                .capacity = self.capacity,
+                .chunk_log2 = self.chunk_log2,
+                .reserved = 0,
+                .user = @intFromPtr(self.user),
+            };
+            if (self.generate) |gen| {
+                gen(self.user, &gp, @ptrCast(aux));
+            } else {
+                var tp = self.terrain;
+                const threads = k << @intCast(2 * self.chunk_log2);
+                const params = [_]?*anyopaque{ @ptrCast(&gp), @ptrCast(&tp) };
+                const b = types.gen_block;
+                try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_gen_terrain, (threads + b - 1) / b, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Gelände)");
+            }
+
+            // 2. Belegung lesen. Passt ein Chunk nicht in die Kapazität, wird
+            //    sie erhöht und der Auftrag wiederholt – abgeschnitten wird nie.
+            try e.read(e.ctx, std.mem.sliceAsBytes(counts[0..k]), self.counts_dev);
+            var need: u32 = 0;
+            for (0..k) |c| need = @max(need, counts[c]);
+
+            // 3. Änderungen anwenden (verdichtet in den zweiten Puffer)
+            if (need <= self.capacity and self.job_edits.items.len > 0) {
+                voxels = try self.applyEdits(k, counts);
+                for (0..k) |c| need = @max(need, counts[c]);
+            } else voxels = self.voxels_dev;
+
+            if (need <= self.capacity) break;
+            self.job_overflow += 1;
+            if (!try self.growCapacity(need, k)) {
+                // Auftrag passt nicht mehr: verwerfen, der Planer fragt die
+                // Chunks im nächsten Update in kleineren Häppchen erneut an.
+                self.job_retry = true;
+                return;
+            }
         }
 
-        // 2. Belegung lesen, dichte Präfixe
-        const e = ctx.gpuExecAux();
-        try e.read(e.ctx, std.mem.sliceAsBytes(counts[0..k]), self.counts_dev);
         var total: u64 = 0;
         sums[0] = 0;
         for (0..k) |c| {
-            var n = counts[c];
-            if (n > self.capacity) {
-                self.job_overflow += 1;
-                n = self.capacity;
-            }
-            total += n;
+            total += counts[c];
             sums[c + 1] = @intCast(total);
         }
         self.job_total = @intCast(total);
         if (total == 0) return;
 
-        // 3. DAG-Bau aller Chunks in einem Zug
+        // 4. DAG-Bau aller Chunks in einem Zug
         try ctx.check(ctx.drv.cuMemcpyHtoDAsync_v2(self.offsets_dev, sums, (@as(u64, k) + 1) * 4, aux), "cuMemcpyHtoDAsync");
         self.job_built = try gpu_build.buildChunks(e, self.chunk_log2, self.rt_log2, .{
             .count = k,
             .capacity = self.capacity,
-            .voxels = self.voxels_dev,
+            .voxels = voxels,
             .offsets = self.offsets_dev,
             .total = @intCast(total),
         }, self.jobOut());
@@ -461,7 +848,15 @@ pub const World = struct {
             self.job_built = null;
             return fail(err, "Welt: {s}", .{std.mem.sliceTo(&self.job_message, 0)});
         }
-        if (self.job_overflow > 0) ctx.logf(2, "Welt: Generatorpuffer bei {d} Chunks übergelaufen (chunk_capacity erhöhen)", .{self.job_overflow});
+        if (self.job_retry) {
+            // Kapazität wurde erhöht; dieselben Chunks kommen kleiner zurück.
+            for (self.requests.items) |key| {
+                if (self.plan.nodes.getPtr(key)) |n| n.state = .requested;
+            }
+            self.stats.overflow_chunks += self.job_overflow;
+            return;
+        }
+        if (self.job_overflow > 0) ctx.logf(3, "Welt: Kapazität je Chunk {d} Mal erhöht (kein Voxel ging verloren)", .{self.job_overflow});
         self.stats.overflow_chunks += self.job_overflow;
         self.stats.built_voxels = self.job_total;
 
@@ -502,6 +897,20 @@ pub const World = struct {
             try ctx.instanceSetTransform(inst, &self.transformOf(key));
             try ctx.instanceSetMask(inst, 0);
             try ctx.instanceKeepHistory(inst);
+            // Neubau nach einer Änderung: den alten Chunk erst jetzt freigeben,
+            // damit nie ein Loch entsteht.
+            if (self.plan.nodes.get(key)) |nd| {
+                if (nd.user != 0) {
+                    const old: u32 = @intCast(nd.user - 1);
+                    const oc = &self.chunks.items[old];
+                    if (oc.instance != 0) {
+                        try ctx.instanceDestroy(oc.instance);
+                        try ctx.geometryDestroy(oc.geometry);
+                    }
+                    oc.* = .{ .key = oc.key, .geometry = 0, .instance = 0, .mask = 0, .stamp = 0, .stamp_coarse = 0, .voxels = 0 };
+                    try oom(self.chunk_free.append(ctx.gpa, old));
+                }
+            }
             const idx: u32 = self.chunk_free.pop() orelse blk: {
                 try oom(self.chunks.append(ctx.gpa, undefined));
                 break :blk @intCast(self.chunks.items.len - 1);
@@ -565,3 +974,63 @@ pub const World = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests der reinen Host-Logik (ohne GPU)
+// ---------------------------------------------------------------------------
+
+test "Änderungen: Abbildung auf Chunk und Zelle über alle Stufen" {
+    const testing = std.testing;
+    const cl: u32 = 5; // 32^3 Voxel je Chunk
+
+    // Ein Voxel bei (100, 70, -3): auf jeder Stufe muss er in dem Chunk liegen,
+    // der seine Position überdeckt, und die lokale Zelle muss dazu passen.
+    const p = EditPos{ .x = 100, .y = 70, .z = -3 };
+    var lod: u32 = 0;
+    while (lod <= 8) : (lod += 1) {
+        const key = chunkKeyFor(cl, p, lod).?;
+        const cell = localCell(cl, p, lod);
+        // Rückrechnung: Weltposition der Zelle muss p enthalten
+        const size: i64 = @as(i64, 1) << @intCast(cl + lod);
+        const step: i64 = @as(i64, 1) << @intCast(lod);
+        const wx = @as(i64, key.x) * size + @as(i64, cell[0]) * step;
+        const wy = @as(i64, key.y) * size + @as(i64, cell[1]) * step;
+        const wz = @as(i64, key.z) * size + @as(i64, cell[2]) * step;
+        try testing.expect(p.x >= wx and p.x < wx + step);
+        try testing.expect(p.y >= wy and p.y < wy + step);
+        try testing.expect(p.z >= wz and p.z < wz + step);
+        try testing.expect(cell[0] < @as(u32, 1) << @intCast(cl));
+    }
+
+    // Negative Koordinaten runden nach unten, nicht zur Null
+    try testing.expectEqual(@as(i32, -1), chunkKeyFor(cl, .{ .x = -1, .y = 0, .z = 0 }, 0).?.x);
+    try testing.expectEqual(@as(u32, 31), localCell(cl, .{ .x = -1, .y = 0, .z = 0 }, 0)[0]);
+}
+
+test "Änderungen: Entfernen wirkt grob erst, wenn die Zelle ganz leer ist" {
+    const testing = std.testing;
+    // Eine Zelle der Stufe 2 umfasst 8^3 = 512 Grundvoxel
+    try testing.expectEqual(@as(u64, 1), cellVoxels(0));
+    try testing.expectEqual(@as(u64, 512), cellVoxels(3));
+    try testing.expectEqual(@as(u64, 4096), cellVoxels(4));
+
+    // Alle Grundvoxel einer Zelle der Stufe 2 (4^3 = 64) gehören zu derselben
+    // groben Zelle – erst der 64. Abbau darf sie leeren.
+    const lod: u32 = 2;
+    var removed: u64 = 0;
+    var x: i64 = 0;
+    while (x < 4) : (x += 1) {
+        var y: i64 = 0;
+        while (y < 4) : (y += 1) {
+            var z: i64 = 0;
+            while (z < 4) : (z += 1) {
+                const cell = cellOf(.{ .x = x, .y = y, .z = z }, lod);
+                try testing.expectEqual(CellKey{ .lod = 2, .x = 0, .y = 0, .z = 0 }, cell);
+                removed += 1;
+                // vorher greift die Entfernung auf dieser Stufe nicht
+                try testing.expectEqual(removed == cellVoxels(lod), removed >= cellVoxels(lod));
+            }
+        }
+    }
+    try testing.expectEqual(cellVoxels(lod), removed);
+}

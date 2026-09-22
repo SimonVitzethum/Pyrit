@@ -586,6 +586,54 @@ pub export fn pyr_world_wait(ctx: ?*PyrContext, world: ?*PyrWorld, camera: ?*con
     return call(ctx, worldWait, .{ w, cam.* });
 }
 
+fn worldEdit(self: *Context, w: *World, list: []const api.WorldEdit) diag.Error!void {
+    if (w.ctx != self) return diag.fail(error.InvalidArgument, "Welt gehört zu einem anderen Kontext", .{});
+    try w.edit(list);
+}
+
+/// Grundvoxel setzen oder entfernen. Die Änderungen liegen als Überlagerung
+/// über dem Generator: betroffene Chunks werden neu gebaut, und jede spätere
+/// Neuerzeugung (Verdrängung, LOD-Wechsel) trägt sie wieder auf.
+pub export fn pyr_world_edit(ctx: ?*PyrContext, world: ?*PyrWorld, edits: ?[*]const api.WorldEdit, count: u32) Result {
+    diag.clear();
+    const w = worldOf(world) orelse return code(diag.fail(error.InvalidArgument, "world ist NULL", .{}));
+    if (count == 0) return api.ok;
+    const e = edits orelse return code(diag.fail(error.InvalidArgument, "edits ist NULL", .{}));
+    return call(ctx, worldEdit, .{ w, e[0..count] });
+}
+
+/// Größe des Puffers für pyr_world_edits_save in Bytes.
+pub export fn pyr_world_edits_bytes(world: ?*PyrWorld) u64 {
+    const w = worldOf(world) orelse return 0;
+    return w.editsBytes();
+}
+
+/// Alle Änderungen in `dst` schreiben (Größe aus pyr_world_edits_bytes). Das
+/// Gelände selbst wird nicht gespeichert: das erzeugt der Generator jederzeit
+/// wieder. Die Datei schreibt der Aufrufer – Pyrit fasst keine Dateien an.
+pub export fn pyr_world_edits_save(world: ?*PyrWorld, dst: ?*anyopaque, size: u64) Result {
+    diag.clear();
+    const w = worldOf(world) orelse return code(diag.fail(error.InvalidArgument, "world ist NULL", .{}));
+    const d = dst orelse return code(diag.fail(error.InvalidArgument, "dst ist NULL", .{}));
+    const buf = @as([*]u8, @ptrCast(d))[0..@intCast(size)];
+    w.editsSave(buf) catch |e| return code(e);
+    return api.ok;
+}
+
+fn worldEditsLoad(self: *Context, w: *World, src: []const u8) diag.Error!void {
+    if (w.ctx != self) return diag.fail(error.InvalidArgument, "Welt gehört zu einem anderen Kontext", .{});
+    try w.editsLoad(src);
+}
+
+/// Änderungen aus einem Puffer von pyr_world_edits_save übernehmen.
+pub export fn pyr_world_edits_load(ctx: ?*PyrContext, world: ?*PyrWorld, src: ?*const anyopaque, size: u64) Result {
+    diag.clear();
+    const w = worldOf(world) orelse return code(diag.fail(error.InvalidArgument, "world ist NULL", .{}));
+    const p = src orelse return code(diag.fail(error.InvalidArgument, "src ist NULL", .{}));
+    const buf = @as([*]const u8, @ptrCast(p))[0..@intCast(size)];
+    return call(ctx, worldEditsLoad, .{ w, buf });
+}
+
 pub export fn pyr_world_stats(world: ?*PyrWorld, out: ?*api.WorldStats) Result {
     const w = worldOf(world) orelse return code(diag.fail(error.InvalidArgument, "world ist NULL", .{}));
     const o = out orelse return code(diag.fail(error.InvalidArgument, "out ist NULL", .{}));

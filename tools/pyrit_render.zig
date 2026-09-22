@@ -25,6 +25,10 @@ fn req(r: api.Result) void {
     if (r != api.ok) std.debug.panic("{s}: {s}", .{ pyrit.pyr_result_string(r), pyrit.pyr_error_message() });
 }
 
+fn logCb(_: ?*anyopaque, level: i32, message: [*:0]const u8) callconv(.c) void {
+    std.debug.print("[pyrit {d}] {s}\n", .{ level, message });
+}
+
 fn devAlloc(bytes: usize) u64 {
     var p: cuda.CUdeviceptr = 0;
     cu(drv.cuMemAlloc_v2(&p, bytes));
@@ -139,6 +143,10 @@ pub fn main(init: std.process.Init) !void {
     // Kameradrehung je Frame in Radiant (wie Mausblick); 0 = starre Blickrichtung
     var turn: f32 = 0;
     var flicker = false;
+    var edit_test = false;
+    var chunk_capacity: u32 = 0;
+    var edit_load = false;
+    var edit_file: ?[]const u8 = null;
     // Sichtweite in Grundvoxeln (0 = Vorgabe 16384 = 1024 Minecraft-Chunks)
     var view_distance: f32 = 0;
     var sea_level: f32 = 0;
@@ -201,6 +209,16 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--view") and i + 1 < args.len) {
             i += 1;
             view_distance = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--chunk-capacity") and i + 1 < args.len) {
+            i += 1;
+            chunk_capacity = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--edit")) {
+            edit_test = true;
+        } else if (std.mem.eql(u8, a, "--edit-file") and i + 1 < args.len) {
+            i += 1;
+            edit_file = args[i];
+        } else if (std.mem.eql(u8, a, "--edit-load")) {
+            edit_load = true;
         } else if (std.mem.eql(u8, a, "--flicker")) {
             flicker = true;
         } else if (std.mem.eql(u8, a, "--half-gi")) {
@@ -233,7 +251,8 @@ pub fn main(init: std.process.Init) !void {
     ci.flags = flags;
     if (world_mode) {
         // feines LOD braucht viele Chunks
-        ci.max_geometries = 65536;
+        if (std.c.getenv("PYRIT_LOG") != null or std.c.getenv("PYRIT_WORLD_PROFILE") != null) ci.log = logCb;
+    ci.max_geometries = 65536;
         ci.max_instances = 65536;
         ci.node_pool_bytes = 512 << 20;
         ci.leaf_pool_bytes = 512 << 20;
@@ -243,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -351,7 +370,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -373,6 +392,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     wi.terrain = &terrain;
     wi.voxel_pixels = voxel_px;
     wi.view_distance = view_distance;
+    wi.chunk_capacity = chunk_capacity;
     wi.rt_leaf_log2 = rt_leaf;
     wi.memory_budget = @as(u64, budget_mib) << 20;
     if (coarse_secondary) {
@@ -470,13 +490,59 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
             light.secondary_bias = st.secondary_bias;
             req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
         }
+        if (f == 0 and edit_load) {
+            // Frische Welt: Änderungen aus der Datei übernehmen, bevor irgendein
+            // Chunk gebaut wurde – sie müssen schon bei der Erzeugung greifen.
+            const data = try std.Io.Dir.cwd().readFileAlloc(init.io, edit_file.?, init.gpa, .limited(1 << 28));
+            defer init.gpa.free(data);
+            req(pyrit.pyr_world_edits_load(@ptrCast(ctx), @ptrCast(world), data.ptr, data.len));
+            std.debug.print("Änderungen geladen: {d} Bytes\n", .{data.len});
+        }
         if (f == 0) {
             // Aufwärmen: alles um die Startposition fertig bauen
             const tw = std.Io.Timestamp.now(init.io, .awake);
-            while (st.pending_chunks > 0 and warm < 400) : (warm += 1) {
+            while (st.pending_chunks > 0 and warm < 8000) : (warm += 1) {
                 req(pyrit.pyr_world_wait(@ptrCast(ctx), @ptrCast(world), &pos));
                 req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
                 req(pyrit.pyr_world_stats(@ptrCast(world), &st));
+            }
+            // Probe für pyr_world_edit: einen Turm setzen und eine Grube
+            // ausheben, beides vor der Kamera. Danach warten, bis die
+            // betroffenen Chunks neu gebaut sind.
+            if (edit_test) {
+                var list: std.ArrayList(api.WorldEdit) = .empty;
+                defer list.deinit(init.gpa);
+                const bx: i64 = @intFromFloat(pos[0] + 60);
+                const bz: i64 = @intFromFloat(pos[2] + 30);
+                const gy: i64 = @intFromFloat(pyrit.pyr_terrain_height(&terrain, @floatFromInt(bx), @floatFromInt(bz)));
+                const red = pyrit.pyr_voxel_attribute(0, 220, 40, 40);
+                var ex: i64 = 0;
+                while (ex < 12) : (ex += 1) {
+                    var ez: i64 = 0;
+                    while (ez < 12) : (ez += 1) {
+                        var ey: i64 = 0;
+                        while (ey < 24) : (ey += 1) {
+                            try list.append(init.gpa, .{ .x = bx + ex, .y = gy + 1 + ey, .z = bz + ez, .attribute = red });
+                        }
+                        // Grube: alles unter der Oberfläche entfernen
+                        ey = 0;
+                        while (ey < 14) : (ey += 1) {
+                            try list.append(init.gpa, .{ .x = bx + ex - 16, .y = gy - ey, .z = bz + ez, .attribute = 0 });
+                        }
+                    }
+                }
+                req(pyrit.pyr_world_edit(@ptrCast(ctx), @ptrCast(world), list.items.ptr, @intCast(list.items.len)));
+                var guard: u32 = 0;
+                while (guard < 64) : (guard += 1) {
+                    req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
+                    req(pyrit.pyr_world_wait(@ptrCast(ctx), @ptrCast(world), &pos));
+                }
+                const bytes = pyrit.pyr_world_edits_bytes(@ptrCast(world));
+                const buf = try init.gpa.alloc(u8, @intCast(bytes));
+                defer init.gpa.free(buf);
+                req(pyrit.pyr_world_edits_save(@ptrCast(world), buf.ptr, bytes));
+                if (edit_file) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = buf });
+                std.debug.print("{d} Änderungen gesetzt, gesichert in {d} Bytes\n", .{ list.items.len, bytes });
             }
             t_flight = std.Io.Timestamp.now(init.io, .awake); // Aufwärmen nicht mitmessen
             std.debug.print("Welt aufgebaut: {d} Updates, {d:.1} ms, {d} Chunks resident, {d} sichtbar, {d:.1} MiB\n", .{ warm + 1, msSince(init, tw) + u, st.resident_chunks, st.visible_chunks, @as(f64, @floatFromInt(st.bytes)) / (1 << 20) });
