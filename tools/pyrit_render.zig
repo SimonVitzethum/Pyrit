@@ -146,6 +146,9 @@ pub fn main(init: std.process.Init) !void {
     var edit_test = false;
     var fx_flags: u32 = 0;
     var materials = false;
+    var use_env = false;
+    var bounces: u32 = 0;
+    var fog: f32 = 0;
     var chunk_capacity: u32 = 0;
     var edit_load = false;
     var edit_stream = false;
@@ -215,6 +218,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--chunk-capacity") and i + 1 < args.len) {
             i += 1;
             chunk_capacity = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--bounces") and i + 1 < args.len) {
+            i += 1;
+            bounces = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--fog") and i + 1 < args.len) {
+            i += 1;
+            fog = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--env")) {
+            use_env = true;
         } else if (std.mem.eql(u8, a, "--materials")) {
             materials = true;
         } else if (std.mem.eql(u8, a, "--fx")) {
@@ -281,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, bounces, fog);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -322,6 +333,55 @@ pub fn main(init: std.process.Init) !void {
 
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
+    if (bounces > 0) light.gi_bounces = bounces;
+    if (fog > 0) {
+        light.fog_density = fog;
+        light.fog_height = 90;
+        light.fog_falloff = 0.02;
+        light.fog_color = .{ 1, 0.98, 0.92 };
+        light.fog_anisotropy = 0.7;
+    }
+    if (use_env) {
+        // Umgebungskarte: Himmelsverlauf mit kleiner, sehr heller Sonne.
+        // Genau der Fall, der ohne Importance-Sampling hoffnungslos rauscht.
+        const ew: u32 = 512;
+        const eh: u32 = 256;
+        const env = try init.gpa.alloc(f32, ew * eh * 4);
+        defer init.gpa.free(env);
+        const sun_theta: f32 = 0.75;
+        const sun_phi: f32 = 1.1;
+        for (0..eh) |y| {
+            const theta = (@as(f32, @floatFromInt(y)) + 0.5) / @as(f32, @floatFromInt(eh)) * std.math.pi;
+            for (0..ew) |x| {
+                const phi = (@as(f32, @floatFromInt(x)) + 0.5) / @as(f32, @floatFromInt(ew)) * 2 * std.math.pi;
+                const up = @cos(theta);
+                // Verlauf: unten Boden, oben Himmel
+                var r: f32 = if (up > 0) 0.35 + 0.25 * up else 0.10;
+                var g: f32 = if (up > 0) 0.45 + 0.35 * up else 0.09;
+                var b: f32 = if (up > 0) 0.65 + 0.35 * up else 0.08;
+                // kleine Sonnenscheibe, sehr hell
+                const dt = theta - sun_theta;
+                var dp = phi - sun_phi;
+                if (dp > std.math.pi) dp -= 2 * std.math.pi;
+                if (dp < -std.math.pi) dp += 2 * std.math.pi;
+                if (dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                    r += 4000;
+                    g += 3800;
+                    b += 3400;
+                }
+                const o = (y * ew + x) * 4;
+                env[o + 0] = r;
+                env[o + 1] = g;
+                env[o + 2] = b;
+                env[o + 3] = 0;
+            }
+        }
+        req(pyrit.pyr_environment_set(@ptrCast(ctx), ew, eh, &env[0]));
+        light.env_intensity = 1;
+        // Die eigene Sonne aus: sie steckt jetzt in der Karte
+        light.sun_color = .{ 0, 0, 0 };
+        std.debug.print("Umgebungskarte {d}x{d} mit Sonnenscheibe gesetzt\n", .{ ew, eh });
+    }
     light.sun_direction = .{ 0.6, 0.55, 0.3 };
     if (!gi) light.flags = types.lighting_shadows | types.lighting_ao | types.lighting_sun_disk;
     req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
@@ -389,7 +449,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, bounces: u32, fog: f32) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -460,6 +520,55 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
 
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
+    if (bounces > 0) light.gi_bounces = bounces;
+    if (fog > 0) {
+        light.fog_density = fog;
+        light.fog_height = 90;
+        light.fog_falloff = 0.02;
+        light.fog_color = .{ 1, 0.98, 0.92 };
+        light.fog_anisotropy = 0.7;
+    }
+    if (use_env) {
+        // Umgebungskarte: Himmelsverlauf mit kleiner, sehr heller Sonne.
+        // Genau der Fall, der ohne Importance-Sampling hoffnungslos rauscht.
+        const ew: u32 = 512;
+        const eh: u32 = 256;
+        const env = try init.gpa.alloc(f32, ew * eh * 4);
+        defer init.gpa.free(env);
+        const sun_theta: f32 = 0.75;
+        const sun_phi: f32 = 1.1;
+        for (0..eh) |y| {
+            const theta = (@as(f32, @floatFromInt(y)) + 0.5) / @as(f32, @floatFromInt(eh)) * std.math.pi;
+            for (0..ew) |x| {
+                const phi = (@as(f32, @floatFromInt(x)) + 0.5) / @as(f32, @floatFromInt(ew)) * 2 * std.math.pi;
+                const up = @cos(theta);
+                // Verlauf: unten Boden, oben Himmel
+                var r: f32 = if (up > 0) 0.35 + 0.25 * up else 0.10;
+                var g: f32 = if (up > 0) 0.45 + 0.35 * up else 0.09;
+                var b: f32 = if (up > 0) 0.65 + 0.35 * up else 0.08;
+                // kleine Sonnenscheibe, sehr hell
+                const dt = theta - sun_theta;
+                var dp = phi - sun_phi;
+                if (dp > std.math.pi) dp -= 2 * std.math.pi;
+                if (dp < -std.math.pi) dp += 2 * std.math.pi;
+                if (dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                    r += 4000;
+                    g += 3800;
+                    b += 3400;
+                }
+                const o = (y * ew + x) * 4;
+                env[o + 0] = r;
+                env[o + 1] = g;
+                env[o + 2] = b;
+                env[o + 3] = 0;
+            }
+        }
+        req(pyrit.pyr_environment_set(@ptrCast(ctx), ew, eh, &env[0]));
+        light.env_intensity = 1;
+        // Die eigene Sonne aus: sie steckt jetzt in der Karte
+        light.sun_color = .{ 0, 0, 0 };
+        std.debug.print("Umgebungskarte {d}x{d} mit Sonnenscheibe gesetzt\n", .{ ew, eh });
+    }
     light.sun_direction = .{ 0.5, 0.35, 0.4 };
     if (!gi) light.flags = types.lighting_shadows | types.lighting_ao | types.lighting_sun_disk;
     light.gi_distance = gi_distance;

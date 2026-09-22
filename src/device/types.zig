@@ -225,7 +225,14 @@ pub const TextureData = extern struct {
     height: u32,
 };
 
-pub const max_lights: u32 = 16;
+pub const max_lights: u32 = 64;
+
+/// Kugel (Punktlicht mit Radius)
+pub const light_sphere: u32 = 0;
+/// Rechteck: strahlt in Richtung `normal`, Kantenlängen 2·size
+pub const light_rect: u32 = 1;
+/// Kegel um `normal` mit weichem Rand zwischen den beiden Winkeln
+pub const light_spot: u32 = 2;
 
 pub const Light = extern struct {
     position: [3]f32,
@@ -235,6 +242,13 @@ pub const Light = extern struct {
     color: [3]f32,
     /// Reichweite; 0 = unbegrenzt
     range: f32,
+    /// light_*
+    kind: u32,
+    /// Rechteck und Kegel: Richtung (wird normiert)
+    normal: [3]f32,
+    /// Rechteck: halbe Kantenlängen; Kegel: cos(innen), cos(außen)
+    size: [2]f32,
+    reserved_light: [2]u32,
 };
 
 pub const lighting_shadows: u32 = 0x1;
@@ -275,7 +289,34 @@ pub const Lighting = extern struct {
     /// Reichweite der indirekten Beleuchtung in Welteinheiten; darüber zählt
     /// der Himmel. 0 = unbegrenzt. Kürzere Strahlen sind deutlich billiger.
     gi_distance: f32,
-    reserved: [2]u32,
+    /// Umgebungskarte (equirektangulär, 4 x f32 je Texel) und ihre Verteilung
+    /// für das Importance-Sampling: `env_marginal` hat height+1 Werte,
+    /// `env_cond` je Zeile width+1. 0 = keine Karte, dann der analytische
+    /// Himmel aus sky_*.
+    env_data: u64,
+    env_marginal: u64,
+    env_cond: u64,
+    env_width: u32,
+    env_height: u32,
+    env_intensity: f32,
+    /// Drehung der Karte um die Y-Achse in Radiant
+    env_rotation: f32,
+    /// Summe der Helligkeiten (für die Wahrscheinlichkeitsdichte)
+    env_total: f32,
+    /// Indirekte Reflexionen: 1 = eine (Vorgabe), mehr für tiefere Lichtwege.
+    /// Ab der zweiten wird russisches Roulette angewandt.
+    gi_bounces: u32,
+    /// Teilnehmendes Medium (Nebel, Lichtschächte): Dichte je Welteinheit auf
+    /// Höhe `fog_height`, darüber exponentiell abnehmend mit `fog_falloff`.
+    fog_density: f32,
+    fog_color: [3]f32,
+    fog_height: f32,
+    fog_falloff: f32,
+    /// Streurichtung nach Henyey-Greenstein: 0 = gleichmäßig, >0 nach vorn
+    fog_anisotropy: f32,
+    /// Schritte der Strahlmarschierung; 0 = 12
+    fog_steps: u32,
+    reserved: [3]u32,
     lights: [max_lights]Light,
 };
 

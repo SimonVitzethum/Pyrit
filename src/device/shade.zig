@@ -216,7 +216,118 @@ pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3) Surfac
 // Himmel
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Umgebungskarte (equirektangulär) mit Importance-Sampling
+//
+// Ohne Karte bleibt der analytische Himmel. Mit Karte wird sie zweifach
+// abgetastet – über den Cosinus-Lappen (der GI-Strahl) und über die
+// Helligkeitsverteilung der Karte – und beides nach der Potenz-Heuristik
+// gewichtet (MIS). Sonst rauscht eine kleine, helle Sonne in der Karte
+// hoffnungslos, oder sie wird doppelt gezählt.
+// ---------------------------------------------------------------------------
+
+pub inline fn hasEnv(l: *const types.Lighting) bool {
+    return l.env_data != 0 and l.env_width > 0 and l.env_height > 0;
+}
+
+fn envTexel(l: *const types.Lighting, x: u32, y: u32) Vec3 {
+    const t = @as([*]const [4]f32, @ptrFromInt(l.env_data))[@as(u64, y) * l.env_width + x];
+    return .{ t[0], t[1], t[2] };
+}
+
+/// Richtung -> Strahldichte aus der Karte (bilinear, in u wiederholend)
+pub fn envRadiance(l: *const types.Lighting, d: Vec3) Vec3 {
+    const dir = vec.normalize(d);
+    const phi = fm.atan2(dir[2], dir[0]) - l.env_rotation;
+    const theta = fm.acos(@min(@max(dir[1], -1), 1));
+    var u = phi * (0.5 / pi);
+    u -= @floor(u);
+    const v = theta * (1.0 / pi);
+    const fx = u * @as(f32, @floatFromInt(l.env_width)) - 0.5;
+    const fy = @min(@max(v * @as(f32, @floatFromInt(l.env_height)) - 0.5, 0), @as(f32, @floatFromInt(l.env_height - 1)));
+    const x0: i32 = @intFromFloat(@floor(fx));
+    const y0: u32 = @intFromFloat(@floor(fy));
+    const tx = fx - @floor(fx);
+    const ty = fy - @floor(fy);
+    const w: i32 = @intCast(l.env_width);
+    const xa: u32 = @intCast(@mod(x0, w));
+    const xb: u32 = @intCast(@mod(x0 + 1, w));
+    const ya = y0;
+    const yb = @min(y0 + 1, l.env_height - 1);
+    const a = envTexel(l, xa, ya);
+    const b = envTexel(l, xb, ya);
+    const c = envTexel(l, xa, yb);
+    const e = envTexel(l, xb, yb);
+    const top = a + (b - a) * splat(tx);
+    const bot = c + (e - c) * splat(tx);
+    return (top + (bot - top) * splat(ty)) * splat(l.env_intensity);
+}
+
+/// Wahrscheinlichkeitsdichte, mit der envSample diese Richtung liefert
+/// (bezogen auf den Raumwinkel)
+pub fn envPdf(l: *const types.Lighting, d: Vec3) f32 {
+    if (l.env_total <= 0) return 0;
+    const dir = vec.normalize(d);
+    const theta = fm.acos(@min(@max(dir[1], -1), 1));
+    const sin_t = fm.sin(theta);
+    if (sin_t < 1e-4) return 0;
+    var u = (fm.atan2(dir[2], dir[0]) - l.env_rotation) * (0.5 / pi);
+    u -= @floor(u);
+    const x: u32 = @min(@as(u32, @intFromFloat(u * @as(f32, @floatFromInt(l.env_width)))), l.env_width - 1);
+    const y: u32 = @min(@as(u32, @intFromFloat(theta * (1.0 / pi) * @as(f32, @floatFromInt(l.env_height)))), l.env_height - 1);
+    const c = envTexel(l, x, y);
+    const lu = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) * sin_t;
+    const nw: f32 = @floatFromInt(l.env_width);
+    const nh: f32 = @floatFromInt(l.env_height);
+    // Dichte über Pixel -> über Raumwinkel
+    return lu / l.env_total * (nw * nh) / (2 * pi * pi * sin_t);
+}
+
+fn searchCdf(cdf: [*]const f32, n: u32, target: f32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = n;
+    while (lo + 1 < hi) {
+        const mid = (lo + hi) / 2;
+        if (cdf[mid] <= target) lo = mid else hi = mid;
+    }
+    return lo;
+}
+
+pub const EnvSample = struct { dir: Vec3, radiance: Vec3, pdf: f32 };
+
+/// Richtung nach der Helligkeit der Karte ziehen
+pub fn envSample(l: *const types.Lighting, r1: f32, r2: f32) EnvSample {
+    const marginal: [*]const f32 = @ptrFromInt(l.env_marginal);
+    const cond: [*]const f32 = @ptrFromInt(l.env_cond);
+    const y = searchCdf(marginal, l.env_height + 1, r1);
+    const row = cond + @as(u64, y) * (l.env_width + 1);
+    const x = searchCdf(row, l.env_width + 1, r2);
+    // innerhalb des Texels gleichverteilt, damit keine Streifen entstehen
+    const dy = blk: {
+        const a = marginal[y];
+        const b = marginal[y + 1];
+        break :blk if (b > a) (r1 - a) / (b - a) else 0.5;
+    };
+    const dx = blk: {
+        const a = row[x];
+        const b = row[x + 1];
+        break :blk if (b > a) (r2 - a) / (b - a) else 0.5;
+    };
+    const u = (@as(f32, @floatFromInt(x)) + dx) / @as(f32, @floatFromInt(l.env_width));
+    const v = (@as(f32, @floatFromInt(y)) + dy) / @as(f32, @floatFromInt(l.env_height));
+    const theta = v * pi;
+    const phi = u * 2 * pi + l.env_rotation;
+    const st = fm.sin(theta);
+    const dir = Vec3{ st * fm.cos(phi), fm.cos(theta), st * fm.sin(phi) };
+    return .{ .dir = dir, .radiance = envRadiance(l, dir), .pdf = envPdf(l, dir) };
+}
+
 pub fn sky(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
+    if (hasEnv(l)) return envRadiance(l, d);
+    return skyAnalytic(l, d, with_sun);
+}
+
+fn skyAnalytic(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
     const zen: Vec3 = l.sky_zenith;
     const hor: Vec3 = l.sky_horizon;
     const gnd: Vec3 = l.ground_color;
@@ -483,17 +594,68 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
         }
     }
 
+    // Umgebungskarte: eine Richtung nach ihrer Helligkeit ziehen und gegen die
+    // Cosinus-Abtastung des GI-Strahls gewichten (Potenz-Heuristik). Ohne das
+    // rauscht eine kleine helle Sonne in der Karte hoffnungslos.
+    if (hasEnv(l) and l.env_total > 0) {
+        const es = envSample(l, rng.next(), rng.next());
+        const endl = vec.dot(n, es.dir);
+        if (endl > 0 and es.pdf > 1e-8) {
+            var tint = splat(@as(f32, 1));
+            var lit = true;
+            if (shadows) {
+                if (anyTransparent(s, trans_mask)) {
+                    const r = traceThrough(tracer, s, p, es.dir, 0, types.flt_max, mask | trans_mask, trans_mask);
+                    lit = r.hit == null;
+                    tint = r.att;
+                } else lit = !occluded(tracer, s, p, es.dir, types.flt_max, mask);
+            }
+            if (lit) {
+                const pdf_bsdf = endl / pi;
+                const w = es.pdf * es.pdf / (es.pdf * es.pdf + pdf_bsdf * pdf_bsdf);
+                c += brdf(n, v, es.dir, sf) * es.radiance * splat(endl * w / es.pdf) * tint;
+            }
+        }
+    }
+
     var i: u32 = 0;
     while (i < @min(l.light_count, types.max_lights)) : (i += 1) {
         const light = &l.lights[i];
-        // Punkt auf der Lichtkugel für weiche Schatten
+        // Abtastpunkt auf der Lichtquelle und ihr Öffnungsfaktor
         var target: Vec3 = light.position;
-        if (light.radius > 0) target += cosineSample(vec.normalize(p - target), rng) * splat(light.radius);
+        var area_cos: f32 = 1;
+        var area: f32 = 0;
+        if (light.kind == types.light_rect) {
+            // gleichverteilt auf dem Rechteck; die Dichte rechnet unten über
+            // den Raumwinkel um (Fläche · cos / Abstand²)
+            const ln = vec.normalize(light.normal);
+            const tb = basis(ln);
+            const t1 = tb[0];
+            const t2 = tb[1];
+            const a = (rng.next() * 2 - 1) * light.size[0];
+            const b = (rng.next() * 2 - 1) * light.size[1];
+            target += t1 * splat(a) + t2 * splat(b);
+            area = 4 * light.size[0] * light.size[1];
+            area_cos = @max(vec.dot(ln, vec.normalize(p - target)), 0);
+            if (area_cos <= 0) continue;
+        } else if (light.radius > 0) {
+            target += cosineSample(vec.normalize(p - target), rng) * splat(light.radius);
+        }
         const to = target - p;
         const dist2 = @max(vec.dot(to, to), 1e-8);
         const dist = @sqrt(dist2);
         if (light.range > 0 and dist > light.range) continue;
         const dir = to * splat(1.0 / dist);
+        if (light.kind == types.light_spot) {
+            // weicher Rand zwischen innerem und äußerem Winkel
+            const ln = vec.normalize(light.normal);
+            const cd = vec.dot(ln, -dir);
+            const ci = light.size[0];
+            const co = light.size[1];
+            if (cd <= co) continue;
+            const t = if (ci > co) @min(@max((cd - co) / (ci - co), 0), 1) else 1;
+            area_cos = t * t;
+        }
         const nl = vec.dot(n, dir);
         if (nl <= 0 and sf.subsurface <= 0) continue;
         var tint = splat(@as(f32, 1));
@@ -505,7 +667,12 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
             } else if (occluded(tracer, s, p, dir, dist * 0.999, mask)) continue;
         }
         const r2 = @max(light.radius * light.radius, 1e-4);
-        const falloff = 1.0 / @max(dist2, r2);
+        // Rechteck: Fläche · cos / Abstand² ist der Raumwinkel; Kugel und
+        // Kegel fallen mit 1/Abstand², der Kegel zusätzlich zum Rand hin.
+        const falloff = if (light.kind == types.light_rect)
+            area * area_cos / @max(dist2, 1e-6)
+        else
+            area_cos / @max(dist2, r2);
         if (nl > 0) c += brdf(n, v, dir, sf) * @as(Vec3, light.color) * splat(nl * falloff) * tint;
         if (sf.subsurface > 0 and nl < 0)
             c += transmit(sf) * @as(Vec3, light.color) * splat(-nl * falloff) * tint;
@@ -575,17 +742,52 @@ pub fn shadeSimple(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: 
 /// Das Ergebnis wird mit Albedo · (1 − metallic) multipliziert.
 pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
     if (l.flags & types.lighting_gi != 0) {
-        const gd = cosineSample(n, rng);
         const gi_max = if (l.gi_distance > 0) l.gi_distance else types.flt_max;
-        const r = traceThrough(tracer, s, p, gd, 0, gi_max, mask | trans_mask, trans_mask);
-        if (r.hit) |g| {
-            const ginst = &tr.instances(s)[g.instance];
-            const gn = worldNormal(ginst, g.face);
-            const gsf = surface(s, g.attribute);
-            const gp = p + gd * splat(g.t) + gn * splat(1e-3 * voxelSize(ginst));
-            return r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask));
+        const bounces = @max(l.gi_bounces, 1);
+        // Mehrere Reflexionen: der Lichtweg wird verfolgt, solange noch
+        // nennenswert Energie übrig ist. Ab der zweiten entscheidet russisches
+        // Roulette – so bleibt der Erwartungswert richtig, ohne jeden Pfad
+        // bis zum Ende zu rechnen.
+        var acc: Vec3 = splat(0);
+        var throughput: Vec3 = splat(1);
+        var op = p;
+        var on = n;
+        var b: u32 = 0;
+        while (b < bounces) : (b += 1) {
+            const gd = cosineSample(on, rng);
+            const r = traceThrough(tracer, s, op, gd, 0, gi_max, mask | trans_mask, trans_mask);
+            if (r.hit) |g| {
+                const ginst = &tr.instances(s)[g.instance];
+                const gn = worldNormal(ginst, g.face);
+                const hp = op + gd * splat(g.t);
+                const gsf = surfaceAt(s, g.attribute, hp, gn);
+                const gp = hp + gn * splat(1e-3 * voxelSize(ginst));
+                acc += throughput * r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask));
+                if (b + 1 >= bounces) break;
+                // Weiter mit dem diffusen Anteil der getroffenen Fläche
+                throughput *= r.att * gsf.albedo * splat(1 - gsf.metallic);
+                const q = @max(@max(throughput[0], throughput[1]), throughput[2]);
+                if (q < 0.05) break;
+                if (q < 1) {
+                    if (rng.next() > q) break;
+                    throughput *= splat(1 / q);
+                }
+                op = gp;
+                on = gn;
+                continue;
+            }
+            // In den Himmel: dort endet der Pfad.
+            if (hasEnv(l) and l.env_total > 0) {
+                const pdf_env = envPdf(l, gd);
+                const pdf_bsdf = @max(vec.dot(on, gd), 0) / pi;
+                const w = if (pdf_bsdf > 0) pdf_bsdf * pdf_bsdf / (pdf_bsdf * pdf_bsdf + pdf_env * pdf_env) else 0;
+                acc += throughput * r.att * envRadiance(l, gd) * splat(w);
+            } else {
+                acc += throughput * r.att * sky(l, gd, false);
+            }
+            break;
         }
-        return r.att * sky(l, gd, false);
+        return acc;
     }
     if (l.flags & types.lighting_ao != 0) {
         const ad = cosineSample(n, rng);
@@ -776,4 +978,70 @@ pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: V
 
 inline fn absorb(color: Vec3, k: f32) Vec3 {
     return .{ fm.pow(@max(color[0], 1e-4), k), fm.pow(@max(color[1], 1e-4), k), fm.pow(@max(color[2], 1e-4), k) };
+}
+
+// ---------------------------------------------------------------------------
+// Teilnehmendes Medium: Nebel und Lichtschächte
+//
+// Entlang des Primärstrahls wird in festen Schritten marschiert. An jedem
+// Schritt kommt Licht von der Sonne dazu, sofern der Punkt sie sieht – das
+// sind die Lichtschächte. Was dahinter liegt, wird um die Durchlässigkeit
+// gedämpft. Die Schrittlage wird je Pixel verschoben (sonst entstehen
+// Bänder), das Rauschen daraus nimmt der zeitliche Filter weg.
+// ---------------------------------------------------------------------------
+
+/// Dichte auf Höhe y: unterhalb fog_height voll, darüber exponentiell weniger
+inline fn fogDensity(l: *const types.Lighting, y: f32) f32 {
+    if (l.fog_falloff <= 0) return l.fog_density;
+    const dy = y - l.fog_height;
+    if (dy <= 0) return l.fog_density;
+    return l.fog_density * fm.exp(-dy * l.fog_falloff);
+}
+
+/// Henyey-Greenstein: wie stark das Medium nach vorn streut
+inline fn phaseHG(g: f32, cos_t: f32) f32 {
+    if (g == 0) return 1.0 / (4 * pi);
+    const g2 = g * g;
+    const d = 1 + g2 - 2 * g * cos_t;
+    return (1 - g2) / (4 * pi * d * @sqrt(@max(d, 1e-6)));
+}
+
+pub inline fn hasFog(l: *const types.Lighting) bool {
+    return l.fog_density > 0;
+}
+
+/// Farbe hinter dem Medium dämpfen und das eingestreute Licht dazurechnen.
+/// `dist` ist die Länge des Sichtstrahls (flt_max für den Himmel).
+pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, o: Vec3, d: Vec3, dist: f32, color: Vec3, rng: *Rng, mask: u32) Vec3 {
+    const max_dist = @min(dist, if (l.gi_distance > 0) l.gi_distance * 4 else 4096);
+    if (!(max_dist > 0)) return color;
+    const steps: u32 = if (l.fog_steps == 0) 12 else @min(l.fog_steps, 64);
+    const dt = max_dist / @as(f32, @floatFromInt(steps));
+    const sd = vec.normalize(l.sun_direction);
+    const phase = phaseHG(l.fog_anisotropy, vec.dot(d, sd));
+    const shadows = l.flags & types.lighting_shadows != 0;
+
+    var transmittance: f32 = 1;
+    var inscatter: Vec3 = splat(0);
+    const jitter = rng.next();
+    var i: u32 = 0;
+    while (i < steps) : (i += 1) {
+        const t = (@as(f32, @floatFromInt(i)) + jitter) * dt;
+        const pos = o + d * splat(t);
+        const dens = fogDensity(l, pos[1]);
+        if (dens <= 0) continue;
+        const sigma = dens * dt;
+        // Sonne sichtbar? Das ergibt die Schächte.
+        var vis: f32 = 1;
+        if (shadows and occluded(tracer, s, pos, sd, types.flt_max, mask)) vis = 0;
+        if (vis > 0) {
+            const li = @as(Vec3, l.sun_color) * splat(phase * vis);
+            inscatter += li * @as(Vec3, l.fog_color) * splat(sigma * transmittance);
+        }
+        // Umgebungslicht im Medium (grob: der Himmel von oben)
+        inscatter += sky(l, .{ 0, 1, 0 }, false) * @as(Vec3, l.fog_color) * splat(sigma * transmittance * (1.0 / (4 * pi)));
+        transmittance *= fm.exp(-sigma);
+        if (transmittance < 0.01) break;
+    }
+    return color * splat(transmittance) + inscatter;
 }

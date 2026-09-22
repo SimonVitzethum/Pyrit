@@ -586,6 +586,22 @@ pub export fn pyr_world_wait(ctx: ?*PyrContext, world: ?*PyrWorld, camera: ?*con
     return call(ctx, worldWait, .{ w, cam.* });
 }
 
+fn environmentSet(self: *Context, w: u32, h: u32, pixels: []const f32) diag.Error!void {
+    try self.setEnvironment(w, h, pixels);
+}
+
+/// Umgebungskarte setzen (equirektangulär, 4 Floats je Texel, RGB + ungenutzt).
+/// Pyrit baut daraus die Verteilung für das Importance-Sampling. width = 0
+/// schaltet sie ab, dann gilt wieder der analytische Himmel aus PyrLighting.
+/// Helligkeit und Drehung stehen in PyrLighting (env_intensity, env_rotation).
+pub export fn pyr_environment_set(ctx: ?*PyrContext, width: u32, height: u32, rgba: ?*const f32) Result {
+    diag.clear();
+    if (width == 0 or height == 0) return call(ctx, environmentSet, .{ 0, 0, @as([]const f32, &.{}) });
+    const p = rgba orelse return code(diag.fail(error.InvalidArgument, "rgba ist NULL", .{}));
+    const n = @as(usize, width) * height * 4;
+    return call(ctx, environmentSet, .{ width, height, @as([*]const f32, @ptrCast(p))[0..n] });
+}
+
 fn textureCreate(self: *Context, w: u32, h: u32, pixels: []const u8, out: *u32) diag.Error!void {
     out.* = try self.textureCreate(w, h, pixels);
 }

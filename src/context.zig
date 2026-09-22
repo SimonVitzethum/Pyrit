@@ -235,6 +235,13 @@ pub const Context = struct {
     texture_table: cuda.CUdeviceptr = 0,
     texture_data: []cuda.CUdeviceptr = &.{},
     texture_high: u32 = 0,
+    /// Umgebungskarte und ihre Verteilung
+    env_data: cuda.CUdeviceptr = 0,
+    env_cond: cuda.CUdeviceptr = 0,
+    env_marginal: cuda.CUdeviceptr = 0,
+    env_w: u32 = 0,
+    env_h: u32 = 0,
+    env_total: f32 = 0,
     instance_buf: [2]cuda.CUdeviceptr = .{ 0, 0 },
     update_scratch: cuda.CUdeviceptr = 0,
     scene_dev: cuda.CUdeviceptr = 0,
@@ -503,6 +510,7 @@ pub const Context = struct {
         for ([_]cuda.CUdeviceptr{ self.materials_dev, self.lighting_dev }) |p| {
             if (p != 0) _ = drv.cuMemFree_v2(p);
         }
+        self.freeEnv();
         for (self.texture_data) |t| {
             if (t != 0) _ = self.drv.cuMemFree_v2(t);
         }
@@ -1463,6 +1471,9 @@ pub const Context = struct {
         l.ground_color = .{ 0.3, 0.27, 0.24 };
         l.sky_intensity = 1.0;
         l.ao_radius = 8;
+        l.gi_bounces = 1;
+        l.fog_color = .{ 1, 1, 1 };
+        l.fog_anisotropy = 0.6;
         return l;
     }
 
@@ -1511,9 +1522,86 @@ pub const Context = struct {
     }
 
     pub fn setLighting(self: *Context, l: *const types.Lighting) Error!void {
-        if (l.light_count > types.max_lights) return fail(error.InvalidArgument, "höchstens {d} Punktlichter", .{types.max_lights});
+        if (l.light_count > types.max_lights) return fail(error.InvalidArgument, "höchstens {d} Lichter", .{types.max_lights});
         self.lighting = l.*;
-        try self.uploadValue(self.lighting_dev, l);
+        // Die Umgebungskarte gehört dem Kontext, nicht dem Aufrufer: seine
+        // Felder werden überschrieben, damit ein altes Lighting sie nicht
+        // versehentlich löscht.
+        self.lighting.env_data = self.env_data;
+        self.lighting.env_marginal = self.env_marginal;
+        self.lighting.env_cond = self.env_cond;
+        self.lighting.env_width = self.env_w;
+        self.lighting.env_height = self.env_h;
+        // Diagnose: ohne Verteilung fällt die Lichtabtastung der Karte weg,
+        // es bleibt reines Abtasten über den Cosinus-Lappen (A/B-Vergleich).
+        self.lighting.env_total = if (std.c.getenv("PYRIT_ENV_NOMIS") != null) 0 else self.env_total;
+        if (self.env_data != 0 and self.lighting.env_intensity == 0) self.lighting.env_intensity = 1;
+        try self.uploadValue(self.lighting_dev, &self.lighting);
+    }
+
+    /// Umgebungskarte setzen: equirektangulär, `w x h`, 4 Floats je Texel
+    /// (RGB + ungenutzt). Pyrit baut daraus die Verteilung für das
+    /// Importance-Sampling: je Zeile eine Summenfunktion über die Spalten und
+    /// eine über die Zeilen, beide mit sin(theta) gewichtet (sonst wären die
+    /// Pole überrepräsentiert).
+    pub fn setEnvironment(self: *Context, w: u32, h: u32, pixels: []const f32) Error!void {
+        self.freeEnv();
+        if (w == 0 or h == 0) {
+            try self.setLighting(&self.lighting);
+            return;
+        }
+        const need = @as(usize, w) * h * 4;
+        if (pixels.len < need) return fail(error.InvalidArgument, "Umgebungskarte {d}x{d} braucht {d} Floats", .{ w, h, need });
+
+        const cond = try oom(self.gpa.alloc(f32, @as(usize, h) * (w + 1)));
+        defer self.gpa.free(cond);
+        const marginal = try oom(self.gpa.alloc(f32, @as(usize, h) + 1));
+        defer self.gpa.free(marginal);
+        var total: f64 = 0;
+        for (0..h) |y| {
+            const sin_t = @sin((@as(f64, @floatFromInt(y)) + 0.5) / @as(f64, @floatFromInt(h)) * std.math.pi);
+            var row_sum: f64 = 0;
+            const row = cond[@as(usize, y) * (w + 1) ..][0 .. w + 1];
+            row[0] = 0;
+            for (0..w) |x| {
+                const px = pixels[(@as(usize, y) * w + x) * 4 ..][0..3];
+                const lu = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
+                row_sum += @max(@as(f64, lu), 0) * sin_t;
+                row[x + 1] = @floatCast(row_sum);
+            }
+            // Zeile auf 1 normieren (0 bleibt 0: dunkle Zeilen werden nie gezogen)
+            if (row_sum > 0) {
+                for (row) |*v| v.* = @floatCast(@as(f64, v.*) / row_sum);
+            }
+            marginal[y] = @floatCast(total);
+            total += row_sum;
+        }
+        marginal[h] = @floatCast(total);
+        if (total > 0) {
+            for (marginal) |*v| v.* = @floatCast(@as(f64, v.*) / total);
+        }
+
+        self.env_data = try self.devAlloc(need * 4, "Umgebungskarte");
+        try self.upload(self.env_data, std.mem.sliceAsBytes(pixels[0..need]));
+        self.env_cond = try self.devAlloc(cond.len * 4, "Umgebungskarte: Verteilung");
+        try self.upload(self.env_cond, std.mem.sliceAsBytes(cond));
+        self.env_marginal = try self.devAlloc(marginal.len * 4, "Umgebungskarte: Verteilung");
+        try self.upload(self.env_marginal, std.mem.sliceAsBytes(marginal));
+        self.env_w = w;
+        self.env_h = h;
+        // Mittelwert der gewichteten Helligkeit je Texel (für die Dichte)
+        self.env_total = @floatCast(total);
+        try self.setLighting(&self.lighting);
+    }
+
+    fn freeEnv(self: *Context) void {
+        for ([_]*cuda.CUdeviceptr{ &self.env_data, &self.env_cond, &self.env_marginal }) |b| {
+            if (b.* != 0) _ = self.drv.cuMemFree_v2(b.*);
+            b.* = 0;
+        }
+        self.env_w = 0;
+        self.env_h = 0;
+        self.env_total = 0;
     }
 
     // -----------------------------------------------------------------------

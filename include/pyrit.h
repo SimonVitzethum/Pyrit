@@ -211,13 +211,22 @@ typedef struct PyrMaterial {
 } PyrMaterial;
 
 
-#define PYR_MAX_LIGHTS 16u
+#define PYR_MAX_LIGHTS 64u
+
+/* PyrLight.kind */
+#define PYR_LIGHT_SPHERE 0u
+#define PYR_LIGHT_RECT   1u
+#define PYR_LIGHT_SPOT   2u
 
 typedef struct PyrLight {
     float position[3];
     float radius;             /* Kugellicht, weiche Schatten */
     float color[3];           /* Beleuchtungsstärke = color / Abstand² */
     float range;              /* 0 = unbegrenzt */
+    uint32_t kind;            /* PYR_LIGHT_* */
+    float normal[3];          /* Rechteck und Kegel: Richtung */
+    float size[2];            /* Rechteck: halbe Kanten; Kegel: cos(innen), cos(aussen) */
+    uint32_t reserved_light[2];
 } PyrLight;
 
 #define PYR_LIGHTING_SHADOWS  0x1u
@@ -245,7 +254,24 @@ typedef struct PyrLighting {
      * Trefferentfernung; nötig bei secondary_mask (siehe PyrWorldStats). */
     float    secondary_bias;
     float    gi_distance;       /* Reichweite der indirekten Beleuchtung, 0 = unbegrenzt */
-    uint32_t reserved[2];
+    /* Umgebungskarte: setzt pyr_environment_set, nicht der Aufrufer */
+    uint64_t env_data;
+    uint64_t env_marginal;
+    uint64_t env_cond;
+    uint32_t env_width;
+    uint32_t env_height;
+    float    env_intensity;     /* 0 = 1 */
+    float    env_rotation;      /* Drehung um Y in Radiant */
+    float    env_total;
+    uint32_t gi_bounces;        /* indirekte Reflexionen, 0/1 = eine */
+    /* Teilnehmendes Medium: Nebel und Lichtschaechte */
+    float    fog_density;       /* je Welteinheit auf Hoehe fog_height, 0 = aus */
+    float    fog_color[3];
+    float    fog_height;
+    float    fog_falloff;       /* exponentielle Abnahme darueber, 0 = gleichmaessig */
+    float    fog_anisotropy;    /* Henyey-Greenstein g, >0 streut nach vorn */
+    uint32_t fog_steps;         /* 0 = 12 */
+    uint32_t reserved[3];
     PyrLight lights[PYR_MAX_LIGHTS];
 } PyrLighting;
 
@@ -489,6 +515,13 @@ PYR_API PyrResult pyr_material_set(PyrContext* ctx, uint32_t index, const PyrMat
 PYR_API PyrResult pyr_texture_create(PyrContext* ctx, uint32_t width, uint32_t height,
                                      const void* rgba8, uint32_t* out_index);
 PYR_API PyrResult pyr_texture_destroy(PyrContext* ctx, uint32_t index);
+
+/* Umgebungskarte (equirektangulär, 4 Floats je Texel: RGB + ungenutzt).
+ * Pyrit baut daraus die Verteilung fuer das Importance-Sampling, damit auch
+ * eine kleine helle Sonne in der Karte rauschfrei beleuchtet. width = 0
+ * schaltet sie ab (dann gilt der analytische Himmel aus PyrLighting).
+ * Helligkeit und Drehung stehen in PyrLighting. */
+PYR_API PyrResult pyr_environment_set(PyrContext* ctx, uint32_t width, uint32_t height, const float* rgba);
 PYR_API void      pyr_lighting_default(PyrLighting* lighting);
 PYR_API PyrResult pyr_set_lighting(PyrContext* ctx, const PyrLighting* lighting);
 PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g, uint32_t b);

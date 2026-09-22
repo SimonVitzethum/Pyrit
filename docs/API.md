@@ -148,6 +148,24 @@ Nicht benötigte Ziele bleiben 0. Shading wird nur berechnet, wenn `color`, `nor
 
 Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über dieselbe Strahlverfolgung wie die Primärstrahlen.
 
+### Materialien über Farbe und Rauheit hinaus
+
+- **Texturen** (`pyr_texture_create`, RGBA8): Index 1-basiert in `material.texture` bzw. `normal_texture`, Kachelgröße über `texture_scale` in Welteinheiten. Voxelflächen sind achsenparallel, deshalb wird genau eine Ebene projiziert – Triplanar-Mischen wäre hier Verschwendung. Gefiltert wird von Hand (bilinear), ohne Texturhardware, damit derselbe Code später auf AMD läuft.
+- **Detailnormale** ohne Textur: `normal_strength` und `normal_scale` erzeugen sie aus Wertrauschen. Beleuchtet wird mit der gestörten, weiterverfolgt mit der geometrischen Normale; im Ziel `normal` steht die geometrische, damit Denoiser und Reprojektion stabil bleiben.
+- **Klarlack** (`clearcoat`, `clearcoat_roughness`): eine zweite, glatte Schicht. Was sie reflektiert, fehlt darunter.
+- **Unterflächenstreuung** (`subsurface`, `subsurface_color`): Licht von hinten kommt getönt durch (Laub, Haut, Wachs). Getrennt vom BRDF gerechnet, sonst zählt es doppelt.
+
+### Lichtquellen und Umgebung
+
+- `PyrLight.kind`: `PYR_LIGHT_SPHERE` (Punkt mit Radius), `PYR_LIGHT_RECT` (Flächenlicht, `normal` und halbe Kanten in `size`) und `PYR_LIGHT_SPOT` (Kegel, `size` = cos innen/außen). Bis zu 64 Stück.
+- **Umgebungskarte** (`pyr_environment_set`, equirektangulär, 4 Floats je Texel): Pyrit baut daraus eine Verteilung (Summenfunktion je Zeile plus eine über die Zeilen, mit sin θ gewichtet) und tastet sie nach Helligkeit ab. Der GI-Strahl tastet dieselbe Karte über den Cosinus-Lappen ab; beide Anteile werden nach der Potenz-Heuristik gewichtet (MIS), sonst zählt die Karte doppelt. Gemessen an einer Karte mit 0,03 rad großer, 4000× heller Sonne: **ohne** Importance-Sampling liegt der Boden bei Helligkeit 46 statt 114 – der Cosinus-Strahl trifft die Scheibe praktisch nie, das Licht fehlt schlicht.
+- **Mehrere Reflexionen** (`gi_bounces`): ab der zweiten entscheidet russisches Roulette, der Erwartungswert bleibt richtig. Gemessen (1 → 3): dunkle Bereiche 43,1 → 46,6, Renderzeit 11,6 → 14,1 ms.
+- **Teilnehmendes Medium** (`fog_density`, `fog_color`, `fog_height`, `fog_falloff`, `fog_anisotropy`, `fog_steps`): Strahlmarschierung entlang des Sichtstrahls mit Sonnenabtastung je Schritt – das ergibt die Lichtschächte. Die Schrittlage wird je Pixel verschoben, das Rauschen daraus nimmt der zeitliche Filter weg.
+
+### Kamera- und Bildeffekte
+
+`PyrPostInfo.fx` zeigt auf `PyrPostFx` und schaltet Bloom, Tiefenschärfe, Bewegungsunschärfe, Belichtungsautomatik und Farbkorrektur zu. Die Kette läuft auf dem fertigen HDR-Bild in Ausgabeauflösung; Bewegung und Tiefe liefert TAAU ohnehin schon. Der Autofokus liest die Tiefe in der Bildmitte direkt auf der GPU, es gibt keinen Rückkanal zum Host. Die Belichtungsautomatik misst die mittlere Log-Helligkeit über jedes 16. Pixel mit Festkomma-Atomics und führt sie gedämpft nach; ihr Zustand bleibt auf der GPU.
+
 ## Nachbearbeitung, Hochskalieren, DLSS, Frame Generation
 
 `pyr_postprocess(ctx, view, targets, post)` läuft vollständig auf der GPU:

@@ -130,5 +130,5 @@ test "Funktionssignaturen" {
         try testing.expectEqual(@sizeOf(cf.return_type.?), @sizeOf(zf.return_type.?));
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 69), count);
+    try testing.expectEqual(@as(usize, 70), count);
 }
