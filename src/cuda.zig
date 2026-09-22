@@ -109,6 +109,7 @@ pub const Driver = struct {
     cuCtxPushCurrent_v2: *const fn (CUcontext) callconv(.c) CUresult,
     cuCtxPopCurrent_v2: *const fn (*CUcontext) callconv(.c) CUresult,
     cuMemAlloc_v2: *const fn (*CUdeviceptr, usize) callconv(.c) CUresult,
+    cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) CUresult,
     cuMemFree_v2: *const fn (CUdeviceptr) callconv(.c) CUresult,
     cuMemHostAlloc: *const fn (*?*anyopaque, usize, c_uint) callconv(.c) CUresult,
     cuMemFreeHost: *const fn (?*anyopaque) callconv(.c) CUresult,

@@ -193,6 +193,12 @@ pub const World = struct {
     job_limit: u32 = 0,
     /// Gesamtplätze im Generatorpuffer (batch_max · Anfangskapazität)
     voxel_slots: u64 = 0,
+    /// letzter Zustand, um unveränderte Frames zu erkennen
+    last_cam: [3]f64 = .{ std.math.nan(f64), 0, 0 },
+    last_refine_k: f64 = 0,
+    quiet_frames: u64 = 0,
+    /// in diesem Frame neu fertig gewordene Chunks (ohne Ersetzungen)
+    built_new: u32 = 0,
     /// Zeitmessung der Update-Phasen (PYRIT_WORLD_PROFILE=1)
     prof: ?*[6]f64 = null,
     prof_frames: u64 = 0,
@@ -371,6 +377,13 @@ pub const World = struct {
                     if (!l.found_existing) l.value_ptr.* = .empty;
                     try oom(l.value_ptr.append(self.ctx.gpa, pos));
                 }
+                // Eine Entfernung, die auf dieser Stufe gar nicht wirkt (die
+                // grobe Zelle ist noch nicht ganz leer), braucht auch keinen
+                // Neubau. Hinzufügen wirkt dagegen auf jeder Stufe.
+                if (now_removed and lod > 0) {
+                    if (lod > rm_track_max) continue;
+                    if ((self.rm_counts.get(cellOf(pos, lod)) orelse 0) < cellVoxels(lod)) continue;
+                }
                 try self.markDirty(key);
             }
         }
@@ -454,9 +467,7 @@ pub const World = struct {
     }
 
     /// Geänderte Chunks zum Neubau vormerken (vor den neuen Chunks)
-    fn takeDirty(self: *World) Error!void {
-        self.requests.clearRetainingCapacity();
-        const max = @min(self.batch_max, self.job_limit);
+    fn takeDirty(self: *World, max: u32) Error!void {
         while (self.requests.items.len < max) {
             const key = self.dirty.pop() orelse break;
             _ = self.dirty_set.remove(key);
@@ -534,6 +545,28 @@ pub const World = struct {
             @floatCast(target * self.secondary_factor / self.pixels_per_unit)
         else
             0;
+        // Ruhepfad: hat sich weder Kamera noch Ziel-LOD geändert und ist nichts
+        // in Arbeit, dann ist auch die Auswahl dieselbe. Dann darf der Frame
+        // gar nicht erst weiterzählen, sonst altern die Knoten und die
+        // Verdrängung würde eine ruhende Welt abräumen.
+        // Das macht Einzeländerungen von der CPU praktisch kostenlos: sie
+        // setzen `dirty`, und nur dann läuft der volle Durchlauf.
+        const same_view = std.mem.eql(f64, &camera, &self.last_cam) and
+            std.mem.eql(f64, &origin, &self.origin) and
+            self.plan.cfg.refine_k == self.last_refine_k;
+        const quiet = same_view and
+            self.job_idle and
+            self.dirty.items.len == 0 and
+            self.stats.pending_chunks == 0;
+        if (quiet) {
+            self.quiet_frames += 1;
+            self.stats.built_chunks = 0;
+            self.stats.built_voxels = 0;
+            return;
+        }
+        self.last_cam = camera;
+        self.last_refine_k = self.plan.cfg.refine_k;
+
         if (!std.mem.eql(f64, &origin, &self.origin)) {
             self.origin = origin;
             for (self.chunks.items) |c| {
@@ -541,19 +574,29 @@ pub const World = struct {
             }
         }
         self.lap(0, &t0); // Budget, Instanz-Transformationen
+        // Der Planerlauf bleibt: er stempelt auch die *inneren* Knoten des
+        // Octrees als gebraucht. Ohne ihn verdrängt die Welt die Vorfahren der
+        // sichtbaren Chunks und baut deren Kinder dauernd neu (gemessen: 1250
+        // Chunks blieben dann dauerhaft offen). Übersprungen wird nur der
+        // vollständig ruhende Frame weiter oben.
         try oom(self.plan.update(camera));
         self.lap(1, &t0); // Planer
         self.stats.built_chunks = 0;
         self.stats.built_voxels = 0;
+        self.built_new = 0;
 
         if (self.pollJob()) try self.finishJob();
         self.lap(2, &t0); // Ergebnis übernehmen (Pools, GAS, Instanzen)
         if (self.job_idle) {
-            // Geänderte Chunks haben Vorrang: der Spieler soll seine Änderung
-            // sofort sehen, nicht erst wenn das Nachladen zur Ruhe kommt.
-            try self.takeDirty();
-            if (self.requests.items.len == 0)
-                try oom(self.plan.takeRequests(camera, @min(self.batch_max, self.job_limit), &self.requests));
+            // Geänderte Chunks zuerst, aber nur bis zur Hälfte des Auftrags:
+            // sonst hungert ein Strom von Änderungen das Nachladen aus (die
+            // Welt wurde dann nie fertig geladen – gemessen: 384 Chunks blieben
+            // dauerhaft offen).
+            const limit = @min(self.batch_max, self.job_limit);
+            self.requests.clearRetainingCapacity();
+            try self.takeDirty(@max(limit / 2, 1));
+            if (self.requests.items.len < limit)
+                try oom(self.plan.takeRequests(camera, limit - self.requests.items.len, &self.requests));
             if (self.requests.items.len > 0) {
                 try self.submitJob();
                 if (self.thread == null) {
@@ -563,7 +606,9 @@ pub const World = struct {
             }
         }
         self.lap(3, &t0); // Auftrag stellen
-        if (self.stats.built_chunks > 0) try oom(self.plan.collect(camera));
+        // Ein ersetzter Chunk (Änderung) verändert die Auswahl nicht – nur
+        // neu fertig gewordene tun das.
+        if (self.built_new > 0) try oom(self.plan.collect(camera));
         // gröbere Auswahl für Schatten und GI (Vorfahren, schon im Speicher)
         if (self.secondary_mask != 0) try oom(self.plan.collectCoarse(camera, self.secondary_factor));
         try self.applyVisibility();
@@ -665,6 +710,43 @@ pub const World = struct {
     /// dafür passen weniger Chunks in einen Auftrag. Reicht der Puffer nicht
     /// einmal für einen Chunk, wird er (einmalig) vergrößert.
     /// Rückgabe: true, wenn der laufende Auftrag mit `k` Chunks weitermachen kann.
+    /// Freier Grafikspeicher in Bytes (0, wenn nicht ermittelbar)
+    fn vramFree(self: *World) u64 {
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        if (self.ctx.drv.cuMemGetInfo_v2(&free_b, &total_b) != cuda.CUDA_SUCCESS) return 0;
+        // Ein Polster bleibt frei: der Renderer braucht selbst noch Speicher.
+        const margin: u64 = @max(@as(u64, total_b) / 8, 128 << 20);
+        return if (free_b > margin) @as(u64, free_b) - margin else 0;
+    }
+
+    /// Generator- (und ggf. Änderungs-)Puffer auf `slots` Voxelplätze bringen.
+    /// Erst anlegen, dann freigeben: schlägt es fehl, bleibt alles wie es war.
+    fn resizeVoxelBuffers(self: *World, slots: u64) bool {
+        const drv = &self.ctx.drv;
+        const two = self.voxels2_dev != 0;
+        var a: cuda.CUdeviceptr = 0;
+        var b: cuda.CUdeviceptr = 0;
+        if (drv.cuMemAlloc_v2(&a, slots * 16) != cuda.CUDA_SUCCESS) return false;
+        if (two and drv.cuMemAlloc_v2(&b, slots * 16) != cuda.CUDA_SUCCESS) {
+            _ = drv.cuMemFree_v2(a);
+            return false;
+        }
+        _ = drv.cuMemFree_v2(self.voxels_dev);
+        self.voxels_dev = a;
+        if (two) {
+            _ = drv.cuMemFree_v2(self.voxels2_dev);
+            self.voxels2_dev = b;
+        }
+        self.voxel_slots = slots;
+        return true;
+    }
+
+    /// Kapazität je Chunk erhöhen. Solange Grafikspeicher da ist, wächst der
+    /// Puffer mit, damit weiterhin viele Chunks je Auftrag durchlaufen –
+    /// erst wenn der Speicher knapp wird, sinkt die Zahl der Chunks.
+    /// Abgebrochen wird nie: im schlechtesten Fall läuft ein Chunk je Auftrag.
+    /// Rückgabe: true, wenn der laufende Auftrag mit `k` Chunks weitermachen kann.
     fn growCapacity(self: *World, need: u32, k: u32) Error!bool {
         const n: u32 = @as(u32, 1) << @intCast(self.chunk_log2);
         const max_cap: u64 = @as(u64, n) * n * n;
@@ -672,21 +754,27 @@ pub const World = struct {
         new_cap = @min(new_cap, max_cap);
         if (new_cap <= self.capacity) return true; // schon am Maximum: unmöglich
         self.capacity = @intCast(new_cap);
+
+        const buffers: u64 = if (self.voxels2_dev != 0) 2 else 1;
+        const want = @as(u64, self.batch_max) * new_cap; // volle Chunkzahl behalten
+        var grew = false;
+        if (want > self.voxel_slots and self.vramFree() > want * 16 * buffers) {
+            grew = self.resizeVoxelBuffers(want);
+        }
         var fit: u64 = self.voxel_slots / new_cap;
         if (fit == 0) {
-            // Ein Chunk muss immer hineinpassen: Puffer einmalig vergrößern.
-            _ = self.ctx.drv.cuMemFree_v2(self.voxels_dev);
-            self.voxels_dev = 0;
-            self.voxel_slots = new_cap;
-            self.voxels_dev = try self.ctx.devAlloc(self.voxel_slots * 16, "Welt: Generatorpuffer");
-            if (self.voxels2_dev != 0) {
-                _ = self.ctx.drv.cuMemFree_v2(self.voxels2_dev);
-                self.voxels2_dev = try self.ctx.devAlloc(self.voxel_slots * 16, "Welt: Änderungspuffer");
-            }
+            // Ein Chunk muss hineinpassen, auch wenn es eng wird.
+            if (!self.resizeVoxelBuffers(new_cap))
+                return fail(error.OutOfMemory, "Welt: kein Grafikspeicher für Chunks mit {d} Voxeln", .{new_cap});
             fit = 1;
         }
         self.job_limit = @intCast(@max(@min(fit, self.batch_max), 1));
-        self.ctx.logf(3, "Welt: Kapazität je Chunk auf {d} erhöht, {d} Chunks je Auftrag", .{ self.capacity, self.job_limit });
+        self.ctx.logf(3, "Welt: Kapazität je Chunk auf {d} erhöht, {d} Chunks je Auftrag, Puffer {d} MiB{s}", .{
+            self.capacity,
+            self.job_limit,
+            self.voxel_slots * 16 * buffers >> 20,
+            if (grew) " (vergrößert)" else "",
+        });
         return k <= self.job_limit;
     }
 
@@ -899,8 +987,10 @@ pub const World = struct {
             try ctx.instanceKeepHistory(inst);
             // Neubau nach einer Änderung: den alten Chunk erst jetzt freigeben,
             // damit nie ein Loch entsteht.
+            var replaced = false;
             if (self.plan.nodes.get(key)) |nd| {
                 if (nd.user != 0) {
+                    replaced = true;
                     const old: u32 = @intCast(nd.user - 1);
                     const oc = &self.chunks.items[old];
                     if (oc.instance != 0) {
@@ -918,19 +1008,25 @@ pub const World = struct {
             self.chunks.items[idx] = .{ .key = key, .geometry = handles[c], .instance = inst, .mask = 0, .stamp = 0, .stamp_coarse = 0, .voxels = sums[c + 1] - sums[c] };
             self.plan.finish(key, false, @as(u64, idx) + 1);
             self.stats.built_chunks += 1;
+            if (!replaced) self.built_new += 1;
         }
     }
 
     fn applyVisibility(self: *World) Error!void {
         const ctx = self.ctx;
         const frame = self.plan.frame;
+        // Ein Nachschlagen, zwei Stempel: der Knoten gilt als gebraucht (sonst
+        // verdrängt) und der Chunk als sichtbar. Damit braucht die Verdrängung
+        // keinen eigenen Planerlauf mehr.
         for (self.plan.visible.items) |k| {
-            const node = self.plan.nodes.get(k) orelse continue;
+            const node = self.plan.nodes.getPtr(k) orelse continue;
+            node.last_used = frame;
             if (node.user == 0) continue;
             self.chunks.items[node.user - 1].stamp = frame;
         }
         for (self.plan.visible_coarse.items) |k| {
-            const node = self.plan.nodes.get(k) orelse continue;
+            const node = self.plan.nodes.getPtr(k) orelse continue;
+            node.last_used = frame;
             if (node.user == 0) continue;
             self.chunks.items[node.user - 1].stamp_coarse = frame;
         }

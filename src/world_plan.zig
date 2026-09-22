@@ -235,8 +235,8 @@ pub const Plan = struct {
     }
 
     /// Nächste Anfragen, grob vor fein, nahe vor fern; markiert sie als in Arbeit.
+    /// Hängt an `out` an (der Aufrufer mischt geänderte Chunks davor).
     pub fn takeRequests(self: *Plan, cam: [3]f64, max: usize, out: *std.ArrayList(Key)) Allocator.Error!void {
-        out.clearRetainingCapacity();
         // Liste der offenen Anfragen aufräumen: gebaute, verdrängte und gerade
         // nicht gebrauchte fallen heraus (kein Durchlauf über alle Knoten)
         var w: usize = 0;

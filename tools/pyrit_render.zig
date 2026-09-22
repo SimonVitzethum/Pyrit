@@ -146,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
     var edit_test = false;
     var chunk_capacity: u32 = 0;
     var edit_load = false;
+    var edit_stream = false;
     var edit_file: ?[]const u8 = null;
     // Sichtweite in Grundvoxeln (0 = Vorgabe 16384 = 1024 Minecraft-Chunks)
     var view_distance: f32 = 0;
@@ -217,6 +218,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--edit-file") and i + 1 < args.len) {
             i += 1;
             edit_file = args[i];
+        } else if (std.mem.eql(u8, a, "--edit-stream")) {
+            edit_stream = true;
         } else if (std.mem.eql(u8, a, "--edit-load")) {
             edit_load = true;
         } else if (std.mem.eql(u8, a, "--flicker")) {
@@ -262,7 +265,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -370,7 +373,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -447,6 +450,8 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var cur_px: []([4]u8) = &.{};
     defer if (prev_px.len != 0) init.gpa.free(prev_px);
     defer if (cur_px.len != 0) init.gpa.free(cur_px);
+    var edit_ms: f64 = 0;
+    var edit_calls: u64 = 0;
     var flick_sum: f64 = 0;
     var flick_n: u64 = 0;
     var have_prev = false;
@@ -482,6 +487,18 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         var j: [2]f32 = undefined;
         pyrit.pyr_jitter_halton(f, &j);
         cam.jitter = j;
+        // Laufende Einzeländerungen von der CPU: je Frame ein Voxel, an
+        // wandernder Stelle – der Fall "einzelne Chunks kommen nach".
+        if (edit_stream and f > 0) {
+            const bx: i64 = @intFromFloat(pos[0] + 40);
+            const bz: i64 = @intFromFloat(pos[2] + 20 + @as(f64, @floatFromInt(f % 64)));
+            const gy: i64 = @intFromFloat(pyrit.pyr_terrain_height(&terrain, @floatFromInt(bx), @floatFromInt(bz)));
+            const one = [1]api.WorldEdit{.{ .x = bx, .y = gy + 2, .z = bz, .attribute = pyrit.pyr_voxel_attribute(0, 240, 240, 40) }};
+            const te = std.Io.Timestamp.now(init.io, .awake);
+            req(pyrit.pyr_world_edit(@ptrCast(ctx), @ptrCast(world), &one, 1));
+            edit_ms += msSince(init, te);
+            edit_calls += 1;
+        }
         const t0 = std.Io.Timestamp.now(init.io, .awake);
         req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
         const u = msSince(init, t0);
@@ -592,6 +609,9 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
             @memcpy(prev_px, cur_px);
             have_prev = true;
         }
+    }
+    if (edit_calls > 0) {
+        std.debug.print("Einzeländerungen: {d} Aufrufe, pyr_world_edit im Mittel {d:.4} ms auf dem Hauptthread\n", .{ edit_calls, edit_ms / @as(f64, @floatFromInt(edit_calls)) });
     }
     if (flicker and flick_n > 0) {
         std.debug.print("Flimmern: {d:.3} mittlerer Unterschied je Kanal zwischen aufeinanderfolgenden Bildern ({d} Paare)\n", .{ flick_sum / @as(f64, @floatFromInt(flick_n)), flick_n });
