@@ -441,13 +441,22 @@ fn coneSample(d: Vec3, spread: f32, rng: *Rng) Vec3 {
 
 /// Wellen: zwei gekreuzte Sinuszüge stören die Normale (Wasser). Ableitung
 /// der Höhenfunktion, daher exakt für die Spiegelung.
-pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3) Vec3 {
+/// `footprint`: Größe eines Bildschirmpixels in Welteinheiten an dieser Stelle.
+/// Fallen mehrere Wellen auf ein Pixel, springt die Normale von Pixel zu Pixel
+/// und die Spiegelung mit ihr – das sieht als fleckige Wasserfläche aus.
+/// Deshalb werden die Wellen ausgeblendet, sobald sie feiner als das Pixel
+/// werden; die Fläche wird dann glatt, was in der Ferne auch richtig ist.
+pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Vec3 {
     const wl = @max(m.wave_length, 1e-3);
     const k = 6.2831853 / wl;
     const t: f32 = @floatCast(s.time);
     const ph = k * m.wave_speed * wl * t;
     // Höhe h(x, z) = A · (sin(k·x + φ) + sin(0.7·k·(x + z) + 1.3·φ))
-    const a = m.wave_height;
+    // Deutlich früher ausblenden: schon wenn eine Welle nur noch acht Pixel
+    // breit ist, beginnt die Spiegelung zu sprenkeln.
+    const fade = if (footprint > 0) @min(@max(wl / (16 * footprint), 0), 1) else 1;
+    if (fade <= 0.01) return n;
+    const a = m.wave_height * fade;
     const dhdx = a * k * (fm.cos(k * p[0] + ph) + 0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
     const dhdz = a * k * (0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
     // Störung senkrecht zur Fläche
@@ -905,7 +914,7 @@ fn refract(d: Vec3, n: Vec3, eta: f32) ?Vec3 {
 /// Untergrund (Wasser auf Boden), endet es dort.
 /// `behind`: fertige Farbe des Untergrunds entlang des ungebrochenen Strahls
 /// (bis `t_opaque`), wiederverwendet, solange nichts gebrochen hat.
-pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: Vec3, tmin: f32, t_opaque: f32, behind: Vec3, ray_mask: u32, trans_mask: u32, opaque_mask: u32, secondary_mask: u32, rng: *Rng) Vec3 {
+pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: Vec3, tmin: f32, t_opaque: f32, behind: Vec3, ray_mask: u32, trans_mask: u32, opaque_mask: u32, secondary_mask: u32, rng: *Rng, footprint: f32) Vec3 {
     const l: *const types.Lighting = @ptrFromInt(s.lighting);
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     // aktueller Strahl o + t d mit t in [0, t_end); t_end = Untergrund (flt_max: Himmel)
@@ -966,7 +975,7 @@ pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: V
         const m = &mats[th.attribute & 0xFF];
         const sf = surface(s, th.attribute);
         var n = worldNormal(inst, th.face);
-        if (m.flags & types.material_waves != 0) n = waveNormal(s, m, o + d * splat(th.t), n);
+        if (m.flags & types.material_waves != 0) n = waveNormal(s, m, o + d * splat(th.t), n, footprint * th.t);
         if (vec.dot(n, d) > 0) n = -n;
         const eps = 1e-3 * voxelSize(inst);
         const p = o + d * splat(th.t);

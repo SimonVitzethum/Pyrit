@@ -569,10 +569,13 @@ pub fn main(init: std.process.Init) !void {
     var water: types.Material = undefined;
     pyrit.pyr_material_default(&water);
     water.flags = types.material_voxel_color | types.material_transparent | types.material_refract | types.material_waves;
-    water.roughness = 0.05;
+    water.roughness = 0.04;
     water.ior = 1.33;
-    water.density = 0.08;
-    water.opacity = 0.05;
+    water.density = 0.05;
+    water.opacity = 0.03;
+    water.wave_height = 0.5;
+    water.wave_length = 48;
+    water.wave_speed = 0.18;
     water.clearcoat = 1; // nasse, lackartige Oberfläche
     water.clearcoat_roughness = 0.03;
     req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &water));

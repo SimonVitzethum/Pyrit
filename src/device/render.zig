@@ -160,7 +160,9 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             const t_behind = if (found) |h| h.t else ray.tmax;
             var rng = shade.Rng.init(x, y, p.frame_index, 1);
             const behind = vec.Vec3{ r.color[0], r.color[1], r.color[2] };
-            var c = shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng);
+            const cm2 = &p.cur.camera;
+            const fp_scale = 2 * cm2.scale[1] / @as(f32, @floatFromInt(@max(cm2.height, 1)));
+            var c = shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng, fp_scale);
             // Nebel ganz zum Schluss: er dämpft alles dahinter, auch die
             // transparenten Schichten, und steuert die Lichtschächte bei.
             const lg: *const types.Lighting = @ptrFromInt(s.lighting);

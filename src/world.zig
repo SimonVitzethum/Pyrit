@@ -29,7 +29,7 @@ fn oom(v: anytype) Error!@typeInfo(@TypeOf(v)).error_union.payload {
 pub fn defaultTerrain() types.TerrainParams {
     return .{
         .seed = 1,
-        .octaves = 9,
+        .octaves = 11,
         .base_height = 40,
         .amplitude = 620,
         .wavelength = 3200,

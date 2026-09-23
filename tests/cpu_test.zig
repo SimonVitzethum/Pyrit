@@ -1373,7 +1373,7 @@ const TransFixture = struct {
         var rng = pyr.shade.Rng.init(1, 1, 0, 0);
         const behind = if (oh) |h| pyr.shade.shadeHit(spy, s, o, d, h, &rng, 0x1, 0, 0).color else pyr.shade.sky(@ptrFromInt(s.lighting), d, true);
         last.* = .{ o, d };
-        return pyr.shade.transparentLayers(spy, s, o, d, 0, if (oh) |h| h.t else types.flt_max, behind, 0xFFFF_FFFF, 0x2, 0x1, 0x1, &rng);
+        return pyr.shade.transparentLayers(spy, s, o, d, 0, if (oh) |h| h.t else types.flt_max, behind, 0xFFFF_FFFF, 0x2, 0x1, 0x1, &rng, 0);
     }
 };
 
@@ -1438,7 +1438,7 @@ test "Transparenz: Brechung nach Snell, parallel versetzter Durchgang, unsichtba
     var rng = pyr.shade.Rng.init(1, 1, 0, 0);
     const tracer = pyr.render.SoftwareTracer{};
     const behind = pyr.shade.shadeHit(tracer, s, o, d, oh, &rng, 0x1, 0, 0).color;
-    const c = pyr.shade.transparentLayers(tracer, s, o, d, 0, oh.t, behind, 0xFFFF_FFFF, 0x2, 0x1, 0x1, &rng);
+    const c = pyr.shade.transparentLayers(tracer, s, o, d, 0, oh.t, behind, 0xFFFF_FFFF, 0x2, 0x1, 0x1, &rng, 0);
     try testing.expect(vec.length(c - behind) < 1e-5);
 }
 

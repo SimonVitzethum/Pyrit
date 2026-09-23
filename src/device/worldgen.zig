@@ -79,12 +79,15 @@ pub fn height(t: *const types.TerrainParams, x: f32, z: f32, min_wavelength: f32
         // Grat: Spitze dort, wo das Rauschen die Mitte kreuzt
         var r = 1 - @abs(2 * n - 1);
         r *= r; // schärfer
+        // Die feinen Oktaven bekommen mehr Gewicht als das reine Halbieren,
+        // sonst liegt die Oberfläche als glatte Terrasse da und die Stufen
+        // lesen sich wie Höhenlinien.
         const v = r * weight;
         // Die nächste Oktave zählt nur dort voll, wo diese schon hoch liegt
         weight = @min(@max(r * 1.8, 0), 1);
         sum += v * amp;
         norm += amp;
-        amp *= 0.5;
+        amp *= 0.52;
         wl *= 0.5;
     }
     // Restliche Amplitude als Erwartungswert, damit die Höhe über die
@@ -115,6 +118,31 @@ fn pick(a: u32, default: u32) u32 {
 
 fn rgb(r: u32, g: u32, b: u32) u32 {
     return (r << 24) | (g << 16) | (b << 8);
+}
+
+/// Farbanteil eines Attributs skalieren, Materialindex behalten.
+/// `warm` verschiebt zusätzlich ins Gelbliche (trockene Stellen).
+fn tint(a: u32, f: f32, warm: f32) u32 {
+    const mat = a & 0xFF;
+    const r0: f32 = @floatFromInt((a >> 24) & 0xFF);
+    const g0: f32 = @floatFromInt((a >> 16) & 0xFF);
+    const b0: f32 = @floatFromInt((a >> 8) & 0xFF);
+    const r: u32 = @intFromFloat(@min(@max(r0 * (f + warm * 0.35), 0), 255));
+    const g: u32 = @intFromFloat(@min(@max(g0 * (f + warm * 0.12), 0), 255));
+    const b: u32 = @intFromFloat(@min(@max(b0 * (f - warm * 0.25), 0), 255));
+    return (r << 24) | (g << 16) | (b << 8) | mat;
+}
+
+/// Farbschwankung des Bodens: eine grobe Lage für große Flecken, eine feine
+/// für die Sprenkelung. Ohne sie ist die ganze Landschaft exakt eine Farbe
+/// und sieht wie ein Teppich aus.
+fn groundVariation(t: *const types.TerrainParams, x: f32, z: f32) [2]f32 {
+    const coarse = valueNoise(x / 260 + 3.1, z / 260 - 7.4, t.seed ^ 0x3c19);
+    const fine = valueNoise(x / 21 - 1.7, z / 21 + 9.2, t.seed ^ 0xb72d);
+    const f = 0.62 + coarse * 0.62 + fine * 0.26;
+    // trockene Flecken dort, wo die grobe Lage hoch liegt
+    const warm = @max(coarse - 0.45, 0) * 2.4;
+    return .{ f, warm };
 }
 
 /// Ein Thread je Spalte (Chunk c, x, z)
@@ -160,25 +188,25 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         }
     }.f;
 
-    // Wasser bis zum Meeresspiegel (transparentes Material, gleiche Geometrie)
+    if (top_f < 0 or bot_f >= @as(f32, @floatFromInt(n))) return;
+    // Zelle der Wasseroberfläche in diesem Chunk (-1 = keine). Sie gehört dem
+    // Wasser; das Gelände endet darunter. Beides in dieselbe Zelle zu legen
+    // hieße, dem Bau die Wahl zu lassen – auf der Wasserfläche standen dann
+    // einzelne Sandwürfel verstreut herum.
+    var water_y: i32 = -1;
     if (t.attr_water != 0 and h < t.sea_level) {
         const wtop_f = (t.sea_level - y0w) / step - 0.5;
-        // nur der Chunk, in dem die Wasseroberfläche liegt, bekommt Wasser
-        if (wtop_f >= 0 and wtop_f < @as(f32, @floatFromInt(n))) {
-            // Nur die Oberfläche: das Medium reicht ohnehin bis zum Grund
-            // (die Absorption rechnet mit dem Weg bis zum Untergrund), und eine
-            // dicke Haut würde an den Rändern ihre Seitenflächen zeigen.
-            const wy_i: i32 = @intFromFloat(@floor(wtop_f));
-            if (wy_i >= 0 and wy_i < ni) emit(g, c, base, counts, out, lx, wy_i, lz, t.attr_water);
-        }
+        if (wtop_f >= 0 and wtop_f < @as(f32, @floatFromInt(n))) water_y = @intFromFloat(@floor(wtop_f));
     }
-
-    if (top_f < 0 or bot_f >= @as(f32, @floatFromInt(n))) return;
-    const top: i32 = @min(@as(i32, @intFromFloat(@floor(top_f))), ni - 1);
+    var top: i32 = @min(@as(i32, @intFromFloat(@floor(top_f))), ni - 1);
+    if (water_y >= 0 and top >= water_y) top = water_y - 1;
     const bot: i32 = @max(@as(i32, @intFromFloat(@floor(bot_f))), 0);
     if (bot > top) return;
 
     const snow_h = snowLine(t, wx, wz);
+    const gv = groundVariation(t, wx, wz);
+    const var_f = gv[0];
+    const var_warm = gv[1];
     const surface_y = @floor((h - y0w) / step - 0.5); // lokale Höhe der obersten Zelle
     var y = top;
     while (y >= bot) : (y -= 1) {
@@ -186,17 +214,22 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         const depth = (surface_y - yf) * step; // Grundvoxel unter der Oberfläche
         const wy = y0w + (yf + 0.5) * step;
         const a: u32 = blk: {
-            if (slope > t.rock_slope) break :blk pick(t.attr_rock, rgb(118, 112, 106));
+            if (slope > t.rock_slope) break :blk tint(pick(t.attr_rock, rgb(118, 112, 106)), var_f * 0.95 + 0.1, 0);
             // Schnee: über der aufgelösten Grenze, und je steiler der Hang,
             // desto höher muss es dafür sein – auf einer Felswand hält er nicht.
-            if (wy > snow_h + slope * t.amplitude * 0.05) break :blk pick(t.attr_snow, rgb(236, 240, 245));
-            if (wy < t.sea_level + 2) break :blk pick(t.attr_sand, rgb(214, 196, 142));
-            if (depth < 1.0) break :blk pick(t.attr_grass, rgb(84, 140, 58));
-            if (depth < 4.0) break :blk pick(t.attr_dirt, rgb(122, 92, 62));
-            break :blk pick(t.attr_rock, rgb(118, 112, 106));
+            if (wy > snow_h + slope * t.amplitude * 0.05) break :blk tint(pick(t.attr_snow, rgb(236, 240, 245)), 0.95 + var_f * 0.08, 0);
+            if (wy < t.sea_level + 2) break :blk tint(pick(t.attr_sand, rgb(214, 196, 142)), var_f * 0.9 + 0.15, 0);
+            if (depth < 1.0) break :blk tint(pick(t.attr_grass, rgb(84, 140, 58)), var_f, var_warm);
+            if (depth < 4.0) break :blk tint(pick(t.attr_dirt, rgb(122, 92, 62)), var_f, 0);
+            break :blk tint(pick(t.attr_rock, rgb(118, 112, 106)), var_f * 0.95 + 0.1, 0);
         };
         emit(g, c, base, counts, out, lx, y, lz, a);
     }
+
+    // Nur die Oberfläche: das Medium reicht ohnehin bis zum Grund (die
+    // Absorption rechnet mit dem Weg bis zum Untergrund), und eine dicke Haut
+    // würde an den Rändern ihre Seitenflächen zeigen.
+    if (water_y >= 0) emit(g, c, base, counts, out, lx, water_y, lz, t.attr_water);
 
     // Bäume. Die Maße stehen in Grundvoxeln und werden auf die Voxelgröße der
     // Stufe umgerechnet – so stehen sie auf *jeder* Stufe, nur eben gröber.
@@ -216,7 +249,9 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
     if (r > @min(t.tree_density * cover, 1.0)) return;
 
     const trunk = pick(t.attr_wood, rgb(96, 68, 44));
-    const leaf = t.attr_leaves;
+    // Jeder Baum bekommt seinen eigenen Grünton, sonst stehen lauter Klone
+    const leaf_f = 0.72 + lattice(@intFromFloat(wx * 1.7), @intFromFloat(wz * 1.3), t.seed ^ 0x2ab1) * 0.55;
+    const leaf = tint(t.attr_leaves, leaf_f, 0);
     // 5 bis 7 Grundvoxel Stamm, 2 Grundvoxel Kronenradius
     const trunk_base: f32 = 5 + @as(f32, @floatFromInt(@mod(@as(i32, @intFromFloat(r * 400)), 3)));
     const trunk_h: i32 = @max(@as(i32, @intFromFloat(@round(trunk_base / step))), 1);
