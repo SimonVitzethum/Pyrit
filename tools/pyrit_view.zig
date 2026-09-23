@@ -690,8 +690,9 @@ pub fn main(init: std.process.Init) !void {
     post.flags = api.post_bgra;
     // Kamera- und Bildeffekte
     var fxi = std.mem.zeroes(api.PostFx);
-    fxi.flags = api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade |
-        api.postfx_dof | api.postfx_autofocus | api.postfx_dof_far_only | api.postfx_motion_blur;
+    // Ohne Tiefenschärfe und Bewegungsunschärfe: alles bleibt scharf, nah wie
+    // fern. Beide lassen sich über PyrPostFx jederzeit zuschalten (Tasten T und U).
+    fxi.flags = api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade;
     fxi.bloom_strength = 0.06;
     fxi.bloom_threshold = 1.2;
     fxi.dof_strength = 2.5;

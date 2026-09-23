@@ -231,6 +231,8 @@ pub fn main(init: std.process.Init) !void {
             fog = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--async-post")) {
             async_post = true;
+        } else if (std.mem.eql(u8, a, "--no-taau")) {
+            upscaler = api.upscaler_none;
         } else if (std.mem.eql(u8, a, "--no-shadows")) {
             no_shadows = true;
         } else if (std.mem.eql(u8, a, "--alpha") and i + 1 < args.len) {

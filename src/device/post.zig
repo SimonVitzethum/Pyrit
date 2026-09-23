@@ -209,14 +209,23 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
             }
         }
         // Stammt der Verlauf von einer anderen Fläche, liegt das Pixel auf
-        // einer Voxelkante: der Jitter schiebt die Abtastung jeden Frame
-        // hin und her. Den Verlauf zu verwerfen lässt das Pixel zwischen
-        // beiden Flächen springen (gemessen: Ausreißer 20,7 Stufen), ihn voll
-        // zu übernehmen zieht nach (33 % Schärfeverlust bei Bewegung).
-        // Also beides: übernehmen, aber die Mittelung kurz halten, damit es
-        // beide Flächen mittelt und trotzdem schnell folgt.
+        // einer Voxelkante: der Jitter schiebt die Abtastung jeden Frame hin
+        // und her. Den Verlauf zu verwerfen lässt das Pixel zwischen beiden
+        // Flächen springen, ihn voll zu übernehmen zieht bei Bewegung nach.
+        //
+        // Entscheidend ist die Bewegung: steht das Bild, ist die Reprojektion
+        // exakt und eine lange Mittelung völlig unbedenklich – sie ergibt
+        // genau den Deckungsgrad der beiden Flächen, also saubere
+        // Kantenglättung. Erst bei Bewegung muss sie kurz werden.
         var limit = 1.0 / @max(p.alpha_min, 1e-4);
-        if (edge_w > 0.25) limit = @min(limit, p.edge_frames);
+        if (edge_w > 0.25) {
+            const mv = @as([*]const [2]f32, @ptrFromInt(p.motion))[i];
+            const speed = @sqrt(mv[0] * mv[0] + mv[1] * mv[1]);
+            // unter 1/10 Pixel Bewegung: volle Mittelung, darüber gleitend
+            // hinunter auf edge_frames
+            const t = @min(@max((speed - 0.1) / 0.9, 0), 1);
+            limit = @min(limit, limit + (p.edge_frames - limit) * t);
+        }
         const count = @min(hist[3] + 1, limit);
         const a = 1.0 / count;
         inline for (0..3) |k| out[k] = hist[k] + (cur[k] - hist[k]) * a;

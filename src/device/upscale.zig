@@ -187,8 +187,8 @@ pub fn taau(p: *const types.UpscaleParams, ox: u32, oy: u32) void {
         inline for (0..3) |k| {
             const mean = m1[k] / cnt;
             const sd = @sqrt(@max(m2[k] / cnt - mean * mean, 0));
-            const a = @max(lo[k], mean - 1.25 * sd);
-            const b = @min(hi[k], mean + 1.25 * sd);
+            const a = @max(lo[k], mean - p.clamp_sigma * sd);
+            const b = @min(hi[k], mean + p.clamp_sigma * sd);
             hy[k] = @min(@max(hy[k], a), @max(a, b));
         }
         const hc = fromYCoCg(hy);
