@@ -197,6 +197,12 @@ pub const World = struct {
     last_cam: [3]f64 = .{ std.math.nan(f64), 0, 0 },
     last_refine_k: f64 = 0,
     quiet_frames: u64 = 0,
+    /// Zeiten im Auftrag (nur mit PYRIT_WORLD_PROFILE)
+    job_gen_ms: f64 = 0,
+    job_read_ms: f64 = 0,
+    job_pre_ms: f64 = 0,
+    job_build_ms: f64 = 0,
+    job_runs: u64 = 0,
     /// in diesem Frame neu fertig gewordene Chunks (ohne Ersetzungen)
     built_new: u32 = 0,
     /// Zeitmessung der Update-Phasen (PYRIT_WORLD_PROFILE=1)
@@ -630,6 +636,10 @@ pub const World = struct {
             if (self.prof_frames % 30 == 0) {
                 const n: f64 = @floatFromInt(self.prof_frames);
                 ctx.logf(1, "Welt je Update: Budget {d:.2} ms, Planer {d:.2}, Übernahme {d:.2}, Auftrag {d:.2}, Sichtbarkeit {d:.2}, Verdrängung {d:.2} ms", .{ p[0] / n, p[1] / n, p[2] / n, p[3] / n, p[4] / n, p[5] / n });
+                if (self.job_runs > 0) {
+                    const jr: f64 = @floatFromInt(self.job_runs);
+                    ctx.logf(1, "Auftrag auf dem Arbeiter ({d} Laeufe): Erzeugen {d:.2} ms, Zaehler zurueckl. {d:.2}, Vorbereiten {d:.2}, Bauen {d:.2}", .{ self.job_runs, self.job_gen_ms / jr, self.job_read_ms / jr, self.job_pre_ms / jr, self.job_build_ms / jr });
+                }
             }
         }
     }
@@ -846,6 +856,8 @@ pub const World = struct {
 
     fn gpuWorkImpl(self: *World) Error!void {
         const ctx = self.ctx;
+        const prof = self.prof != null;
+        var t_phase: i64 = if (prof) tick() else 0;
         const k = self.job_count;
         const aux = ctx.aux_stream;
         const counts = self.pinnedCounts();
@@ -884,7 +896,15 @@ pub const World = struct {
 
             // 2. Belegung lesen. Passt ein Chunk nicht in die Kapazität, wird
             //    sie erhöht und der Auftrag wiederholt – abgeschnitten wird nie.
+            if (prof) {
+                self.job_gen_ms += @as(f64, @floatFromInt(tick() - t_phase)) / 1e6;
+                t_phase = tick();
+            }
             try e.read(e.ctx, std.mem.sliceAsBytes(counts[0..k]), self.counts_dev);
+            if (prof) {
+                self.job_read_ms += @as(f64, @floatFromInt(tick() - t_phase)) / 1e6;
+                t_phase = tick();
+            }
             var need: u32 = 0;
             for (0..k) |c| need = @max(need, counts[c]);
 
@@ -915,6 +935,10 @@ pub const World = struct {
 
         // 4. DAG-Bau aller Chunks in einem Zug
         try ctx.check(ctx.drv.cuMemcpyHtoDAsync_v2(self.offsets_dev, sums, (@as(u64, k) + 1) * 4, aux), "cuMemcpyHtoDAsync");
+        if (prof) {
+            self.job_pre_ms += @as(f64, @floatFromInt(tick() - t_phase)) / 1e6;
+            t_phase = tick();
+        }
         self.job_built = try gpu_build.buildChunks(e, self.chunk_log2, self.rt_log2, .{
             .count = k,
             .capacity = self.capacity,
@@ -922,6 +946,10 @@ pub const World = struct {
             .offsets = self.offsets_dev,
             .total = @intCast(total),
         }, self.jobOut());
+        if (prof) {
+            self.job_build_ms += @as(f64, @floatFromInt(tick() - t_phase)) / 1e6;
+            self.job_runs += 1;
+        }
     }
 
     fn jobOut(self: *World) gpu_build.ChunkOut {
