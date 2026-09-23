@@ -829,8 +829,7 @@ pub const FrameGenParams = extern struct {
     mv_mid: u64,
     /// out_ldr als BGRA statt RGBA (Fenstersysteme)
     bgra: u32,
-    /// Varianzbegrenzung des Verlaufs in Standardabweichungen (YCoCg)
-    clamp_sigma: f32,
+    reserved_bgra: u32,
 };
 
 // ---------------------------------------------------------------------------
