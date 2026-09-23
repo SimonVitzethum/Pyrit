@@ -525,7 +525,12 @@ pub const PostParams = extern struct {
     var_dst: u64,
     /// Stärke der Varianzführung im À-trous-Filter (SVGF: 4)
     phi_lum: f32,
-    _pad_post: u32 = 0,
+    /// Unterhalb dieser Normalenübereinstimmung wird der Verlauf ganz
+    /// verworfen; darüber geht er gewichtet ein (0,9 = altes, hartes Verhalten)
+    normal_reject: f32,
+    /// Höchstzahl gemittelter Frames auf Voxelkanten (dort mittelt der Jitter
+    /// zwei Flächen; lange Mittelung würde nachziehen)
+    edge_frames: f32,
 };
 
 pub const tonemap_aces: u32 = 0;

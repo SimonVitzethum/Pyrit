@@ -2052,6 +2052,9 @@ pub const Context = struct {
             p.out_var = v.post_var[0];
         }
         p.phi_lum = if (info.denoise_phi > 0) info.denoise_phi else 4.0;
+        // Diagnose-Schalter; die Vorgaben sind gemessen (siehe post.zig)
+        p.normal_reject = if (std.c.getenv("PYRIT_POST_NORMREJ")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch -1) else -1;
+        p.edge_frames = if (std.c.getenv("PYRIT_POST_EDGEFRAMES")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 4) else 4;
         p.alpha_min = if (info.temporal_alpha > 0) info.temporal_alpha else 0.05;
         p.clamp_sigma = info.clamp_sigma;
         p.reset = @intFromBool(!temporal_ok);

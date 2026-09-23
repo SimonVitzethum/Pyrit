@@ -150,6 +150,7 @@ pub fn main(init: std.process.Init) !void {
     var env_flat = false;
     var firefly: f32 = 0;
     var alpha: f32 = 0;
+    var no_shadows = false;
     var bounces: u32 = 0;
     var fog: f32 = 0;
     var async_post = false;
@@ -230,6 +231,8 @@ pub fn main(init: std.process.Init) !void {
             fog = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--async-post")) {
             async_post = true;
+        } else if (std.mem.eql(u8, a, "--no-shadows")) {
+            no_shadows = true;
         } else if (std.mem.eql(u8, a, "--alpha") and i + 1 < args.len) {
             i += 1;
             alpha = try std.fmt.parseFloat(f32, args[i]);
@@ -308,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -350,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (no_shadows) light.flags &= ~types.lighting_shadows;
     if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
@@ -469,7 +473,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, bounces: u32, fog: f32, async_post: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, bounces: u32, fog: f32, async_post: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -541,6 +545,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (no_shadows) light.flags &= ~types.lighting_shadows;
     if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
@@ -658,6 +663,10 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var edit_calls: u64 = 0;
     var flick_sum: f64 = 0;
     var pump_sum: f64 = 0;
+    var loud_sum: f64 = 0;
+    var diff_map: []u8 = &.{};
+    defer if (diff_map.len != 0) init.gpa.free(diff_map);
+    var p999_sum: f64 = 0;
     var flick_n: u64 = 0;
     var have_prev = false;
 
@@ -803,18 +812,56 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
             if (cur_px.len == 0) {
                 cur_px = try init.gpa.alloc([4]u8, np);
                 prev_px = try init.gpa.alloc([4]u8, np);
+                diff_map = try init.gpa.alloc(u8, np);
+                @memset(diff_map, 0);
             }
             cu(drv.cuMemcpyDtoH_v2(cur_px.ptr, ldr, np * 4));
             if (have_prev) {
                 var sum: f64 = 0;
                 var mean_a: f64 = 0;
                 var mean_b: f64 = 0;
+                // Verteilung der Unterschiede: ein wanderndes Rauschen an
+                // Kanten betrifft nur wenige Prozent der Pixel und geht im
+                // Mittelwert unter. Deshalb zusätzlich zählen, wie viele
+                // Pixel sich deutlich ändern, und wie stark die stärksten.
+                var hist = [_]u32{0} ** 256;
                 for (cur_px, prev_px) |a, b| {
+                    var pmax: u32 = 0;
                     inline for (0..3) |k| {
-                        sum += @abs(@as(f64, @floatFromInt(a[k])) - @as(f64, @floatFromInt(b[k])));
+                        const d = @abs(@as(f64, @floatFromInt(a[k])) - @as(f64, @floatFromInt(b[k])));
+                        sum += d;
                         mean_a += @floatFromInt(a[k]);
                         mean_b += @floatFromInt(b[k]);
+                        pmax = @max(pmax, @as(u32, @intFromFloat(d)));
                     }
+                    hist[@min(pmax, 255)] += 1;
+                }
+                // Karte der Unterschiede mitschreiben: erst daran sieht man,
+                // *wo* sich etwas bewegt.
+                if (diff_map.len == np) {
+                    for (cur_px, prev_px, 0..) |a, b, k| {
+                        var pmax: u32 = 0;
+                        inline for (0..3) |q| pmax = @max(pmax, @as(u32, @intFromFloat(@abs(@as(f64, @floatFromInt(a[q])) - @as(f64, @floatFromInt(b[q]))))));
+                        diff_map[k] = @max(diff_map[k], @as(u8, @intCast(@min(pmax, 255))));
+                    }
+                }
+                {
+                    // Anteil der Pixel mit mehr als 4 Stufen Unterschied und
+                    // das 99,9-Perzentil
+                    var above: u64 = 0;
+                    for (5..256) |k| above += hist[k];
+                    loud_sum += @as(f64, @floatFromInt(above)) / @as(f64, @floatFromInt(np)) * 100;
+                    var acc: u64 = 0;
+                    const want = np - np / 1000;
+                    var p999: u32 = 0;
+                    for (hist, 0..) |c, k| {
+                        acc += c;
+                        if (acc >= want) {
+                            p999 = @intCast(k);
+                            break;
+                        }
+                    }
+                    p999_sum += @floatFromInt(p999);
                 }
                 const n3: f64 = @floatFromInt(np * 3);
                 flick_sum += sum / n3;
@@ -834,7 +881,16 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     }
     if (flicker and flick_n > 0) {
         const fn_f: f64 = @floatFromInt(flick_n);
-        std.debug.print("Flimmern: {d:.3} je Pixel, Helligkeitspumpen: {d:.4} ({d} Paare)\n", .{ flick_sum / fn_f, pump_sum / fn_f, flick_n });
+        if (diff_map.len != 0) {
+            var f2: std.ArrayList(u8) = .empty;
+            defer f2.deinit(init.gpa);
+            var hd: [64]u8 = undefined;
+            try f2.appendSlice(init.gpa, try std.fmt.bufPrint(&hd, "P5\n{d} {d}\n255\n", .{ out_w, out_h }));
+            for (diff_map) |d| try f2.append(init.gpa, @intCast(@min(@as(u32, d) * 6, 255)));
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "unruhe.pgm", .data = f2.items });
+            std.debug.print("Karte der Unterschiede: unruhe.pgm\n", .{});
+        }
+        std.debug.print("Flimmern: Mittel {d:.3}, unruhige Pixel {d:.2} %, staerkste (99,9 %) {d:.1} Stufen, Pumpen {d:.4}\n", .{ flick_sum / fn_f, loud_sum / fn_f, p999_sum / fn_f, pump_sum / fn_f });
     }
     const all = msSince(init, t_flight);
     std.debug.print("{d} Frames {d}x{d} -> {d}x{d} im Flug: {d:.2} ms pro Frame gesamt ({d} mit Zwischenbild), Welt-Update Mittel {d:.2} ms, max {d:.2} ms\n", .{ frames, w, h, out_w, out_h, all / @as(f64, @floatFromInt(@max(frames, 1))), fg_frames, update_ms / @as(f64, @floatFromInt(@max(frames, 1))), update_max });

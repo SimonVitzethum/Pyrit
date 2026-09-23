@@ -93,6 +93,8 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
 
     var hist: V4 = .{ 0, 0, 0, 0 };
     var hmom: [2]f32 = .{ 0, 0 };
+    // Anteil des Verlaufs, der von einer *anderen* Voxelfläche stammt
+    var edge_w: f32 = 0;
     if (!reset) {
         const mv = @as([*]const [2]f32, @ptrFromInt(p.motion))[i];
         const px = @as(f32, @floatFromInt(x)) + mv[0];
@@ -110,19 +112,39 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
             if (tx >= 0 and ty >= 0 and tx < @as(f32, @floatFromInt(w)) and ty < @as(f32, @floatFromInt(h)) and bw > 0) {
                 const j = @as(u64, @intFromFloat(ty)) * w + @as(u64, @intFromFloat(tx));
                 const hn = ldh(p.hist_normal, j);
-                const ok = if (hit)
-                    isHit(hn) and n[0] * hn[0] + n[1] * hn[1] + n[2] * hn[2] > 0.9 and @abs(hn[3] - n[3]) < 0.05 * n[3] + 0.01
-                else
-                    !isHit(hn);
-                if (ok) {
+                // Gültigkeit nicht als Ja/Nein, sondern als Gewicht. An einer
+                // Voxelkante stehen die beiden Flächen 90° zueinander; mit
+                // Jitter springt die Abtastung jeden Frame über die Kante.
+                // Eine harte Prüfung verwirft dort den Verlauf *jedes Mal*,
+                // das Pixel zeigt abwechselnd die eine und die andere Fläche
+                // und der Schatten scheint zu wandern. Mit einem weichen
+                // Übergang behält es einen Teil seiner Vorgeschichte und
+                // mittelt beide Flächen, statt zwischen ihnen zu springen.
+                var vw: f32 = 0;
+                var same_face = false;
+                if (hit) {
+                    if (isHit(hn) and @abs(hn[3] - n[3]) < 0.05 * n[3] + 0.01) {
+                        const nd = n[0] * hn[0] + n[1] * hn[1] + n[2] * hn[2];
+                        same_face = nd > 0.9;
+                        vw = (nd - p.normal_reject) / (1 - p.normal_reject);
+                        vw = @min(@max(vw, 0), 1);
+                        vw *= vw;
+                    }
+                } else if (!isHit(hn)) {
+                    vw = 1;
+                    same_face = true;
+                }
+                if (vw > 0 and !same_face) edge_w += bw;
+                if (vw > 0) {
                     const c = ldh(p.hist_color, j);
-                    inline for (0..4) |q| hist[q] += c[q] * bw;
+                    const bwv = bw * vw;
+                    inline for (0..4) |q| hist[q] += c[q] * bwv;
                     if (p.hist_moments != 0) {
                         const m = ld2(p.hist_moments, j);
-                        hmom[0] += m[0] * bw;
-                        hmom[1] += m[1] * bw;
+                        hmom[0] += m[0] * bwv;
+                        hmom[1] += m[1] * bwv;
                     }
-                    wsum += bw;
+                    wsum += bwv;
                 }
             }
         }
@@ -186,7 +208,16 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
                 hist[k] = @min(@max(hist[k], mean[k] - p.clamp_sigma * sd[k]), mean[k] + p.clamp_sigma * sd[k]);
             }
         }
-        const count = @min(hist[3] + 1, 1.0 / @max(p.alpha_min, 1e-4));
+        // Stammt der Verlauf von einer anderen Fläche, liegt das Pixel auf
+        // einer Voxelkante: der Jitter schiebt die Abtastung jeden Frame
+        // hin und her. Den Verlauf zu verwerfen lässt das Pixel zwischen
+        // beiden Flächen springen (gemessen: Ausreißer 20,7 Stufen), ihn voll
+        // zu übernehmen zieht nach (33 % Schärfeverlust bei Bewegung).
+        // Also beides: übernehmen, aber die Mittelung kurz halten, damit es
+        // beide Flächen mittelt und trotzdem schnell folgt.
+        var limit = 1.0 / @max(p.alpha_min, 1e-4);
+        if (edge_w > 0.25) limit = @min(limit, p.edge_frames);
+        const count = @min(hist[3] + 1, limit);
         const a = 1.0 / count;
         inline for (0..3) |k| out[k] = hist[k] + (cur[k] - hist[k]) * a;
         out[3] = count;
@@ -264,7 +295,10 @@ pub fn atrous(p: *const types.PostParams, x: u32, y: u32) void {
                     const n2 = nd * nd;
                     const n4 = n2 * n2;
                     const n8 = n4 * n4;
-                    const wn = n8 * n8 * n8 * n8; // ^64
+                    // ^32. Der Exponent ist bei Voxelgeometrie ohne Belang:
+                    // achsenparallele Flächen haben n·n' von exakt 0 oder 1,
+                    // da ändert ein weicherer Verlauf nichts (nachgemessen).
+                    const wn = n8 * n8 * n8 * n8;
                     const wd = fm.exp(-@abs(nq[3] - n[3]) / (0.02 * n[3] * @as(f32, @floatFromInt(step)) + 1e-3));
                     const wl = fm.exp(-@abs(lum(cq) - lc) / sigma_l);
                     const wgt = kernel5[a] * kernel5[b] * wn * wd * wl;
