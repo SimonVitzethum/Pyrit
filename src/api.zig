@@ -311,7 +311,8 @@ pub const WorldInfo = extern struct {
     /// senkrechter Bereich in Grundvoxeln [y_min, y_max); beide 0 = aus dem Gelände
     y_min: i32,
     y_max: i32,
-    /// Chunks je pyr_world_update, 0 = 64
+    /// Chunks je pyr_world_update, 0 = 256 (bestimmt, wie schnell eine frisch
+    /// betretene Welt ihre volle Schärfe erreicht)
     chunks_per_update: u32,
     /// Instanzmaske der Welt, 0 = 0x1
     mask: u32,

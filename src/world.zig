@@ -220,9 +220,19 @@ pub const World = struct {
         }
         if (y_max <= y_min) return fail(error.InvalidArgument, "y_max muss größer als y_min sein", .{});
         const n: u32 = @as(u32, 1) << @intCast(cl);
-        const batch: u32 = if (info.chunks_per_update == 0) 64 else info.chunks_per_update;
+        // Wie viele Chunks ein Auftrag umfasst, bestimmt, wie schnell eine
+        // frisch betretene Welt ihre volle Schärfe erreicht: je Update läuft
+        // genau ein Auftrag. Gemessen bis zur vollen Schärfe: 64 -> 112
+        // Updates, 256 -> 29, 1024 -> 17. Die Vorgabe richtet sich deshalb
+        // nicht nach einer festen Zahl, sondern danach, wie viele Chunks in
+        // den Generatorpuffer passen (128 MiB, also bei der Standardkapazität
+        // von 8192 Voxeln rund 1024 Chunks auf einmal).
+        const gen_budget: u64 = 128 << 20;
+        const cap_pre: u32 = if (info.chunk_capacity == 0) @min(n * n * 8, n * n * n) else @min(info.chunk_capacity, n * n * n);
+        const auto_batch: u32 = @intCast(std.math.clamp(gen_budget / (@as(u64, cap_pre) * 16), 16, 4096));
+        const batch: u32 = if (info.chunks_per_update == 0) auto_batch else info.chunks_per_update;
         if (batch > 4096) return fail(error.InvalidArgument, "chunks_per_update höchstens 4096", .{});
-        const cap: u32 = if (info.chunk_capacity == 0) @min(n * n * 8, n * n * n) else @min(info.chunk_capacity, n * n * n);
+        const cap: u32 = cap_pre;
         // gemessen: kleinere AABBs sind in der Welt schneller (dünne Oberflächen,
         // die Hardware-BVH trennt sie besser als der DAG-Lauf im Shader)
         const rt_log2: u32 = if (info.rt_leaf_log2 == 0) @max(cl -| 2, 3) else std.math.clamp(info.rt_leaf_log2, 3, cl);

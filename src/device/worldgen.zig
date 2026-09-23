@@ -198,29 +198,44 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         emit(g, c, base, counts, out, lx, y, lz, a);
     }
 
-    // Vegetation: Grasbüschel und Bäume auf der obersten Zelle (nur in feiner
-    // Auflösung sichtbar, darüber zu klein)
-    if (t.attr_leaves == 0 or key.lod > 1 or slope > t.rock_slope) return;
+    // Bäume. Die Maße stehen in Grundvoxeln und werden auf die Voxelgröße der
+    // Stufe umgerechnet – so stehen sie auf *jeder* Stufe, nur eben gröber.
+    // (Vorher gab es sie nur auf Stufe 0 und 1, also nur nahe der Kamera:
+    // beim Näherkommen wuchs plötzlich ein Wald aus dem Nichts.)
+    // Nur solange ein Baum überhaupt mindestens ein Voxel groß ist. Auf
+    // gröberen Stufen ist er kleiner als eine Zelle; ihn trotzdem zu setzen
+    // hieße, jede Spalte zu bewalden – das sprengt die Kapazität des
+    // Generatorpuffers (gemessen: der Aufbau lief nicht mehr fertig).
+    if (t.attr_leaves == 0 or slope > t.rock_slope or step > 4) return;
     const wy_top = y0w + (surface_y + 0.5) * step;
     if (wy_top < t.sea_level + 1 or wy_top > snow_h) return;
     const r = lattice(@intFromFloat(wx), @intFromFloat(wz), t.seed ^ 0x51ed);
-    if (r > t.tree_density) return;
+    // Auf gröberen Stufen deckt eine Spalte mehrere Grundspalten ab; damit die
+    // Walddichte gleich bleibt, muss sie entsprechend häufiger treffen.
+    const cover = step * step;
+    if (r > @min(t.tree_density * cover, 1.0)) return;
+
     const trunk = pick(t.attr_wood, rgb(96, 68, 44));
     const leaf = t.attr_leaves;
-    const trunk_h: i32 = 4 + @mod(@as(i32, @intFromFloat(r * 400)), 3);
+    // 5 bis 7 Grundvoxel Stamm, 2 Grundvoxel Kronenradius
+    const trunk_base: f32 = 5 + @as(f32, @floatFromInt(@mod(@as(i32, @intFromFloat(r * 400)), 3)));
+    const trunk_h: i32 = @max(@as(i32, @intFromFloat(@round(trunk_base / step))), 1);
+    const crown_r: i32 = @max(@as(i32, @intFromFloat(@round(2.5 / step))), 1);
+
     var ty: i32 = 1;
     while (ty <= trunk_h) : (ty += 1) {
         const vy = @as(i32, @intFromFloat(surface_y)) + ty;
         if (vy >= 0 and vy < ni) emit(g, c, base, counts, out, lx, vy, lz, trunk);
     }
-    // Krone: Kugelschale um die Stammspitze, innerhalb des Chunks
-    var dz: i32 = -2;
-    while (dz <= 2) : (dz += 1) {
-        var dx: i32 = -2;
-        while (dx <= 2) : (dx += 1) {
-            var dy: i32 = -1;
-            while (dy <= 2) : (dy += 1) {
-                if (dx * dx + dy * dy + dz * dz > 5) continue;
+    // Krone: Kugel um die Stammspitze, innerhalb des Chunks
+    const rr = crown_r * crown_r + crown_r;
+    var dz: i32 = -crown_r;
+    while (dz <= crown_r) : (dz += 1) {
+        var dx: i32 = -crown_r;
+        while (dx <= crown_r) : (dx += 1) {
+            var dy: i32 = -@divTrunc(crown_r, 2);
+            while (dy <= crown_r) : (dy += 1) {
+                if (dx * dx + dy * dy + dz * dz > rr) continue;
                 const vx = @as(i32, @intCast(lx)) + dx;
                 const vz = @as(i32, @intCast(lz)) + dz;
                 const vy = @as(i32, @intFromFloat(surface_y)) + trunk_h + dy;

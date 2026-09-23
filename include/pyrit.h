@@ -814,7 +814,8 @@ typedef struct PyrWorldInfo {
     uint32_t reserved0;
     uint64_t memory_budget;      /* Bytes für Chunks; darüber wird die Welt gröber. 0 = 256 MiB */
     int32_t  y_min, y_max;       /* Grundvoxel; beide 0 = aus dem Gelände */
-    uint32_t chunks_per_update;  /* 0 = 64 */
+    uint32_t chunks_per_update;  /* 0 = 256; bestimmt, wie schnell eine frisch
+                                    betretene Welt volle Schaerfe erreicht */
     uint32_t mask;               /* Instanzmaske, 0 = 0x1 */
     /* Zusätzliche Maske für eine gröbere Fassung der Welt, die nur Schatten-,
      * GI- und Reflexionsstrahlen sehen (PyrTargets.secondary_mask); 0 = aus.
