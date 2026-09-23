@@ -147,6 +147,8 @@ pub fn main(init: std.process.Init) !void {
     var fx_flags: u32 = 0;
     var materials = false;
     var use_env = false;
+    var env_flat = false;
+    var firefly: f32 = 0;
     var bounces: u32 = 0;
     var fog: f32 = 0;
     var async_post = false;
@@ -227,6 +229,12 @@ pub fn main(init: std.process.Init) !void {
             fog = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--async-post")) {
             async_post = true;
+        } else if (std.mem.eql(u8, a, "--clamp-fire") and i + 1 < args.len) {
+            i += 1;
+            firefly = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, a, "--env-flat")) {
+            use_env = true;
+            env_flat = true;
         } else if (std.mem.eql(u8, a, "--env")) {
             use_env = true;
         } else if (std.mem.eql(u8, a, "--materials")) {
@@ -296,7 +304,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -338,6 +346,7 @@ pub fn main(init: std.process.Init) !void {
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
         light.fog_height = 90;
@@ -368,10 +377,13 @@ pub fn main(init: std.process.Init) !void {
                 var dp = phi - sun_phi;
                 if (dp > std.math.pi) dp -= 2 * std.math.pi;
                 if (dp < -std.math.pi) dp += 2 * std.math.pi;
-                if (dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
-                    r += 4000;
-                    g += 3800;
-                    b += 3400;
+                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                    // Strahldichte so gewaehlt, dass L * Raumwinkel etwa der
+                    // Beleuchtungsstaerke der analytischen Sonne entspricht
+                    // (0.03 rad Scheibe -> 0.00283 sr, 2.6 / 0.00283 ~ 920)
+                    r += 920;
+                    g += 870;
+                    b += 780;
                 }
                 const o = (y * ew + x) * 4;
                 env[o + 0] = r;
@@ -453,7 +465,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, bounces: u32, fog: f32, async_post: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, bounces: u32, fog: f32, async_post: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -525,6 +537,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
         light.fog_height = 90;
@@ -555,10 +568,13 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
                 var dp = phi - sun_phi;
                 if (dp > std.math.pi) dp -= 2 * std.math.pi;
                 if (dp < -std.math.pi) dp += 2 * std.math.pi;
-                if (dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
-                    r += 4000;
-                    g += 3800;
-                    b += 3400;
+                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                    // Strahldichte so gewaehlt, dass L * Raumwinkel etwa der
+                    // Beleuchtungsstaerke der analytischen Sonne entspricht
+                    // (0.03 rad Scheibe -> 0.00283 sr, 2.6 / 0.00283 ~ 920)
+                    r += 920;
+                    g += 870;
+                    b += 780;
                 }
                 const o = (y * ew + x) * 4;
                 env[o + 0] = r;

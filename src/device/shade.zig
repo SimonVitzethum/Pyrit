@@ -276,7 +276,9 @@ pub fn envPdf(l: *const types.Lighting, d: Vec3) f32 {
     const x: u32 = @min(@as(u32, @intFromFloat(u * @as(f32, @floatFromInt(l.env_width)))), l.env_width - 1);
     const y: u32 = @min(@as(u32, @intFromFloat(theta * (1.0 / pi) * @as(f32, @floatFromInt(l.env_height)))), l.env_height - 1);
     const c = envTexel(l, x, y);
-    const lu = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) * sin_t;
+    // über den Überschuss, genau wie beim Bau der Verteilung
+    const lu = @max(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] - l.env_mean, 0) * sin_t;
+    if (lu <= 0) return 0;
     const nw: f32 = @floatFromInt(l.env_width);
     const nh: f32 = @floatFromInt(l.env_height);
     // Dichte über Pixel -> über Raumwinkel
@@ -319,7 +321,16 @@ pub fn envSample(l: *const types.Lighting, r1: f32, r2: f32) EnvSample {
     const phi = u * 2 * pi + l.env_rotation;
     const st = fm.sin(theta);
     const dir = Vec3{ st * fm.cos(phi), fm.cos(theta), st * fm.sin(phi) };
-    return .{ .dir = dir, .radiance = envRadiance(l, dir), .pdf = envPdf(l, dir) };
+    // Strahldichte aus *demselben* Texel, über das auch die Dichte gebildet
+    // wird. Nähme man hier den bilinearen Wert, bekäme ein dunkles Texel neben
+    // der Sonne deren Helligkeit, aber seine eigene winzige Dichte – das
+    // Verhältnis explodiert und ergibt Leuchtpunkte, die jeden Frame
+    // woanders sitzen (gemessen: Flimmern 0,898 statt 0,388).
+    return .{
+        .dir = dir,
+        .radiance = envTexel(l, x, y) * splat(l.env_intensity),
+        .pdf = envPdf(l, dir),
+    };
 }
 
 pub fn sky(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
@@ -613,7 +624,7 @@ fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: V
             if (lit) {
                 const pdf_bsdf = endl / pi;
                 const w = es.pdf * es.pdf / (es.pdf * es.pdf + pdf_bsdf * pdf_bsdf);
-                c += brdf(n, v, es.dir, sf) * es.radiance * splat(endl * w / es.pdf) * tint;
+                c += clampContribution(l, brdf(n, v, es.dir, sf) * es.radiance * splat(endl * w / es.pdf) * tint);
             }
         }
     }
@@ -740,6 +751,16 @@ pub fn shadeSimple(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: 
 /// Eintreffende indirekte Strahldichte an (p, n): ein Kosinus-Strahl (GI),
 /// Umgebungsverdeckung oder – ohne beides – der Himmel grob nach der Normalen.
 /// Das Ergebnis wird mit Albedo · (1 − metallic) multipliziert.
+/// Beitrag einer einzelnen Abtastung begrenzen. Das verschiebt den
+/// Erwartungswert leicht nach unten, nimmt aber genau die vereinzelten
+/// Ausreißer weg, die als Flimmern auffallen.
+fn clampContribution(l: *const types.Lighting, c: Vec3) Vec3 {
+    if (l.firefly_clamp <= 0) return c;
+    const m = @max(@max(c[0], c[1]), c[2]);
+    if (m <= l.firefly_clamp) return c;
+    return c * splat(l.firefly_clamp / m);
+}
+
 pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
     if (l.flags & types.lighting_gi != 0) {
         const gi_max = if (l.gi_distance > 0) l.gi_distance else types.flt_max;
@@ -762,7 +783,7 @@ pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
                 const hp = op + gd * splat(g.t);
                 const gsf = surfaceAt(s, g.attribute, hp, gn);
                 const gp = hp + gn * splat(1e-3 * voxelSize(ginst));
-                acc += throughput * r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask));
+                acc += clampContribution(l, throughput * r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask)));
                 if (b + 1 >= bounces) break;
                 // Weiter mit dem diffusen Anteil der getroffenen Fläche
                 throughput *= r.att * gsf.albedo * splat(1 - gsf.metallic);

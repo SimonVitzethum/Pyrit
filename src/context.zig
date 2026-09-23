@@ -252,6 +252,7 @@ pub const Context = struct {
     env_w: u32 = 0,
     env_h: u32 = 0,
     env_total: f32 = 0,
+    env_mean: f32 = 0,
     instance_buf: [2]cuda.CUdeviceptr = .{ 0, 0 },
     update_scratch: cuda.CUdeviceptr = 0,
     scene_dev: cuda.CUdeviceptr = 0,
@@ -1565,6 +1566,7 @@ pub const Context = struct {
         // Diagnose: ohne Verteilung fällt die Lichtabtastung der Karte weg,
         // es bleibt reines Abtasten über den Cosinus-Lappen (A/B-Vergleich).
         self.lighting.env_total = if (std.c.getenv("PYRIT_ENV_NOMIS") != null) 0 else self.env_total;
+        self.lighting.env_mean = self.env_mean;
         if (self.env_data != 0 and self.lighting.env_intensity == 0) self.lighting.env_intensity = 1;
         try self.uploadValue(self.lighting_dev, &self.lighting);
     }
@@ -1587,6 +1589,23 @@ pub const Context = struct {
         defer self.gpa.free(cond);
         const marginal = try oom(self.gpa.alloc(f32, @as(usize, h) + 1));
         defer self.gpa.free(marginal);
+        // Die Verteilung wird über den *Überschuss* über den Mittelwert
+        // gebildet, nicht über die Helligkeit selbst. Grund: den gleichmäßigen
+        // Teil des Himmels trifft der Cosinus-Strahl der GI bereits perfekt;
+        // richtet man die Lichtabtastung auch darauf, landen die meisten
+        // Abtastungen dort und werden von MIS anschließend verworfen – der
+        // Sonnenbeitrag käme dann nur in jedem vierten Frame, dafür vierfach,
+        // und das flimmert sichtbar. Über den Überschuss zielt die
+        // Lichtabtastung auf genau die Spitzen, die dem Cosinus-Strahl
+        // entgehen; wo der Überschuss 0 ist, übernimmt ihn die GI ganz
+        // (MIS bleibt dabei erwartungstreu).
+        var mean: f64 = 0;
+        for (0..@as(usize, h) * w) |k| {
+            const px = pixels[k * 4 ..][0..3];
+            mean += 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
+        }
+        mean /= @floatFromInt(@as(usize, h) * w);
+
         var total: f64 = 0;
         for (0..h) |y| {
             const sin_t = @sin((@as(f64, @floatFromInt(y)) + 0.5) / @as(f64, @floatFromInt(h)) * std.math.pi);
@@ -1596,7 +1615,7 @@ pub const Context = struct {
             for (0..w) |x| {
                 const px = pixels[(@as(usize, y) * w + x) * 4 ..][0..3];
                 const lu = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2];
-                row_sum += @max(@as(f64, lu), 0) * sin_t;
+                row_sum += @max(@as(f64, lu) - mean, 0) * sin_t;
                 row[x + 1] = @floatCast(row_sum);
             }
             // Zeile auf 1 normieren (0 bleibt 0: dunkle Zeilen werden nie gezogen)
@@ -1621,6 +1640,7 @@ pub const Context = struct {
         self.env_h = h;
         // Mittelwert der gewichteten Helligkeit je Texel (für die Dichte)
         self.env_total = @floatCast(total);
+        self.env_mean = @floatCast(mean);
         try self.setLighting(&self.lighting);
     }
 
@@ -1632,6 +1652,7 @@ pub const Context = struct {
         self.env_w = 0;
         self.env_h = 0;
         self.env_total = 0;
+        self.env_mean = 0;
     }
 
     // -----------------------------------------------------------------------

@@ -301,8 +301,11 @@ pub const Lighting = extern struct {
     env_intensity: f32,
     /// Drehung der Karte um die Y-Achse in Radiant
     env_rotation: f32,
-    /// Summe der Helligkeiten (für die Wahrscheinlichkeitsdichte)
+    /// Summe des Helligkeitsüberschusses (für die Wahrscheinlichkeitsdichte)
     env_total: f32,
+    /// mittlere Helligkeit der Karte; die Lichtabtastung zielt nur auf das,
+    /// was darüber liegt (den Rest trifft der Cosinus-Strahl ohnehin)
+    env_mean: f32,
     /// Indirekte Reflexionen: 1 = eine (Vorgabe), mehr für tiefere Lichtwege.
     /// Ab der zweiten wird russisches Roulette angewandt.
     gi_bounces: u32,
@@ -316,7 +319,11 @@ pub const Lighting = extern struct {
     fog_anisotropy: f32,
     /// Schritte der Strahlmarschierung; 0 = 12
     fog_steps: u32,
-    reserved: [3]u32,
+    /// Obergrenze für den Beitrag einer einzelnen Abtastung (0 = aus).
+    /// Sehr helle, sehr kleine Lichter liefern sonst vereinzelte Ausreißer,
+    /// die jeden Frame woanders sitzen und sichtbar flimmern.
+    firefly_clamp: f32,
+    reserved: [1]u32,
     lights: [max_lights]Light,
 };
 

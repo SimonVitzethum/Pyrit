@@ -263,6 +263,7 @@ typedef struct PyrLighting {
     float    env_intensity;     /* 0 = 1 */
     float    env_rotation;      /* Drehung um Y in Radiant */
     float    env_total;
+    float    env_mean;
     uint32_t gi_bounces;        /* indirekte Reflexionen, 0/1 = eine */
     /* Teilnehmendes Medium: Nebel und Lichtschaechte */
     float    fog_density;       /* je Welteinheit auf Hoehe fog_height, 0 = aus */
@@ -271,7 +272,8 @@ typedef struct PyrLighting {
     float    fog_falloff;       /* exponentielle Abnahme darueber, 0 = gleichmaessig */
     float    fog_anisotropy;    /* Henyey-Greenstein g, >0 streut nach vorn */
     uint32_t fog_steps;         /* 0 = 12 */
-    uint32_t reserved[3];
+    float    firefly_clamp;     /* Obergrenze je Abtastung, 0 = aus */
+    uint32_t reserved[1];
     PyrLight lights[PYR_MAX_LIGHTS];
 } PyrLighting;
 

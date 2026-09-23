@@ -84,6 +84,8 @@ const Win = struct {
     zoom_in: bool = false,
     zoom_out: bool = false,
     toggle_fg: bool = false,
+    /// Umschalter für die Bildeffekte (Tasten B, T, U, N, G)
+    toggle: [5]bool = .{false} ** 5,
 
     fn marshal(self: *Win, p: *wl.Proxy, op: u32, iface: ?*const wl.Interface, args: anytype) ?*wl.Proxy {
         const ver = self.c.proxy_get_version(p);
@@ -238,6 +240,11 @@ fn onKey(_: ?*anyopaque, _: *wl.Proxy, _: u32, _: u32, key: u32, state: u32) cal
         wl.key_equal => W.zoom_in = true,
         wl.key_minus => W.zoom_out = true,
         wl.key_f => W.toggle_fg = true,
+        wl.key_b => W.toggle[0] = true,
+        wl.key_t => W.toggle[1] = true,
+        wl.key_u => W.toggle[2] = true,
+        wl.key_n => W.toggle[3] = true,
+        wl.key_g => W.toggle[4] = true,
         else => {},
     }
 }
@@ -559,7 +566,37 @@ pub fn main(init: std.process.Init) !void {
     water.ior = 1.33;
     water.density = 0.08;
     water.opacity = 0.05;
+    water.clearcoat = 1; // nasse, lackartige Oberfläche
+    water.clearcoat_roughness = 0.03;
     req(pyrit.pyr_material_set(@ptrCast(ctx), 2, &water));
+
+    // Boden und Laub (Material 0): Textur, Detailnormale, Streuung
+    {
+        const tw: u32 = 64;
+        const tex = try gpa.alloc(u8, tw * tw * 4);
+        defer gpa.free(tex);
+        for (0..tw) |ty| for (0..tw) |tx| {
+            const nz = (tx *% 73 +% ty *% 151) ^ ((tx *% 19) >> 2);
+            const val: u8 = @intCast(180 + (nz % 76));
+            const o = (ty * tw + tx) * 4;
+            tex[o + 0] = val;
+            tex[o + 1] = @intCast(@min(@as(u32, val) + 12, 255));
+            tex[o + 2] = @intCast(@as(u32, val) * 3 / 4);
+            tex[o + 3] = 255;
+        };
+        var tex_index: u32 = 0;
+        req(pyrit.pyr_texture_create(@ptrCast(ctx), tw, tw, tex.ptr, &tex_index));
+        var ground: types.Material = undefined;
+        pyrit.pyr_material_default(&ground);
+        ground.flags = types.material_voxel_color;
+        ground.texture = tex_index;
+        ground.texture_scale = 8;
+        ground.normal_strength = 0.35;
+        ground.normal_scale = 2;
+        ground.subsurface = 0.25;
+        ground.subsurface_color = .{ 0.4, 0.8, 0.3 };
+        req(pyrit.pyr_material_set(@ptrCast(ctx), 0, &ground));
+    }
 
     var wi = std.mem.zeroes(api.WorldInfo);
     wi.terrain = &terrain;
@@ -573,6 +610,61 @@ pub fn main(init: std.process.Init) !void {
     light.sun_direction = .{ 0.5, 0.45, 0.35 };
     if (half_gi) light.flags |= types.lighting_gi_half;
     light.gi_distance = 96;
+    light.gi_bounces = 2;
+    // Nebel: Höhenabnahme, nach vorn streuend (Lichtschächte zur Sonne)
+    light.fog_density = 0.006;
+    light.fog_height = 90;
+    light.fog_falloff = 0.02;
+    light.fog_color = .{ 1, 0.98, 0.92 };
+    light.fog_anisotropy = 0.7;
+    // Umgebungskarte: Himmelsverlauf mit Sonnenscheibe, nach Helligkeit abgetastet
+    {
+        const ew: u32 = 512;
+        const eh: u32 = 256;
+        const env = try gpa.alloc(f32, ew * eh * 4);
+        defer gpa.free(env);
+        // Scheibenradius und Strahldichte zusammen so gewaehlt, dass
+        // L * Raumwinkel der Beleuchtungsstaerke einer echten Sonne
+        // entspricht (2.6). Zu helle Scheiben ueberstrahlen nicht nur, sie
+        // verstaerken auch das Rauschen im Halbschatten: mit einem
+        // Schattenstrahl je Pixel und Frame waechst es proportional zur
+        // Beleuchtungsstaerke (gemessen: Flimmern 0,87 bei 7,4 gegen 0,57
+        // bei 2,6 Beleuchtungsstaerke).
+        const sun_radius: f32 = 0.025;
+        const sun_theta: f32 = 0.85;
+        const sun_phi: f32 = 1.1;
+        for (0..eh) |y| {
+            const theta = (@as(f32, @floatFromInt(y)) + 0.5) / @as(f32, @floatFromInt(eh)) * std.math.pi;
+            for (0..ew) |x| {
+                const phi = (@as(f32, @floatFromInt(x)) + 0.5) / @as(f32, @floatFromInt(ew)) * 2 * std.math.pi;
+                const up = @cos(theta);
+                var r: f32 = if (up > 0) 0.30 + 0.20 * up else 0.08;
+                var g: f32 = if (up > 0) 0.40 + 0.30 * up else 0.07;
+                var b: f32 = if (up > 0) 0.62 + 0.32 * up else 0.06;
+                const dt = theta - sun_theta;
+                var dp = phi - sun_phi;
+                if (dp > std.math.pi) dp -= 2 * std.math.pi;
+                if (dp < -std.math.pi) dp += 2 * std.math.pi;
+                const st = @sin(theta);
+                if (dt * dt + dp * dp * st * st < sun_radius * sun_radius) {
+                    const peak = 2.6 / (std.math.pi * sun_radius * sun_radius);
+                    r += peak;
+                    g += peak * 0.94;
+                    b += peak * 0.84;
+                }
+                const o = (y * ew + x) * 4;
+                env[o + 0] = r;
+                env[o + 1] = g;
+                env[o + 2] = b;
+                env[o + 3] = 0;
+            }
+        }
+        req(pyrit.pyr_environment_set(@ptrCast(ctx), ew, eh, &env[0]));
+        light.env_intensity = 1;
+        // Richtung der Sonne in der Karte auch für Schatten und Nebel
+        light.sun_direction = .{ @sin(sun_theta) * @cos(sun_phi), @cos(sun_theta), @sin(sun_theta) * @sin(sun_phi) };
+        light.sun_color = .{ 0, 0, 0 }; // das Licht steckt jetzt in der Karte
+    }
     req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
 
     var view: api.Handle = null;
@@ -593,6 +685,19 @@ pub fn main(init: std.process.Init) !void {
     post.exposure = 1.0;
     post.clamp_sigma = 1.5;
     post.flags = api.post_bgra;
+    // Kamera- und Bildeffekte
+    var fxi = std.mem.zeroes(api.PostFx);
+    fxi.flags = api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade |
+        api.postfx_dof | api.postfx_autofocus | api.postfx_motion_blur;
+    fxi.bloom_strength = 0.06;
+    fxi.bloom_threshold = 1.2;
+    fxi.dof_strength = 2.5;
+    fxi.motion_blur_scale = 0.4;
+    fxi.contrast = 1.06;
+    fxi.saturation = 1.08;
+    fxi.temperature = 4;
+    fxi.exposure_compensation = 0.2;
+    post.fx = &fxi;
     var fgi = std.mem.zeroes(api.FrameGenInfo);
     fgi.flags = api.post_bgra;
 
@@ -615,6 +720,28 @@ pub fn main(init: std.process.Init) !void {
         if (W.toggle_fg) {
             fg = !fg;
             W.toggle_fg = false;
+        }
+        if (W.toggle[0]) {
+            fxi.flags ^= api.postfx_bloom;
+            W.toggle[0] = false;
+        }
+        if (W.toggle[1]) {
+            fxi.flags ^= api.postfx_dof;
+            W.toggle[1] = false;
+        }
+        if (W.toggle[2]) {
+            fxi.flags ^= api.postfx_motion_blur;
+            W.toggle[2] = false;
+        }
+        if (W.toggle[3]) {
+            light.fog_density = if (light.fog_density > 0) 0 else 0.006;
+            req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
+            W.toggle[3] = false;
+        }
+        if (W.toggle[4]) {
+            light.gi_bounces = if (light.gi_bounces > 1) 1 else 3;
+            req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
+            W.toggle[4] = false;
         }
         if (W.zoom_in) {
             voxel_px = @max((if (voxel_px == 0) 4 else voxel_px) * 0.8, 1);
@@ -723,12 +850,16 @@ pub fn main(init: std.process.Init) !void {
             var st: api.WorldStats = undefined;
             req(pyrit.pyr_world_stats(@ptrCast(world), &st));
             var buf: [256]u8 = undefined;
-            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d}{s} · {d} Chunks, {d:.0} MiB, {d:.1} px/Voxel", .{
-                frame_ms,                                       1000 / @max(frame_ms, 0.001),
-                if (fg) " +Zwischenbild" else "",                rw,
-                rh,                                             if (scale > 1) " hochskaliert" else "",
-                st.resident_chunks,                             @as(f64, @floatFromInt(st.bytes)) / (1 << 20),
-                st.voxel_pixels,
+            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · Bloom {s}, Schärfe {s}, Unschärfe {s}, Nebel {s}, GI {d}x", .{
+                frame_ms,                                                     1000 / @max(frame_ms, 0.001),
+                if (fg) " +Zwischenbild" else "",                              rw,
+                rh,                                                            st.resident_chunks,
+                @as(f64, @floatFromInt(st.bytes)) / (1 << 20),
+                if (fxi.flags & api.postfx_bloom != 0) "an" else "aus",
+                if (fxi.flags & api.postfx_dof != 0) "an" else "aus",
+                if (fxi.flags & api.postfx_motion_blur != 0) "an" else "aus",
+                if (light.fog_density > 0) "an" else "aus",
+                @max(light.gi_bounces, 1),
             });
             _ = W.marshal(W.toplevel.?, wl.toplevel_set_title, null, .{title.ptr});
         }
