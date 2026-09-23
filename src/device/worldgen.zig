@@ -97,9 +97,24 @@ pub fn height(t: *const types.TerrainParams, x: f32, z: f32, min_wavelength: f32
         norm += amp;
         amp *= 0.5;
     }
-    const h = sum / @max(norm, 1e-6);
+    var h = sum / @max(norm, 1e-6);
     // Täler flacher, Gipfel steiler
-    return t.base_height + t.amplitude * h * h * 1.6;
+    h = h * h * 1.6;
+
+    // Großräumige Kontinentform: ohne sie liegen alle Tiefflächen auf
+    // derselben Höhe und der Ozean ist eine leere Platte. Zwei sehr lange
+    // Wellen heben und senken ganze Landstriche, das ergibt Buchten,
+    // Halbinseln und Inseln statt einer einzigen Küstenlinie.
+    const cwl = t.wavelength * 9;
+    if (min_wavelength < cwl) {
+        const c1 = valueNoise(x / cwl + 21.7, z / cwl - 13.2, t.seed ^ 0x6d21);
+        const c2 = valueNoise(x / (cwl * 0.37) - 5.9, z / (cwl * 0.37) + 8.8, t.seed ^ 0xa14f);
+        const cont = (c1 - 0.5) * 1.35 + (c2 - 0.5) * 0.55;
+        h += cont * 0.13;
+    } else {
+        // gröbere Stufen sehen die Welle nicht mehr: Erwartungswert 0
+    }
+    return t.base_height + t.amplitude * @max(h, -0.08);
 }
 
 /// Höhe, ab der Schnee liegt – keine Linie, sondern ein von Rauschen und
@@ -188,20 +203,29 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         }
     }.f;
 
-    if (top_f < 0 or bot_f >= @as(f32, @floatFromInt(n))) return;
-    // Zelle der Wasseroberfläche in diesem Chunk (-1 = keine). Sie gehört dem
-    // Wasser; das Gelände endet darunter. Beides in dieselbe Zelle zu legen
-    // hieße, dem Bau die Wahl zu lassen – auf der Wasserfläche standen dann
-    // einzelne Sandwürfel verstreut herum.
+    // Zelle der Wasseroberfläche in diesem Chunk (-1 = keine). Sie wird
+    // *unabhängig* vom Gelände bestimmt: über tiefem Meer liegt in diesem
+    // Chunk gar kein Boden, und wer hier zu früh zurückkehrt, lässt den
+    // ganzen Ozean leer – genau das war der Fall.
     var water_y: i32 = -1;
     if (t.attr_water != 0 and h < t.sea_level) {
         const wtop_f = (t.sea_level - y0w) / step - 0.5;
         if (wtop_f >= 0 and wtop_f < @as(f32, @floatFromInt(n))) water_y = @intFromFloat(@floor(wtop_f));
     }
-    var top: i32 = @min(@as(i32, @intFromFloat(@floor(top_f))), ni - 1);
+
+    const has_ground = top_f >= 0 and bot_f < @as(f32, @floatFromInt(n));
+    var top: i32 = if (has_ground) @min(@as(i32, @intFromFloat(@floor(top_f))), ni - 1) else -1;
+    const bot: i32 = if (has_ground) @max(@as(i32, @intFromFloat(@floor(bot_f))), 0) else 0;
+    // Die Zelle der Oberfläche gehört dem Wasser; das Gelände endet darunter.
+    // Beides in dieselbe Zelle zu legen hieße, dem Bau die Wahl zu lassen –
+    // auf der Wasserfläche standen dann einzelne Sandwürfel verstreut herum.
     if (water_y >= 0 and top >= water_y) top = water_y - 1;
-    const bot: i32 = @max(@as(i32, @intFromFloat(@floor(bot_f))), 0);
-    if (bot > top) return;
+
+    // Nur die Oberfläche: das Medium reicht ohnehin bis zum Grund (die
+    // Absorption rechnet mit dem Weg bis zum Untergrund), und eine dicke Haut
+    // würde an den Rändern ihre Seitenflächen zeigen.
+    if (water_y >= 0) emit(g, c, base, counts, out, lx, water_y, lz, t.attr_water);
+    if (!has_ground or bot > top) return;
 
     const snow_h = snowLine(t, wx, wz);
     const gv = groundVariation(t, wx, wz);
@@ -225,11 +249,6 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         };
         emit(g, c, base, counts, out, lx, y, lz, a);
     }
-
-    // Nur die Oberfläche: das Medium reicht ohnehin bis zum Grund (die
-    // Absorption rechnet mit dem Weg bis zum Untergrund), und eine dicke Haut
-    // würde an den Rändern ihre Seitenflächen zeigen.
-    if (water_y >= 0) emit(g, c, base, counts, out, lx, water_y, lz, t.attr_water);
 
     // Bäume. Die Maße stehen in Grundvoxeln und werden auf die Voxelgröße der
     // Stufe umgerechnet – so stehen sie auf *jeder* Stufe, nur eben gröber.
