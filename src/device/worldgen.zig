@@ -235,18 +235,32 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
     // Stufe umgerechnet – so stehen sie auf *jeder* Stufe, nur eben gröber.
     // (Vorher gab es sie nur auf Stufe 0 und 1, also nur nahe der Kamera:
     // beim Näherkommen wuchs plötzlich ein Wald aus dem Nichts.)
-    // Nur solange ein Baum überhaupt mindestens ein Voxel groß ist. Auf
-    // gröberen Stufen ist er kleiner als eine Zelle; ihn trotzdem zu setzen
-    // hieße, jede Spalte zu bewalden – das sprengt die Kapazität des
-    // Generatorpuffers (gemessen: der Aufbau lief nicht mehr fertig).
-    if (t.attr_leaves == 0 or slope > t.rock_slope or step > 4) return;
+    if (t.attr_leaves == 0 or slope > t.rock_slope) return;
     const wy_top = y0w + (surface_y + 0.5) * step;
     if (wy_top < t.sea_level + 1 or wy_top > snow_h) return;
     const r = lattice(@intFromFloat(wx), @intFromFloat(wz), t.seed ^ 0x51ed);
-    // Auf gröberen Stufen deckt eine Spalte mehrere Grundspalten ab; damit die
-    // Walddichte gleich bleibt, muss sie entsprechend häufiger treffen.
-    const cover = step * step;
-    if (r > @min(t.tree_density * cover, 1.0)) return;
+    // Eine Spalte deckt step² Grundspalten ab; so viele Bäume stünden darin.
+    const expect = t.tree_density * step * step;
+
+    // Ist ein Baum kleiner als eine Zelle, kann man ihn nicht mehr setzen –
+    // jede Spalte zu bewalden würde den Generatorpuffer sprengen. Stattdessen
+    // färbt sich der Boden zum Laub hin, anteilig zur Kronendeckung. Aus der
+    // Ferne ist genau das der richtige Anblick: eine Waldfläche, keine
+    // einzelnen Bäume. Vorher verschwand der Wald ab Stufe 3 einfach.
+    if (step > 4) {
+        const cover = @min(expect * 7, 1.0); // eine Krone deckt ~7 Grundspalten
+        if (cover <= 0.02) return;
+        // Eine Zelle ÜBER dem Boden: in dieselbe zu schreiben hieße, sich mit
+        // dem Geländevoxel um die Zelle zu streiten (derselbe Fehler, der beim
+        // Wasser einzelne Würfel auf die Oberfläche gestreut hat).
+        const ly: i32 = @as(i32, @intFromFloat(surface_y)) + 1;
+        if (ly < 0 or ly >= ni) return;
+        const canopy = tint(t.attr_leaves, 0.75 + r * 0.5, 0);
+        // gemischt: je dichter der Wald, desto eher gewinnt das Laub
+        if (r < cover) emit(g, c, base, counts, out, lx, ly, lz, canopy);
+        return;
+    }
+    if (r > @min(expect, 1.0)) return;
 
     const trunk = pick(t.attr_wood, rgb(96, 68, 44));
     // Zweite Zufallszahl je Baum: Art, Größe und Grünton

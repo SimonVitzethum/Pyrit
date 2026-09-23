@@ -18,6 +18,7 @@ const wl = @import("wayland.zig");
 const api = pyrit.api;
 const types = pyr.types;
 const cuda = pyrit.cuda;
+const blocktex = @import("blocktex.zig");
 
 var drv: cuda.Driver = undefined;
 
@@ -567,6 +568,54 @@ pub fn main(init: std.process.Init) !void {
     terrain.attr_water = pyrit.pyr_voxel_attribute(2, 40, 90, 140);
     terrain.attr_leaves = pyrit.pyr_voxel_attribute(0, 48, 112, 40);
     terrain.attr_wood = pyrit.pyr_voxel_attribute(0, 96, 68, 44);
+
+    // Blockarten bekommen eigene Materialien, damit jede ihre eigene 32x32-
+    // Kachel tragen kann (eine Kachel je Grundvoxel). Die Farbe steckt weiter
+    // im Voxelattribut, die Textur moduliert sie nur.
+    {
+        const mat_grass: u32 = 1;
+        const mat_rock: u32 = 3;
+        const mat_sand: u32 = 4;
+        const mat_snow: u32 = 5;
+        const mat_wood: u32 = 6;
+        const mat_leaves: u32 = 7;
+        terrain.attr_grass = pyrit.pyr_voxel_attribute(mat_grass, 84, 140, 58);
+        terrain.attr_dirt = pyrit.pyr_voxel_attribute(mat_grass, 122, 92, 62);
+        terrain.attr_rock = pyrit.pyr_voxel_attribute(mat_rock, 118, 112, 106);
+        terrain.attr_sand = pyrit.pyr_voxel_attribute(mat_sand, 214, 196, 142);
+        terrain.attr_snow = pyrit.pyr_voxel_attribute(mat_snow, 236, 240, 245);
+        terrain.attr_wood = pyrit.pyr_voxel_attribute(mat_wood, 96, 68, 44);
+        terrain.attr_leaves = pyrit.pyr_voxel_attribute(mat_leaves, 48, 112, 40);
+
+        const tex = try init.gpa.alloc(u8, blocktex.size * blocktex.size * 4);
+        defer init.gpa.free(tex);
+        const kinds = [_]struct { k: blocktex.Kind, m: u32, rough: f32 }{
+            .{ .k = .grass, .m = mat_grass, .rough = 0.95 },
+            .{ .k = .rock, .m = mat_rock, .rough = 0.85 },
+            .{ .k = .sand, .m = mat_sand, .rough = 0.98 },
+            .{ .k = .snow, .m = mat_snow, .rough = 0.75 },
+            .{ .k = .wood, .m = mat_wood, .rough = 0.9 },
+            .{ .k = .leaves, .m = mat_leaves, .rough = 0.95 },
+        };
+        for (kinds) |e| {
+            blocktex.make(e.k, tex);
+            var idx: u32 = 0;
+            req(pyrit.pyr_texture_create(@ptrCast(ctx), blocktex.size, blocktex.size, tex.ptr, &idx));
+            var m: types.Material = undefined;
+            pyrit.pyr_material_default(&m);
+            m.flags = types.material_voxel_color;
+            m.roughness = e.rough;
+            m.texture = idx;
+            m.texture_scale = 1; // eine Kachel je Grundvoxel
+            if (e.k == .leaves) {
+                m.subsurface = 0.35; // Laub leuchtet von hinten durch
+                m.subsurface_color = .{ 0.45, 0.85, 0.35 };
+            }
+            if (e.k == .snow) m.clearcoat = 0.25;
+            req(pyrit.pyr_material_set(@ptrCast(ctx), e.m, &m));
+        }
+    }
+
     var water: types.Material = undefined;
     pyrit.pyr_material_default(&water);
     water.flags = types.material_voxel_color | types.material_transparent | types.material_refract | types.material_waves;
