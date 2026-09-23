@@ -139,7 +139,13 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
     if (p.color != 0 or p.normal != 0 or p.albedo != 0) {
         if (found) |h| {
             var rng = shade.Rng.init(x, y, p.frame_index, 0);
-            const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask);
+            // Größe eines Bildschirmpixels in Welteinheiten am Treffer.
+            // Daraus wählt das Shading die Verkleinerungsstufe der Texturen
+            // und blendet die Detailnormale aus, bevor sie flimmern kann.
+            const cm = &p.cur.camera;
+            const px_per_unit = 2 * cm.scale[1] / @as(f32, @floatFromInt(@max(cm.height, 1)));
+            const footprint = if (cm.projection == types.projection_orthographic) px_per_unit else h.t * px_per_unit;
+            const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint);
             r.color = .{ sh.color[0], sh.color[1], sh.color[2], 1 };
             r.normal = .{ sh.normal[0], sh.normal[1], sh.normal[2], r.depth };
             // w trägt den diffusen Anteil für den indirekten Durchgang

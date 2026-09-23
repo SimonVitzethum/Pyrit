@@ -1532,13 +1532,75 @@ pub const Context = struct {
         var slot: u32 = 1;
         while (slot < self.texture_data.len and self.texture_data[slot] != 0) slot += 1;
         if (slot >= self.texture_data.len) return fail(error.Capacity, "keine Texturplätze mehr (max_textures erhöhen)", .{});
-        const buf = try self.devAlloc(need, "Textur");
+
+        // Verkleinerungsstufen erzeugen (Mittel über je 2x2). Ohne sie
+        // flimmert jede Textur in der Ferne, sobald sich etwas bewegt: dann
+        // fallen viele Texel auf ein Pixel und es wird jedes Mal ein anderes
+        // getroffen.
+        var levels: u32 = 1;
+        {
+            var lw = w;
+            var lh = h;
+            while (lw > 1 or lh > 1) : (levels += 1) {
+                lw = @max(lw / 2, 1);
+                lh = @max(lh / 2, 1);
+            }
+        }
+        var total: u64 = 0;
+        {
+            var lw = w;
+            var lh = h;
+            var k: u32 = 0;
+            while (k < levels) : (k += 1) {
+                total += @as(u64, lw) * lh;
+                lw = @max(lw / 2, 1);
+                lh = @max(lh / 2, 1);
+            }
+        }
+        const chain = try oom(self.gpa.alloc([4]u8, @intCast(total)));
+        defer self.gpa.free(chain);
+        @memcpy(std.mem.sliceAsBytes(chain[0..@intCast(@as(u64, w) * h)]), pixels[0..@intCast(need)]);
+        {
+            var src_off: u64 = 0;
+            var lw = w;
+            var lh = h;
+            var k: u32 = 1;
+            while (k < levels) : (k += 1) {
+                const dst_off = src_off + @as(u64, lw) * lh;
+                const nw = @max(lw / 2, 1);
+                const nh = @max(lh / 2, 1);
+                for (0..nh) |y| {
+                    for (0..nw) |x| {
+                        var acc: [4]u32 = .{ 0, 0, 0, 0 };
+                        var n: u32 = 0;
+                        for (0..2) |dy| {
+                            for (0..2) |dx| {
+                                const sx = @min(x * 2 + dx, lw - 1);
+                                const sy = @min(y * 2 + dy, lh - 1);
+                                const p4 = chain[@intCast(src_off + @as(u64, sy) * lw + sx)];
+                                inline for (0..4) |c| acc[c] += p4[c];
+                                n += 1;
+                            }
+                        }
+                        var out: [4]u8 = undefined;
+                        inline for (0..4) |c| out[c] = @intCast(acc[c] / n);
+                        chain[@intCast(dst_off + @as(u64, y) * nw + x)] = out;
+                    }
+                }
+                src_off = dst_off;
+                lw = nw;
+                lh = nh;
+            }
+        }
+
+        const buf = try self.devAlloc(total * 4, "Textur");
         errdefer _ = self.drv.cuMemFree_v2(buf);
-        try self.upload(buf, pixels[0..@intCast(need)]);
-        const entry = types.TextureData{ .data = buf, .width = w, .height = h };
+        try self.upload(buf, std.mem.sliceAsBytes(chain));
+        const entry = types.TextureData{ .data = buf, .width = w, .height = h, .levels = levels, .reserved_tex_data = 0 };
         try self.uploadValue(self.texture_table + @as(u64, slot) * @sizeOf(types.TextureData), &entry);
         self.texture_data[slot] = buf;
         if (slot >= self.texture_high) self.texture_high = slot + 1;
+        self.logf(3, "Textur {d}: {d}x{d}, {d} Stufen, {d} KiB", .{ slot, w, h, levels, total * 4 >> 10 });
         return slot;
     }
 
@@ -1798,6 +1860,7 @@ pub const Context = struct {
 
         if (fx.flags & api.postfx_dof != 0) {
             p.dof_autofocus = @intFromBool(fx.flags & api.postfx_autofocus != 0);
+            p.dof_far_only = @intFromBool(fx.flags & api.postfx_dof_far_only != 0);
             p.dof_focus = if (fx.focus_distance > 0) fx.focus_distance else 10;
             p.dof_strength = if (fx.dof_strength > 0) fx.dof_strength else 3;
             p.dof_max_coc = if (fx.dof_max_coc > 0) fx.dof_max_coc else 12;

@@ -97,34 +97,62 @@ pub fn surface(s: *const types.Scene, attribute: u32) Surface {
 // Texturhardware, damit derselbe Code später auch auf AMD läuft.
 // ---------------------------------------------------------------------------
 
-fn texel(t: *const types.TextureData, x: i32, y: i32) Vec3 {
-    const w: i32 = @intCast(t.width);
-    const h: i32 = @intCast(t.height);
-    const cx: u32 = @intCast(@mod(x, w));
-    const cy: u32 = @intCast(@mod(y, h));
-    const px = @as([*]const [4]u8, @ptrFromInt(t.data))[@as(u64, cy) * t.width + cx];
+/// Lage und Größe einer Verkleinerungsstufe im Puffer
+fn levelInfo(t: *const types.TextureData, lod: u32) struct { off: u64, w: u32, h: u32 } {
+    var off: u64 = 0;
+    var w = t.width;
+    var h = t.height;
+    var k: u32 = 0;
+    while (k < lod) : (k += 1) {
+        off += @as(u64, w) * h;
+        w = @max(w / 2, 1);
+        h = @max(h / 2, 1);
+    }
+    return .{ .off = off, .w = w, .h = h };
+}
+
+fn texel(t: *const types.TextureData, off: u64, w: u32, h: u32, x: i32, y: i32) Vec3 {
+    const cx: u32 = @intCast(@mod(x, @as(i32, @intCast(w))));
+    const cy: u32 = @intCast(@mod(y, @as(i32, @intCast(h))));
+    const px = @as([*]const [4]u8, @ptrFromInt(t.data))[off + @as(u64, cy) * w + cx];
     const inv = 1.0 / 255.0;
     return .{ @as(f32, @floatFromInt(px[0])) * inv, @as(f32, @floatFromInt(px[1])) * inv, @as(f32, @floatFromInt(px[2])) * inv };
 }
 
-fn sampleTexture(s: *const types.Scene, index: u32, u: f32, v: f32) Vec3 {
-    if (index == 0 or index >= s.texture_count) return .{ 1, 1, 1 };
-    const tt: [*]const types.TextureData = @ptrFromInt(s.textures);
-    const t = &tt[index];
-    if (t.data == 0) return .{ 1, 1, 1 };
-    const fx = u * @as(f32, @floatFromInt(t.width)) - 0.5;
-    const fy = v * @as(f32, @floatFromInt(t.height)) - 0.5;
+fn sampleLevel(t: *const types.TextureData, lod: u32, u: f32, v: f32) Vec3 {
+    const li = levelInfo(t, lod);
+    const fx = u * @as(f32, @floatFromInt(li.w)) - 0.5;
+    const fy = v * @as(f32, @floatFromInt(li.h)) - 0.5;
     const x0: i32 = @intFromFloat(@floor(fx));
     const y0: i32 = @intFromFloat(@floor(fy));
     const tx = fx - @floor(fx);
     const ty = fy - @floor(fy);
-    const a = texel(t, x0, y0);
-    const b = texel(t, x0 + 1, y0);
-    const c = texel(t, x0, y0 + 1);
-    const d = texel(t, x0 + 1, y0 + 1);
+    const a = texel(t, li.off, li.w, li.h, x0, y0);
+    const b = texel(t, li.off, li.w, li.h, x0 + 1, y0);
+    const c = texel(t, li.off, li.w, li.h, x0, y0 + 1);
+    const d = texel(t, li.off, li.w, li.h, x0 + 1, y0 + 1);
     const top = a + (b - a) * splat(tx);
     const bot = c + (d - c) * splat(tx);
     return top + (bot - top) * splat(ty);
+}
+
+/// `texels_per_pixel`: wie viele Texel der Grundstufe auf ein Bildschirmpixel
+/// fallen. Darüber wird die Verkleinerungsstufe gewählt und zwischen zwei
+/// Stufen überblendet – ohne das flimmert jede Textur in der Ferne.
+fn sampleTexture(s: *const types.Scene, index: u32, u: f32, v: f32, texels_per_pixel: f32) Vec3 {
+    if (index == 0 or index >= s.texture_count) return .{ 1, 1, 1 };
+    const tt: [*]const types.TextureData = @ptrFromInt(s.textures);
+    const t = &tt[index];
+    if (t.data == 0) return .{ 1, 1, 1 };
+    const levels = @max(t.levels, 1);
+    if (levels == 1 or texels_per_pixel <= 1) return sampleLevel(t, 0, u, v);
+    const lod_f = @min(fm.log2(texels_per_pixel), @as(f32, @floatFromInt(levels - 1)));
+    const lo: u32 = @intFromFloat(@floor(lod_f));
+    const frac = lod_f - @floor(lod_f);
+    const a = sampleLevel(t, lo, u, v);
+    if (lo + 1 >= levels or frac <= 0) return a;
+    const b = sampleLevel(t, lo + 1, u, v);
+    return a + (b - a) * splat(frac);
 }
 
 /// Flächenparameter eines Voxeltreffers: welche zwei Weltachsen die Fläche
@@ -178,7 +206,7 @@ fn valueNoise2(x: f32, y: f32) f32 {
 
 /// Oberfläche am Treffer: wie `surface`, zusätzlich mit Textur und
 /// Detailnormale. `p` ist der Weltpunkt, `n` die geometrische Normale.
-pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3) Surface {
+pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3, footprint: f32) Surface {
     var sf = surface(s, attribute);
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     const m = &mats[attribute & 0xFF];
@@ -186,24 +214,36 @@ pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3) Surfac
 
     const scale = if (m.texture_scale > 0) m.texture_scale else 1;
     const uv = faceUv(p, n, scale);
-    if (m.texture != 0) sf.albedo *= sampleTexture(s, m.texture, uv[0], uv[1]);
+    // Wie viele Texel auf ein Pixel fallen: Kantenlänge einer Kachel in
+    // Welteinheiten gegen die Größe eines Pixels an dieser Stelle.
+    var tpp: f32 = 0;
+    if (footprint > 0 and (m.texture != 0 or m.normal_texture != 0)) {
+        const tt: [*]const types.TextureData = @ptrFromInt(s.textures);
+        const idx = if (m.texture != 0) m.texture else m.normal_texture;
+        if (idx < s.texture_count) tpp = footprint / scale * @as(f32, @floatFromInt(tt[idx].width));
+    }
+    if (m.texture != 0) sf.albedo *= sampleTexture(s, m.texture, uv[0], uv[1], tpp);
 
     // Detailnormale: aus der Normalentextur oder erzeugt
     var du: f32 = 0;
     var dv: f32 = 0;
     if (m.normal_texture != 0) {
-        const t = sampleTexture(s, m.normal_texture, uv[0], uv[1]);
+        const t = sampleTexture(s, m.normal_texture, uv[0], uv[1], tpp);
         du = (t[0] * 2 - 1) * @max(m.normal_strength, 1);
         dv = (t[1] * 2 - 1) * @max(m.normal_strength, 1);
     } else if (m.normal_strength != 0) {
         const ns = if (m.normal_scale > 0) m.normal_scale else 1;
+        // Detail ausblenden, sobald mehr als eine Rauschperiode auf ein Pixel
+        // fällt: sonst flimmert die Fläche in der Ferne bei jeder Bewegung.
+        const fade = if (footprint > 0) @min(@max(ns / @max(2 * footprint, 1e-6), 0), 1) else 1;
+        if (fade <= 0.01) return sf;
         const nu = p[0] / ns;
         const nv = p[1] / ns;
         const nw = p[2] / ns;
         const e: f32 = 0.5;
         // Steigung des Rauschens in den beiden Flächenrichtungen
-        du = (valueNoise2(nu + e, nv + nw) - valueNoise2(nu - e, nv + nw)) * m.normal_strength;
-        dv = (valueNoise2(nu, nv + nw + e) - valueNoise2(nu, nv + nw - e)) * m.normal_strength;
+        du = (valueNoise2(nu + e, nv + nw) - valueNoise2(nu - e, nv + nw)) * m.normal_strength * fade;
+        dv = (valueNoise2(nu, nv + nw + e) - valueNoise2(nu, nv + nw - e)) * m.normal_strength * fade;
     }
     if (du != 0 or dv != 0) {
         const tg = faceTangents(n);
@@ -703,12 +743,12 @@ pub const Shaded = struct {
 /// Farbe des Treffers h des Strahls o + t d.
 /// `mask`: Instanzen, die Sekundärstrahlen (Schatten, GI, Reflexion) sehen –
 /// ohne transparente Ebene.
-pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32) Shaded {
+pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32, footprint: f32) Shaded {
     const l: *const types.Lighting = @ptrFromInt(s.lighting);
     const inst = &tr.instances(s)[h.instance];
     const n = worldNormal(inst, h.face);
     const p = o + d * splat(h.t) + n * splat(1e-3 * voxelSize(inst));
-    const sf = surfaceAt(s, h.attribute, p, n);
+    const sf = surfaceAt(s, h.attribute, p, n, footprint);
     // Beleuchtet wird mit der gestörten Normale, versetzt und weiterverfolgt
     // mit der geometrischen – sonst würden Strahlen in die Fläche laufen.
     const ns = if (sf.normal[0] != 0 or sf.normal[1] != 0 or sf.normal[2] != 0) sf.normal else n;
@@ -781,7 +821,8 @@ pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
                 const ginst = &tr.instances(s)[g.instance];
                 const gn = worldNormal(ginst, g.face);
                 const hp = op + gd * splat(g.t);
-                const gsf = surfaceAt(s, g.attribute, hp, gn);
+                // Indirekte Treffer brauchen kein Detail: gröbste Stufe
+                const gsf = surfaceAt(s, g.attribute, hp, gn, 1e6);
                 const gp = hp + gn * splat(1e-3 * voxelSize(ginst));
                 acc += clampContribution(l, throughput * r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask)));
                 if (b + 1 >= bounces) break;

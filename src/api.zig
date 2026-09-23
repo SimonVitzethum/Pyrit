@@ -176,6 +176,8 @@ pub const postfx_auto_exposure: u32 = 0x8;
 pub const postfx_grade: u32 = 0x10;
 /// Schärfeebene aus der Tiefe in der Bildmitte nachführen
 pub const postfx_autofocus: u32 = 0x20;
+/// nur hinter der Schärfeebene unscharf zeichnen, Vordergrund bleibt scharf
+pub const postfx_dof_far_only: u32 = 0x40;
 
 /// Kamera- und Bildeffekte auf dem fertigen Bild. Alle 0 = aus; die Werte
 /// unten sind die Vorgaben, wenn ein Feld 0 bleibt.

@@ -137,6 +137,8 @@ typedef struct PyrTextureData {
     uint64_t data;
     uint32_t width;
     uint32_t height;
+    uint32_t levels;   /* Verkleinerungsstufen, hintereinander im Puffer */
+    uint32_t reserved_tex_data;
 } PyrTextureData;
 
 typedef struct PyrScene {
@@ -563,6 +565,7 @@ PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g,
 #define PYR_POSTFX_AUTO_EXPOSURE  0x8u
 #define PYR_POSTFX_GRADE          0x10u
 #define PYR_POSTFX_AUTOFOCUS      0x20u
+#define PYR_POSTFX_DOF_FAR_ONLY   0x40u
 
 /* Kamera- und Bildeffekte auf dem fertigen Bild in Ausgabeauflösung.
  * Felder auf 0 nehmen die jeweilige Vorgabe. */

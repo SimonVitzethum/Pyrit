@@ -223,6 +223,10 @@ pub const TextureData = extern struct {
     data: u64,
     width: u32,
     height: u32,
+    /// Anzahl der Verkleinerungsstufen (1 = nur die Grundstufe). Sie liegen
+    /// hintereinander im selben Puffer, jede halb so groß wie die vorige.
+    levels: u32,
+    reserved_tex_data: u32,
 };
 
 pub const max_lights: u32 = 64;
@@ -712,6 +716,8 @@ pub const PostFxParams = extern struct {
     dof_max_coc: f32,
     /// Schärfeebene aus der Tiefe in der Bildmitte nehmen
     dof_autofocus: u32,
+    /// nur hinter der Schärfeebene unscharf zeichnen (Vordergrund bleibt scharf)
+    dof_far_only: u32,
     /// Bewegungsunschärfe
     blur_scale: f32,
     blur_max: f32,

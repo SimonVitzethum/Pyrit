@@ -244,7 +244,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--bloom")) {
             fx_flags |= api.postfx_bloom;
         } else if (std.mem.eql(u8, a, "--dof")) {
-            fx_flags |= api.postfx_dof | api.postfx_autofocus;
+            fx_flags |= api.postfx_dof | api.postfx_autofocus | api.postfx_dof_far_only;
         } else if (std.mem.eql(u8, a, "--motion-blur")) {
             fx_flags |= api.postfx_motion_blur;
         } else if (std.mem.eql(u8, a, "--auto-exposure")) {
@@ -651,6 +651,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var edit_ms: f64 = 0;
     var edit_calls: u64 = 0;
     var flick_sum: f64 = 0;
+    var pump_sum: f64 = 0;
     var flick_n: u64 = 0;
     var have_prev = false;
 
@@ -800,10 +801,22 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
             cu(drv.cuMemcpyDtoH_v2(cur_px.ptr, ldr, np * 4));
             if (have_prev) {
                 var sum: f64 = 0;
+                var mean_a: f64 = 0;
+                var mean_b: f64 = 0;
                 for (cur_px, prev_px) |a, b| {
-                    inline for (0..3) |k| sum += @abs(@as(f64, @floatFromInt(a[k])) - @as(f64, @floatFromInt(b[k])));
+                    inline for (0..3) |k| {
+                        sum += @abs(@as(f64, @floatFromInt(a[k])) - @as(f64, @floatFromInt(b[k])));
+                        mean_a += @floatFromInt(a[k]);
+                        mean_b += @floatFromInt(b[k]);
+                    }
                 }
-                flick_sum += sum / @as(f64, @floatFromInt(np * 3));
+                const n3: f64 = @floatFromInt(np * 3);
+                flick_sum += sum / n3;
+                // Getrennt: verschiebt sich die *mittlere* Helligkeit? Das ist
+                // kein örtliches Rauschen, sondern ein Pumpen des ganzen
+                // Bildes – das Auge sieht es viel eher als der Mittelwert
+                // über Einzelpixel.
+                pump_sum += @abs(mean_a - mean_b) / n3;
                 flick_n += 1;
             }
             @memcpy(prev_px, cur_px);
@@ -814,7 +827,8 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         std.debug.print("Einzeländerungen: {d} Aufrufe, pyr_world_edit im Mittel {d:.4} ms auf dem Hauptthread\n", .{ edit_calls, edit_ms / @as(f64, @floatFromInt(edit_calls)) });
     }
     if (flicker and flick_n > 0) {
-        std.debug.print("Flimmern: {d:.3} mittlerer Unterschied je Kanal zwischen aufeinanderfolgenden Bildern ({d} Paare)\n", .{ flick_sum / @as(f64, @floatFromInt(flick_n)), flick_n });
+        const fn_f: f64 = @floatFromInt(flick_n);
+        std.debug.print("Flimmern: {d:.3} je Pixel, Helligkeitspumpen: {d:.4} ({d} Paare)\n", .{ flick_sum / fn_f, pump_sum / fn_f, flick_n });
     }
     const all = msSince(init, t_flight);
     std.debug.print("{d} Frames {d}x{d} -> {d}x{d} im Flug: {d:.2} ms pro Frame gesamt ({d} mit Zwischenbild), Welt-Update Mittel {d:.2} ms, max {d:.2} ms\n", .{ frames, w, h, out_w, out_h, all / @as(f64, @floatFromInt(@max(frames, 1))), fg_frames, update_ms / @as(f64, @floatFromInt(@max(frames, 1))), update_max });

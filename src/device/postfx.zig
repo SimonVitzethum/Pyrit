@@ -90,6 +90,10 @@ inline fn cocOf(p: *const types.PostFxParams, depth: f32, focus: f32) f32 {
     if (!(depth < 1e30)) return @min(p.dof_strength, p.dof_max_coc);
     const d = @max(depth, 1e-3);
     const f = @max(focus, 1e-3);
+    // Vor der Schärfeebene auf Wunsch scharf lassen: in einem Spiel steht die
+    // Kamera meist dicht an Geometrie, und ein unscharfer Vordergrund stört
+    // dort mehr als er nützt.
+    if (p.dof_far_only != 0 and d <= f) return 0;
     const c = p.dof_strength * (d - f) / d;
     return @min(@abs(c), p.dof_max_coc);
 }

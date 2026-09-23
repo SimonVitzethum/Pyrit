@@ -85,7 +85,7 @@ const Win = struct {
     zoom_out: bool = false,
     toggle_fg: bool = false,
     /// Umschalter für die Bildeffekte (Tasten B, T, U, N, G)
-    toggle: [5]bool = .{false} ** 5,
+    toggle: [7]bool = .{false} ** 7,
 
     fn marshal(self: *Win, p: *wl.Proxy, op: u32, iface: ?*const wl.Interface, args: anytype) ?*wl.Proxy {
         const ver = self.c.proxy_get_version(p);
@@ -245,6 +245,8 @@ fn onKey(_: ?*anyopaque, _: *wl.Proxy, _: u32, _: u32, key: u32, state: u32) cal
         wl.key_u => W.toggle[2] = true,
         wl.key_n => W.toggle[3] = true,
         wl.key_g => W.toggle[4] = true,
+        wl.key_k => W.toggle[5] = true,
+        wl.key_j => W.toggle[6] = true,
         else => {},
     }
 }
@@ -684,11 +686,12 @@ pub fn main(init: std.process.Init) !void {
     post.denoise_iterations = 4;
     post.exposure = 1.0;
     post.clamp_sigma = 1.5;
+    post.temporal_alpha = 0.05;
     post.flags = api.post_bgra;
     // Kamera- und Bildeffekte
     var fxi = std.mem.zeroes(api.PostFx);
     fxi.flags = api.postfx_bloom | api.postfx_auto_exposure | api.postfx_grade |
-        api.postfx_dof | api.postfx_autofocus | api.postfx_motion_blur;
+        api.postfx_dof | api.postfx_autofocus | api.postfx_dof_far_only | api.postfx_motion_blur;
     fxi.bloom_strength = 0.06;
     fxi.bloom_threshold = 1.2;
     fxi.dof_strength = 2.5;
@@ -742,6 +745,19 @@ pub fn main(init: std.process.Init) !void {
             light.gi_bounces = if (light.gi_bounces > 1) 1 else 3;
             req(pyrit.pyr_set_lighting(@ptrCast(ctx), &light));
             W.toggle[4] = false;
+        }
+        if (W.toggle[5]) {
+            // Länge der zeitlichen Mittelung: 20, 50, 100 Frames
+            post.temporal_alpha = switch (@as(u32, @intFromFloat(@round(1 / @max(post.temporal_alpha, 0.05))))) {
+                0...20 => 0.02,
+                21...50 => 0.01,
+                else => 0.05,
+            };
+            W.toggle[5] = false;
+        }
+        if (W.toggle[6]) {
+            post.denoise_iterations = if (post.denoise_iterations >= 6) 2 else post.denoise_iterations + 2;
+            W.toggle[6] = false;
         }
         if (W.zoom_in) {
             voxel_px = @max((if (voxel_px == 0) 4 else voxel_px) * 0.8, 1);
@@ -850,7 +866,7 @@ pub fn main(init: std.process.Init) !void {
             var st: api.WorldStats = undefined;
             req(pyrit.pyr_world_stats(@ptrCast(world), &st));
             var buf: [256]u8 = undefined;
-            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · Bloom {s}, Schärfe {s}, Unschärfe {s}, Nebel {s}, GI {d}x", .{
+            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · Bloom {s}, Schärfe {s}, Unschärfe {s}, Nebel {s}, GI {d}x, Mittelung {d} Frames, Filter {d}", .{
                 frame_ms,                                                     1000 / @max(frame_ms, 0.001),
                 if (fg) " +Zwischenbild" else "",                              rw,
                 rh,                                                            st.resident_chunks,
@@ -860,6 +876,8 @@ pub fn main(init: std.process.Init) !void {
                 if (fxi.flags & api.postfx_motion_blur != 0) "an" else "aus",
                 if (light.fog_density > 0) "an" else "aus",
                 @max(light.gi_bounces, 1),
+                @as(u32, @intFromFloat(@round(1 / @max(post.temporal_alpha, 1e-3)))),
+                post.denoise_iterations,
             });
             _ = W.marshal(W.toplevel.?, wl.toplevel_set_title, null, .{title.ptr});
         }
