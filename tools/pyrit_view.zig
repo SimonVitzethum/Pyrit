@@ -458,6 +458,8 @@ pub fn main(init: std.process.Init) !void {
     var fg = false;
     var half_gi = true;
     var vsync = true;
+    // Supersampling: gerendert wird in super-facher Fenstergröße
+    var super: u32 = 1;
     // Selbstprüfung des Fensterpfads ohne GPU (Testbild statt Rendern)
     var check = false;
     var max_frames: u32 = 0;
@@ -489,6 +491,9 @@ pub fn main(init: std.process.Init) !void {
             fg = true;
         } else if (std.mem.eql(u8, a, "--check")) {
             check = true;
+        } else if (std.mem.eql(u8, a, "--super") and i + 1 < args.len) {
+            i += 1;
+            super = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--no-vsync")) {
             vsync = false;
         } else if (std.mem.eql(u8, a, "--no-half-gi")) {
@@ -805,9 +810,12 @@ pub fn main(init: std.process.Init) !void {
         win_w = @max(W.width, 16);
         win_h = @max(W.height, 16);
         try resizeBuffers(win_w, win_h);
-        const rw = @max(win_w / scale, 16);
-        const rh = @max(win_h / scale, 16);
-        tgs.resize(rw, rh, win_w, win_h);
+        const ss = @max(super, 1);
+        const post_w = win_w * ss;
+        const post_h = win_h * ss;
+        const rw = @max(post_w / scale, 16);
+        const rh = @max(post_h / scale, 16);
+        tgs.resize(rw, rh, post_w, post_h);
         const frame_bytes: usize = @as(usize, win_w) * win_h * 4;
 
         // Kamera setzen (die Welt wählt danach ihr LOD)
@@ -829,8 +837,9 @@ pub fn main(init: std.process.Init) !void {
         req(pyrit.pyr_commit(@ptrCast(ctx), &fi));
         req(pyrit.pyr_render(@ptrCast(ctx), view, &cam, &tgs.tg));
         post.output_ldr = tgs.ldr;
-        post.output_width = win_w;
-        post.output_height = win_h;
+        post.output_width = post_w;
+        post.output_height = post_h;
+        fxi.supersample = ss;
         req(pyrit.pyr_postprocess(@ptrCast(ctx), view, &tgs.tg, &post));
 
         if (fg and frame > 2) {
@@ -867,18 +876,17 @@ pub fn main(init: std.process.Init) !void {
             var st: api.WorldStats = undefined;
             req(pyrit.pyr_world_stats(@ptrCast(world), &st));
             var buf: [256]u8 = undefined;
-            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · Bloom {s}, Schärfe {s}, Unschärfe {s}, Nebel {s}, GI {d}x, Mittelung {d} Frames, Filter {d}", .{
+            const title = try std.fmt.bufPrintZ(&buf, "Pyrit – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · Bloom {s}, Nebel {s}, GI {d}x, Mittelung {d} Frames, Filter {d}, Supersampling {d}x", .{
                 frame_ms,                                                     1000 / @max(frame_ms, 0.001),
                 if (fg) " +Zwischenbild" else "",                              rw,
                 rh,                                                            st.resident_chunks,
                 @as(f64, @floatFromInt(st.bytes)) / (1 << 20),
                 if (fxi.flags & api.postfx_bloom != 0) "an" else "aus",
-                if (fxi.flags & api.postfx_dof != 0) "an" else "aus",
-                if (fxi.flags & api.postfx_motion_blur != 0) "an" else "aus",
                 if (light.fog_density > 0) "an" else "aus",
                 @max(light.gi_bounces, 1),
                 @as(u32, @intFromFloat(@round(1 / @max(post.temporal_alpha, 1e-3)))),
                 post.denoise_iterations,
+                ss,
             });
             _ = W.marshal(W.toplevel.?, wl.toplevel_set_title, null, .{title.ptr});
         }

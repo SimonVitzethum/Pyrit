@@ -215,7 +215,11 @@ pub const PostFx = extern struct {
     /// 3D-LUT im Anzeigeraum: RGBA8, Kantenlänge lut_size, Reihenfolge x+y·n+z·n²
     lut: u64 = 0,
     lut_size: u32 = 0,
-    reserved_fx: u32 = 0,
+    /// Supersampling: gerendert wird in `supersample`-facher Auflösung
+    /// (output_width/height mal diesem Faktor), der letzte Schritt mittelt
+    /// zusammen. 0/1 = aus. Kostet supersample² mal Strahlen, ist aber das
+    /// einzige wirksame Mittel gegen wandernde Kanten bei Voxelgeometrie.
+    supersample: u32 = 0,
 };
 
 /// TAAU (auch ohne Skalierung: TAA mit Subpixel-Rekonstruktion)

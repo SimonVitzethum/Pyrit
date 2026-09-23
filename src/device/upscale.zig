@@ -145,10 +145,10 @@ pub fn taau(p: *const types.UpscaleParams, ox: u32, oy: u32) void {
             const c = ldColor(p, j);
             const ddx = (@as(f32, @floatFromInt(x)) + 0.5 + p.jitter[0] - sx) * kscale;
             const ddy = (@as(f32, @floatFromInt(y)) + 0.5 + p.jitter[1] - sy) * kscale;
-            const wgt = fm.exp(-2.29 * (ddx * ddx + ddy * ddy)) * tonemapWeight(c);
+            const wgt = fm.exp(-p.kernel_sharp * (ddx * ddx + ddy * ddy)) * tonemapWeight(c);
             inline for (0..3) |k| sum[k] += c[k] * wgt;
             wsum += wgt;
-            wmax = @max(wmax, fm.exp(-2.29 * (ddx * ddx + ddy * ddy)));
+            wmax = @max(wmax, fm.exp(-p.kernel_sharp * (ddx * ddx + ddy * ddy)));
             const yc = toYCoCg(c);
             inline for (0..3) |k| {
                 m1[k] += yc[k];

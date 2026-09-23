@@ -594,7 +594,11 @@ typedef struct PyrPostFx {
     float    gain[3];               /* 0 = 1 */
     uint64_t lut;                   /* 3D-LUT (RGBA8) im Anzeigeraum, 0 = keine */
     uint32_t lut_size;              /* Kantenlaenge */
-    uint32_t reserved_fx;
+    /* Supersampling: gerendert wird in diesem Faktor hoeherer Aufloesung,
+     * der letzte Schritt mittelt zusammen. 0/1 = aus. Kostet den Faktor im
+     * Quadrat an Strahlen, ist aber das einzige wirksame Mittel gegen
+     * wandernde Kanten bei Voxelgeometrie. */
+    uint32_t supersample;
 } PyrPostFx;
 
 typedef struct PyrPostInfo {

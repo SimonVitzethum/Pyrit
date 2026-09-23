@@ -1967,7 +1967,12 @@ pub const Context = struct {
         p.color = src;
         p.out_hdr = info.output_hdr;
         p.out_ldr = info.output_ldr;
-        try self.fxLaunch(self.fn_fx_resolve, &p, n);
+        const ss: u32 = @max(fx.supersample, 1);
+        p.supersample = ss;
+        p.out_width = w / ss;
+        p.out_height = h / ss;
+        const out_pixels = if (ss > 1) @as(u64, p.out_width) * p.out_height else n;
+        try self.fxLaunch(self.fn_fx_resolve, &p, out_pixels);
     }
 
     fn freeDlss(self: *Context, v: *ViewSlot) void {
@@ -2242,6 +2247,7 @@ pub const Context = struct {
         // 2,5 statt der früheren 1,25: gemessen weniger Unruhe an Voxelkanten
         // (stärkste Sprünge 10,3 -> 9,4 Stufen) und bei Bewegung sogar minimal
         // schärfer (8,64 -> 8,80). Enger zu begrenzen kostet also nur.
+        u.kernel_sharp = if (std.c.getenv("PYRIT_TAAU_KERNEL")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 2.29) else 2.29;
         u.clamp_sigma = if (std.c.getenv("PYRIT_TAAU_CLAMP")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 2.5) else 2.5;
         u.out_hdr = info.output_hdr;
         u.out_ldr = info.output_ldr;
@@ -2306,6 +2312,7 @@ pub const Context = struct {
         // 2,5 statt der früheren 1,25: gemessen weniger Unruhe an Voxelkanten
         // (stärkste Sprünge 10,3 -> 9,4 Stufen) und bei Bewegung sogar minimal
         // schärfer (8,64 -> 8,80). Enger zu begrenzen kostet also nur.
+        u.kernel_sharp = if (std.c.getenv("PYRIT_TAAU_KERNEL")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 2.29) else 2.29;
         u.clamp_sigma = if (std.c.getenv("PYRIT_TAAU_CLAMP")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 2.5) else 2.5;
         u.out_hdr = info.output_hdr;
         u.out_ldr = info.output_ldr;

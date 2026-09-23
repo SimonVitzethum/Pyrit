@@ -151,6 +151,8 @@ pub fn main(init: std.process.Init) !void {
     var firefly: f32 = 0;
     var alpha: f32 = 0;
     var no_shadows = false;
+    var no_jitter = false;
+    var super: u32 = 1;
     var bounces: u32 = 0;
     var fog: f32 = 0;
     var async_post = false;
@@ -231,6 +233,11 @@ pub fn main(init: std.process.Init) !void {
             fog = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--async-post")) {
             async_post = true;
+        } else if (std.mem.eql(u8, a, "--super") and i + 1 < args.len) {
+            i += 1;
+            super = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--no-jitter")) {
+            no_jitter = true;
         } else if (std.mem.eql(u8, a, "--no-taau")) {
             upscaler = api.upscaler_none;
         } else if (std.mem.eql(u8, a, "--no-shadows")) {
@@ -313,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, no_jitter, super, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -455,6 +462,48 @@ pub fn main(init: std.process.Init) !void {
     _ = drv.cuDevicePrimaryCtxRelease_v2(dev);
 }
 
+/// Box-Mittel von `src` (sw x sh) nach `dst` (dw x dh); sw/dw muss ganzzahlig sein
+fn downsample(src: []const [4]u8, sw: u32, sh: u32, dst: [][4]u8, dw: u32, dh: u32) void {
+    if (sw == dw and sh == dh) {
+        @memcpy(dst, src[0..dst.len]);
+        return;
+    }
+    const fx = sw / dw;
+    const fy = sh / dh;
+    const n: u32 = fx * fy;
+    for (0..dh) |y| {
+        for (0..dw) |x| {
+            var acc: [4]u32 = .{ 0, 0, 0, 0 };
+            for (0..fy) |sy| {
+                for (0..fx) |sx| {
+                    const p4 = src[(y * fy + sy) * sw + (x * fx + sx)];
+                    inline for (0..4) |k| acc[k] += p4[k];
+                }
+            }
+            var o: [4]u8 = undefined;
+            inline for (0..4) |k| o[k] = @intCast(acc[k] / n);
+            dst[y * dw + x] = o;
+        }
+    }
+}
+
+fn savePpmScaled(init: std.process.Init, ldr: u64, sw: u32, sh: u32, dw: u32, dh: u32, out_path: []const u8) !void {
+    const gpa = init.gpa;
+    const src = try gpa.alloc([4]u8, @as(usize, sw) * sh);
+    defer gpa.free(src);
+    cu(drv.cuMemcpyDtoH_v2(src.ptr, ldr, src.len * 4));
+    const dst = try gpa.alloc([4]u8, @as(usize, dw) * dh);
+    defer gpa.free(dst);
+    downsample(src, sw, sh, dst, dw, dh);
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(gpa);
+    var hb: [64]u8 = undefined;
+    try file.appendSlice(gpa, try std.fmt.bufPrint(&hb, "P6\n{d} {d}\n255\n", .{ dw, dh }));
+    for (dst) |q| try file.appendSlice(gpa, q[0..3]);
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = file.items });
+    std.debug.print("Bild: {s}\n", .{out_path});
+}
+
 fn savePpm(init: std.process.Init, ldr: u64, w: u32, h: u32, out_path: []const u8) !void {
     const gpa = init.gpa;
     const n: usize = @as(usize, w) * h;
@@ -475,9 +524,14 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, bounces: u32, fog: f32, async_post: bool) !void {
-    const w = out_w / scale;
-    const h = out_h / scale;
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, no_jitter: bool, super: u32, bounces: u32, fog: f32, async_post: bool) !void {
+    // Supersampling: alles läuft in super-facher Auflösung, erst ganz am Ende
+    // wird gemittelt. Damit entscheidet sich die Deckung einer Voxelkante
+    // schon *innerhalb* eines Frames statt über die Zeit.
+    const ow = out_w * @max(super, 1);
+    const oh = out_h * @max(super, 1);
+    const w = ow / scale;
+    const h = oh / scale;
     var terrain: api.TerrainInfo = undefined;
     pyrit.pyr_terrain_default(&terrain);
     // Wasser (Material 2, durchsichtig) und Bäume (Material 0)
@@ -625,7 +679,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         if (coarse_secondary) tgs[si].secondary_mask = 0x2;
     }
     var tg = tgs[0];
-    const n_out: usize = @as(usize, out_w) * out_h;
+    const n_out: usize = @as(usize, ow) * oh;
     const ldr = devAlloc(n_out * 4);
     const ldr_fg = devAlloc(n_out * 4);
     defer {
@@ -643,9 +697,9 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     post.denoise_iterations = denoise;
     post.exposure = 1.0;
     post.clamp_sigma = clamp_sigma;
-    post.output_width = out_w;
+    post.output_width = ow;
     post.upscaler = upscaler;
-    post.output_height = out_h;
+    post.output_height = oh;
     var fxi = std.mem.zeroes(api.PostFx);
     fxi.flags = fx_flags;
     fxi.saturation = 1.05;
@@ -667,6 +721,8 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var pump_sum: f64 = 0;
     var loud_sum: f64 = 0;
     var diff_map: []u8 = &.{};
+    var src_px: []([4]u8) = &.{};
+    defer if (src_px.len != 0) init.gpa.free(src_px);
     defer if (diff_map.len != 0) init.gpa.free(diff_map);
     var p999_sum: f64 = 0;
     var flick_n: u64 = 0;
@@ -702,7 +758,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         pyrit.pyr_camera_perspective(&cam, 1.0, w, h, 0.1);
         var j: [2]f32 = undefined;
         pyrit.pyr_jitter_halton(f, &j);
-        cam.jitter = j;
+        cam.jitter = if (no_jitter) .{ 0, 0 } else j;
         // Laufende Einzeländerungen von der CPU: je Frame ein Voxel, an
         // wandernder Stelle – der Fall "einzelne Chunks kommen nach".
         if (edit_stream and f > 0) {
@@ -811,13 +867,16 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
 
         if (flicker and f + 8 >= total) {
             const np: usize = @as(usize, out_w) * out_h;
+            const nsrc: usize = @as(usize, ow) * oh;
             if (cur_px.len == 0) {
                 cur_px = try init.gpa.alloc([4]u8, np);
                 prev_px = try init.gpa.alloc([4]u8, np);
+                src_px = try init.gpa.alloc([4]u8, nsrc);
                 diff_map = try init.gpa.alloc(u8, np);
                 @memset(diff_map, 0);
             }
-            cu(drv.cuMemcpyDtoH_v2(cur_px.ptr, ldr, np * 4));
+            cu(drv.cuMemcpyDtoH_v2(src_px.ptr, ldr, nsrc * 4));
+            downsample(src_px, ow, oh, cur_px, out_w, out_h);
             if (have_prev) {
                 var sum: f64 = 0;
                 var mean_a: f64 = 0;
@@ -899,7 +958,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     const nf: f64 = @floatFromInt(@max(frames, 1));
     if (profile) std.debug.print("Aufteilung: Commit {d:.2} ms, Rendern {d:.2} ms, Nachbearbeitung {d:.2} ms\n", .{ prof[0] / nf, prof[1] / nf, prof[2] / nf });
     std.debug.print("Am Ende: {d} Chunks resident, {d} sichtbar, {d} ausstehend, {d:.1} MiB, Ziel {d:.1} px/Voxel, gröbste Stufe {d}, Überläufe {d}\n", .{ st.resident_chunks, st.visible_chunks, st.pending_chunks, @as(f64, @floatFromInt(st.bytes)) / (1 << 20), st.voxel_pixels, st.top_lod, st.overflow_chunks });
-    try savePpm(init, ldr, out_w, out_h, out_path);
+    try savePpmScaled(init, ldr, ow, oh, out_w, out_h, out_path);
     if (fg_frames > 0) {
         var buf: [512]u8 = undefined;
         const fg_path = try std.fmt.bufPrint(&buf, "{s}.fg.ppm", .{out_path});

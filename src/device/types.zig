@@ -763,6 +763,11 @@ pub const PostFxParams = extern struct {
     bgra: u32,
     out_hdr: u64,
     out_ldr: u64,
+    /// Supersampling: die ganze Kette läuft in `supersample`-facher Auflösung,
+    /// der letzte Schritt mittelt je supersample² Pixel zusammen. 0/1 = aus.
+    supersample: u32,
+    out_width: u32,
+    out_height: u32,
 };
 
 pub const postfx_block: u32 = 256;
@@ -798,6 +803,9 @@ pub const UpscaleParams = extern struct {
     bgra: u32,
     /// Varianzbegrenzung des Verlaufs in Standardabweichungen (YCoCg)
     clamp_sigma: f32,
+    /// Schärfe des Rekonstruktionskerns: groß = schmal (nur das nächste
+    /// Sample zählt), klein = breit (mittelt über Nachbarn)
+    kernel_sharp: f32,
 };
 
 pub const upscale_block: u32 = 8;

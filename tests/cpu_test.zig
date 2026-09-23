@@ -1199,7 +1199,7 @@ test "TAAU: 2x Hochskalieren rekonstruiert Details, auch bei Bewegung" {
                 .color = @intFromPtr(color.ptr), .color_half = 0, .reserved = 0, .normal = @intFromPtr(normal.ptr), .motion = @intFromPtr(motion.ptr), .hits = @intFromPtr(hits.ptr),
                 .jitter = j, .hist_in = @intFromPtr(hist[cur ^ 1].ptr), .hist_out = @intFromPtr(hist[cur].ptr), .mvd_out = @intFromPtr(mvd.ptr),
                 .reset = @intFromBool(f == 0), .max_weight = 12, .exposure = 1, .tonemap = types.tonemap_none,
-                .out_hdr = @intFromPtr(out.ptr), .out_ldr = 0, .bgra = 0, .clamp_sigma = 1.25,
+                .out_hdr = @intFromPtr(out.ptr), .out_ldr = 0, .bgra = 0, .clamp_sigma = 1.25, .kernel_sharp = 2.29,
             };
             for (0..oh) |y| for (0..ow) |x| pyr.upscale.taau(&u, @intCast(x), @intCast(y));
             if (f == 0 or f == frames - 1) {
