@@ -5,3 +5,7 @@ zig-out/
 # Messausgaben
 *.ppm
 *.png
+
+# NVIDIA DLSS SDK: steht unter NVIDIA-Lizenz und gehoert nicht ins Repository.
+# Hierher legen (oder verlinken) und mit -Ddlss-sdk=DLSS bauen.
+DLSS/

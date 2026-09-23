@@ -185,6 +185,9 @@ Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über diesel
 
 ### Überlappung mit dem nächsten Frame
 
+**Wichtig vorab, gemessen auf freier GPU:** mit dem eigenen TAAU bringt die Überlappung *nichts* (29,49 gegen 29,26 ms bei 1080p, also 0,8 %). Der Grund ist einfach: TAAU rechnet auf denselben Shader-Einheiten wie das Rendern, die Arbeit konkurriert also um dieselbe Hardware statt sie zu ergänzen. Ein Gewinn ist nur dort zu erwarten, wo die Nachbearbeitung *andere* Einheiten belegt – bei DLSS und Ray Reconstruction auf den Tensorkernen. Diese Messung steht noch aus.
+
+
 Die Nachbearbeitung läuft auf einem eigenen CUDA-Stream, angebunden an das Rendern *dieses* Frames über ein Ereignis. DLSS und TAA arbeiten damit auf den Tensorkernen, während die Shader- und RT-Einheiten schon den nächsten Frame rechnen können. Voraussetzung ist `PYR_CREATE_ASYNC_POST`: ohne das Flag wartet der nächste Frame auf die Nachbearbeitung des vorigen, weil er sonst in dieselben Ziele schreiben würde, aus denen noch gelesen wird.
 
 Mit dem Flag muss die Anwendung **zwei Sätze von `PyrTargets` abwechselnd** benutzen und darf nicht nach jedem Frame synchronisieren – sonst gibt es nichts zu überlappen. `pyr_synchronize` wartet auf beide Ströme.

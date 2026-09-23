@@ -149,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
     var use_env = false;
     var env_flat = false;
     var firefly: f32 = 0;
+    var alpha: f32 = 0;
     var bounces: u32 = 0;
     var fog: f32 = 0;
     var async_post = false;
@@ -229,6 +230,9 @@ pub fn main(init: std.process.Init) !void {
             fog = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--async-post")) {
             async_post = true;
+        } else if (std.mem.eql(u8, a, "--alpha") and i + 1 < args.len) {
+            i += 1;
+            alpha = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--clamp-fire") and i + 1 < args.len) {
             i += 1;
             firefly = try std.fmt.parseFloat(f32, args[i]);
@@ -304,7 +308,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -425,7 +429,7 @@ pub fn main(init: std.process.Init) !void {
     var post = std.mem.zeroes(api.PostInfo);
     post.output_ldr = ldr;
     post.denoise_iterations = 3;
-    post.temporal_alpha = 1.0 / @as(f32, @floatFromInt(@max(frames, 1)));
+    post.temporal_alpha = if (alpha > 0) alpha else 1.0 / @as(f32, @floatFromInt(@max(frames, 1)));
     post.exposure = 1.0;
 
     const t1 = std.Io.Timestamp.now(init.io, .awake);
@@ -465,7 +469,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, bounces: u32, fog: f32, async_post: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, bounces: u32, fog: f32, async_post: bool) !void {
     const w = out_w / scale;
     const h = out_h / scale;
     var terrain: api.TerrainInfo = undefined;
@@ -627,6 +631,8 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     }
     var post = std.mem.zeroes(api.PostInfo);
     post.output_ldr = ldr;
+    // 0 = Vorgabe der Bibliothek (0,05, also 20 Frames Mittelung)
+    post.temporal_alpha = alpha;
     post.denoise_iterations = denoise;
     post.exposure = 1.0;
     post.clamp_sigma = clamp_sigma;

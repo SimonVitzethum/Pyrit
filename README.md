@@ -43,8 +43,14 @@ The GPU kernels are compiled from the same Zig source for `nvptx64-cuda` (to
 PTX) and for `amdgcn-amdhsa` (so far only as a compile check; a HIP backend is
 to follow).
 
-DLSS is optional and needs the SDK, which is not bundled:
-`zig build -Ddlss-sdk=/path/to/DLSS`.
+DLSS is optional and needs NVIDIA's SDK, which is not bundled (it has its own
+licence). Clone it into `DLSS/` in the repository root — that path is
+gitignored — and build with the SDK path:
+
+```sh
+git clone --depth 1 https://github.com/NVIDIA/DLSS.git
+zig build -Ddlss-sdk=$PWD/DLSS
+```
 
 ## Tools
 
