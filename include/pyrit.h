@@ -657,6 +657,11 @@ PYR_API PyrResult pyr_frame_generate(PyrContext* ctx, PyrView view, const PyrFra
 
 /* Subpixel-Versatz für TAA (Halton 2,3), Bereich [-0.5, 0.5) */
 PYR_API void pyr_jitter_halton(uint32_t frame, float out[2]);
+/* Jitter in kleinen Schritten statt Spruengen: ueber 16 Frames dieselbe
+ * gleichmaessige Abdeckung wie Halton, aber zwischen zwei Frames hoechstens
+ * ein Viertelpixel Unterschied. An Voxelkanten wechselt die Abtastung dadurch
+ * allmaehlich statt sprunghaft zwischen zwei Flaechen. */
+PYR_API void pyr_jitter_ordered(uint32_t frame, float out[2]);
 
 /* ---------------------------------------------------------------------------
  * Statistik

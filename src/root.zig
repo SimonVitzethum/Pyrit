@@ -402,6 +402,28 @@ pub export fn pyr_frame_generate(ctx: ?*PyrContext, view: Handle, info: ?*const 
     return call(ctx, Context.frameGenerate, .{ handle(view), i });
 }
 
+/// Jitter, der das Pixel in kleinen Schritten abfährt statt zu springen.
+///
+/// Halton verteilt über viele Frames sehr gleichmäßig, springt aber von einem
+/// Frame zum nächsten quer durch das Pixel. An einer Voxelkante heißt das: die
+/// Abtastung wechselt sprunghaft zwischen zwei Flächen, die sehr verschieden
+/// beleuchtet sind – das sieht man als wandernden Schatten. Diese Folge fährt
+/// ein 4x4-Gitter im Zickzack ab: über 16 Frames dieselbe gleichmäßige
+/// Abdeckung, aber zwischen zwei Frames höchstens ein Viertelpixel Unterschied.
+/// Die Reihenfolge der Zeilen ist umgekehrt-binär, damit auch kurze Fenster
+/// (die ersten 2, 4, 8 Frames) schon gleichmäßig liegen.
+pub export fn pyr_jitter_ordered(frame: u32, out: ?*[2]f32) void {
+    const o = out orelse return;
+    const k = frame % 16;
+    const row = ((k & 1) << 1) | ((k & 2) >> 1); // 0,2,1,3 statt 0,1,2,3
+    const step = (k >> 2) & 3;
+    // Zickzack: ungerade Zeilen rückwärts, damit der Sprung am Zeilenende klein bleibt
+    const col = if (row & 1 != 0) 3 - step else step;
+    const fx = (@as(f32, @floatFromInt(col)) + 0.5) / 4.0;
+    const fy = (@as(f32, @floatFromInt(row)) + 0.5) / 4.0;
+    o.* = .{ fx - 0.5, fy - 0.5 };
+}
+
 pub export fn pyr_jitter_halton(frame: u32, out: ?*[2]f32) void {
     const o = out orelse return;
     const i = (frame % 1024) + 1;

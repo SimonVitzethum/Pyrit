@@ -882,7 +882,7 @@ pub fn main(init: std.process.Init) !void {
         pyrit.pyr_camera_look_at(&cam, &eye, &target, &.{ 0, 1, 0 });
         pyrit.pyr_camera_perspective(&cam, 1.1, rw, rh, 0.1);
         var jitter: [2]f32 = undefined;
-        pyrit.pyr_jitter_halton(frame, &jitter);
+        pyrit.pyr_jitter_ordered(frame, &jitter);
         cam.jitter = jitter;
 
         req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));

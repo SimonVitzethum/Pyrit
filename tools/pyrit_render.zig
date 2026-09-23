@@ -153,6 +153,8 @@ pub fn main(init: std.process.Init) !void {
     var alpha: f32 = 0;
     var no_shadows = false;
     var no_jitter = false;
+    var gpu_info = false;
+    var resize_test = false;
     var super: u32 = 1;
     var chunks_per_update: u32 = 0;
     var bounces: u32 = 0;
@@ -241,6 +243,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--super") and i + 1 < args.len) {
             i += 1;
             super = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--resize")) {
+            resize_test = true;
+        } else if (std.mem.eql(u8, a, "--gpu-info")) {
+            gpu_info = true;
         } else if (std.mem.eql(u8, a, "--no-jitter")) {
             no_jitter = true;
         } else if (std.mem.eql(u8, a, "--no-taau")) {
@@ -307,6 +313,42 @@ pub fn main(init: std.process.Init) !void {
     cu(drv.cuDevicePrimaryCtxRetain(&cu_ctx, dev));
     cu(drv.cuCtxSetCurrent(cu_ctx));
 
+    if (gpu_info) {
+        // Kennzahlen der Karte und die tatsächlich erreichbare Bandbreite.
+        // Letztere misst ein reines Gerät-zu-Gerät-Kopieren: mehr als das
+        // schafft kein Kernel, es ist die ehrliche Obergrenze.
+        var a_sm: c_int = 0;
+        var a_clk: c_int = 0;
+        var a_mclk: c_int = 0;
+        var a_bus: c_int = 0;
+        var a_l2: c_int = 0;
+        _ = drv.cuDeviceGetAttribute(&a_sm, 16, dev);
+        _ = drv.cuDeviceGetAttribute(&a_clk, 13, dev);
+        _ = drv.cuDeviceGetAttribute(&a_mclk, 36, dev);
+        _ = drv.cuDeviceGetAttribute(&a_bus, 37, dev);
+        _ = drv.cuDeviceGetAttribute(&a_l2, 38, dev);
+        const theo = @as(f64, @floatFromInt(a_mclk)) * 1000.0 * @as(f64, @floatFromInt(a_bus)) / 8.0 * 2.0 / 1e9;
+        std.debug.print("GPU: {d} SMs, SM-Takt {d} MHz, Speicher {d} MHz x {d} bit, L2 {d} KiB\n", .{ a_sm, @divTrunc(a_clk, 1000), @divTrunc(a_mclk, 1000), a_bus, @divTrunc(a_l2, 1024) });
+        std.debug.print("Theoretische Bandbreite: {d:.0} GB/s\n", .{theo});
+
+        const bytes: u64 = 256 << 20;
+        var src: cuda.CUdeviceptr = 0;
+        var dst: cuda.CUdeviceptr = 0;
+        cu(drv.cuMemAlloc_v2(&src, bytes));
+        cu(drv.cuMemAlloc_v2(&dst, bytes));
+        cu(drv.cuMemsetD8_v2(src, 1, bytes));
+        cu(drv.cuCtxSynchronize());
+        const t0 = std.Io.Timestamp.now(init.io, .awake);
+        var it: u32 = 0;
+        while (it < 20) : (it += 1) cu(drv.cuMemcpyDtoD_v2(dst, src, bytes));
+        cu(drv.cuCtxSynchronize());
+        const ms = msSince(init, t0);
+        const gbs = @as(f64, @floatFromInt(bytes)) * 2 * 20 / (ms / 1000.0) / 1e9;
+        std.debug.print("Gemessen (Kopieren, lesen+schreiben): {d:.0} GB/s = {d:.0} % der theoretischen\n", .{ gbs, gbs / theo * 100 });
+        _ = drv.cuMemFree_v2(src);
+        _ = drv.cuMemFree_v2(dst);
+    }
+
     var ci = std.mem.zeroes(api.CreateInfo);
     ci.struct_size = @sizeOf(api.CreateInfo);
     ci.version = api.version;
@@ -325,7 +367,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, no_jitter, super, chunks_per_update, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, no_jitter, resize_test, super, chunks_per_update, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -531,7 +573,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, no_jitter: bool, super: u32, chunks_per_update: u32, bounces: u32, fog: f32, async_post: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, no_jitter: bool, resize_test: bool, super: u32, chunks_per_update: u32, bounces: u32, fog: f32, async_post: bool) !void {
     // Supersampling: alles läuft in super-facher Auflösung, erst ganz am Ende
     // wird gemittelt. Damit entscheidet sich die Deckung einer Voxelkante
     // schon *innerhalb* eines Frames statt über die Zeit.
@@ -818,9 +860,21 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         const target = [3]f32{ eye[0] + dx, eye[1] - 45, eye[2] + dz };
         const up = [3]f32{ 0, 1, 0 };
         pyrit.pyr_camera_look_at(&cam, &eye, &target, &up);
-        pyrit.pyr_camera_perspective(&cam, 1.0, w, h, 0.1);
+        // Belastungstest: die Auflösung wechselt jeden Frame. Das trifft alle
+        // Puffer, die sich nach ihr richten (Verlauf, Filter, TAAU, Effekte).
+        var cw = w;
+        var ch = h;
+        if (resize_test) {
+            const steps = [_]f32{ 1.0, 0.75, 0.5, 0.85, 0.6, 1.0 };
+            const k = steps[f % steps.len];
+            cw = @max(@as(u32, @intFromFloat(@as(f32, @floatFromInt(w)) * k)), 64);
+            ch = @max(@as(u32, @intFromFloat(@as(f32, @floatFromInt(h)) * k)), 64);
+            post.output_width = cw;
+            post.output_height = ch;
+        }
+        pyrit.pyr_camera_perspective(&cam, 1.0, cw, ch, 0.1);
         var j: [2]f32 = undefined;
-        pyrit.pyr_jitter_halton(f, &j);
+        if (std.c.getenv("PYRIT_JITTER_HALTON") != null) pyrit.pyr_jitter_halton(f, &j) else pyrit.pyr_jitter_ordered(f, &j);
         cam.jitter = if (no_jitter) .{ 0, 0 } else j;
         // Laufende Einzeländerungen von der CPU: je Frame ein Voxel, an
         // wandernder Stelle – der Fall "einzelne Chunks kommen nach".
