@@ -1370,6 +1370,7 @@ pub const Context = struct {
             v.before.camera.width == camera.width and v.before.camera.height == camera.height;
 
         var params = types.RenderParams{
+            .coverage = @max(targets.coverage, 1),
             .scene = self.scene_dev,
             .cur = cur,
             .prev = if (prev_ok) v.before else cur,
@@ -1503,6 +1504,7 @@ pub const Context = struct {
         l.sky_intensity = 1.0;
         l.ao_radius = 8;
         l.gi_bounces = 1;
+        l.gi_shadow_depth = 1;
         l.fog_color = .{ 1, 1, 1 };
         l.fog_anisotropy = 0.6;
         return l;
@@ -1629,6 +1631,7 @@ pub const Context = struct {
         // es bleibt reines Abtasten über den Cosinus-Lappen (A/B-Vergleich).
         self.lighting.env_total = if (std.c.getenv("PYRIT_ENV_NOMIS") != null) 0 else self.env_total;
         self.lighting.env_mean = self.env_mean;
+        self.lighting.sun_always = @intFromBool(std.c.getenv("PYRIT_SUN_ALWAYS") != null);
         if (self.env_data != 0 and self.lighting.env_intensity == 0) self.lighting.env_intensity = 1;
         try self.uploadValue(self.lighting_dev, &self.lighting);
     }

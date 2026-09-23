@@ -313,6 +313,13 @@ pub const Lighting = extern struct {
     /// Indirekte Reflexionen: 1 = eine (Vorgabe), mehr für tiefere Lichtwege.
     /// Ab der zweiten wird russisches Roulette angewandt.
     gi_bounces: u32,
+    /// Bis zu welcher Tiefe indirekte Treffer eigene Schattenstrahlen werfen.
+    /// 0 = nur der Primärtreffer schattet, die Bounces nehmen das Licht
+    /// ungeschattet. Das ist die mit Abstand teuerste Stelle: jeder Bounce
+    /// kostet sonst einen weiteren Schattenstrahl je Pixel.
+    gi_shadow_depth: u32,
+    /// Diagnose: Sonnenstrahl auch bei schwarzer Sonne werfen (A/B-Vergleich)
+    sun_always: u32,
     /// Teilnehmendes Medium (Nebel, Lichtschächte): Dichte je Welteinheit auf
     /// Höhe `fog_height`, darüber exponentiell abnehmend mit `fog_falloff`.
     fog_density: f32,
@@ -362,6 +369,9 @@ pub const HitEx = extern struct {
 };
 
 pub const RenderParams = extern struct {
+    /// Abtastungen je Pixel für die *Deckung* (1..4, 1 = aus). Zusätzliche
+    /// Primärstrahlen sind billig; geschattet wird nur, was sich unterscheidet.
+    coverage: u32,
     scene: u64,
     cur: CameraData,
     prev: CameraData,

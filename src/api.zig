@@ -127,6 +127,12 @@ pub const Targets = extern struct {
     transparent_mask: u32,
     /// Maske für Schatten-, GI- und Reflexionsstrahlen; 0 = wie ray_mask
     secondary_mask: u32,
+    /// Abtastungen je Pixel für die *Deckung* (1..4; 0/1 = aus).
+    /// An Voxelkanten entscheidet sonst der Jitter jeden Frame neu, welche der
+    /// beiden Flächen das Pixel sieht – das sieht man als wandernde Schatten.
+    /// Zusätzliche Primärstrahlen sind billig; geschattet wird nur, was sich
+    /// unterscheidet, also fast nur an Kanten.
+    coverage: u32,
 };
 
 // ---------------------------------------------------------------------------

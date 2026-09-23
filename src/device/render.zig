@@ -139,6 +139,20 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
     if (p.color != 0 or p.normal != 0 or p.albedo != 0) {
         if (found) |h| {
             var rng = shade.Rng.init(x, y, p.frame_index, 0);
+            // Deckungsabtastung gegen wandernde Kanten
+            //
+            // Die Ursache ist nicht das Rauschen, sondern die Deckung: an
+            // einer Voxelkante entscheidet der Jitter jeden Frame neu, welche
+            // der beiden Flächen das Pixel sieht – und die sind sehr
+            // verschieden beleuchtet. Ein Filter kann das nicht heilen, weil
+            // das Signal echt wechselt.
+            //
+            // Hier wird die Deckung stattdessen *innerhalb* eines Frames
+            // aufgelöst: zusätzliche Primärstrahlen prüfen, welche Fläche das
+            // Pixel wirklich zu welchem Anteil sieht. Schattiert wird nur, was
+            // sich unterscheidet – im Bildinneren treffen alle Abtastungen
+            // dieselbe Fläche und es bleibt bei einer Schattierung. Nur an
+            // Kanten, also wenigen Prozent der Pixel, kommt eine zweite dazu.
             // Größe eines Bildschirmpixels in Welteinheiten am Treffer.
             // Daraus wählt das Shading die Verkleinerungsstufe der Texturen
             // und blendet die Detailnormale aus, bevor sie flimmern kann.
@@ -146,7 +160,79 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             const px_per_unit = 2 * cm.scale[1] / @as(f32, @floatFromInt(@max(cm.height, 1)));
             const footprint = if (cm.projection == types.projection_orthographic) px_per_unit else h.t * px_per_unit;
             const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint);
-            r.color = .{ sh.color[0], sh.color[1], sh.color[2], 1 };
+            var col = vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
+
+            var cov = @min(@max(p.coverage, 1), 4);
+            // Die zusätzlichen Strahlen lohnen nur an einer Voxelkante. Wo
+            // der Treffer weit genug von der Kante entfernt in seiner Fläche
+            // liegt, landen alle Abtastungen ohnehin im selben Voxel – das
+            // steht hier schon fest, ohne einen einzigen weiteren Strahl.
+            // Das betrifft die große Mehrheit der Pixel, und für sie kostet
+            // die Deckung damit gar nichts.
+            if (cov > 1) {
+                const inst = &tr.instances(s)[h.instance];
+                // Spaltenlänge der Welt->Objekt-Matrix: Weltmaß -> Objektmaß.
+                var w2o: f32 = 0;
+                inline for (0..3) |a| w2o += inst.world_to_object[a] * inst.world_to_object[a];
+                const fp_obj = footprint * @sqrt(w2o);
+                const axis = (h.face & types.hit_face_mask) >> 1;
+                var near_edge = false;
+                inline for (0..3) |a| {
+                    if (a != axis) {
+                        const f = h.p_object[a] - @floor(h.p_object[a]);
+                        if (@min(f, 1 - f) < 0.75 * fp_obj) near_edge = true;
+                    }
+                }
+                if (!near_edge) cov = 1;
+            }
+            if (cov > 1) {
+                // Feste Versätze auf einem gedrehten Gitter: sie liegen
+                // gleichmäßig im Pixel und sind über die Frames konstant, der
+                // Jitter verschiebt sie gemeinsam.
+                const offs = [3][2]f32{ .{ 0.3, -0.1 }, .{ -0.1, 0.3 }, .{ -0.3, -0.3 } };
+                var wsum: f32 = 1;
+                var k: u32 = 0;
+                while (k + 1 < cov) : (k += 1) {
+                    const o2 = offs[k];
+                    const r2 = cameraRay(cam, px + o2[0], py + o2[1]);
+                    const f2 = tracer.trace(s, r2.o, r2.d, r2.tmin, r2.tmax, opaque_mask, p.flags | types.trace_skip_transparent);
+                    if (f2) |h2| {
+                        // Dieselbe Fläche in derselben Tiefe heißt: dieselbe
+                        // Beleuchtung. Unterscheidet sich nur das Attribut,
+                        // also die Farbe des Nachbarvoxels, genügt es, sie
+                        // auszutauschen – dafür braucht es keinen einzigen
+                        // weiteren Strahl. Nur an echten Geometriekanten
+                        // (andere Fläche oder andere Tiefe) wird voll neu
+                        // schattiert, und das sind wenige Pixel.
+                        const same_face = h2.instance == h.instance and
+                            (h2.face & types.hit_face_mask) == (h.face & types.hit_face_mask) and
+                            @abs(h2.t - h.t) < 0.002 * h.t + 1e-3;
+                        if (same_face and h2.attribute == h.attribute) {
+                            col += vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
+                        } else if (same_face) {
+                            const hp2 = r2.o + r2.d * vec.splat(h2.t);
+                            const nn = vec.Vec3{ sh.normal[0], sh.normal[1], sh.normal[2] };
+                            const s2 = shade.surfaceAt(s, h2.attribute, hp2, nn, footprint);
+                            var scaled: vec.Vec3 = undefined;
+                            inline for (0..3) |q| {
+                                scaled[q] = sh.color[q] * (s2.albedo[q] / @max(sh.albedo[q], 1e-4));
+                            }
+                            col += scaled;
+                        } else {
+                            var rng2 = shade.Rng.init(x, y, p.frame_index, 8 + k);
+                            const fp2 = if (cm.projection == types.projection_orthographic) px_per_unit else h2.t * px_per_unit;
+                            const s2 = shade.shadeHit(tracer, s, r2.o, r2.d, h2, &rng2, secondary_mask, trans_mask, fp2);
+                            col += vec.Vec3{ s2.color[0], s2.color[1], s2.color[2] };
+                        }
+                    } else {
+                        col += shade.sky(@ptrFromInt(s.lighting), r2.d, true);
+                    }
+                    wsum += 1;
+                }
+                col *= vec.splat(1.0 / wsum);
+            }
+
+            r.color = .{ col[0], col[1], col[2], 1 };
             r.normal = .{ sh.normal[0], sh.normal[1], sh.normal[2], r.depth };
             // w trägt den diffusen Anteil für den indirekten Durchgang
             r.albedo = .{ sh.albedo[0], sh.albedo[1], sh.albedo[2], sh.diffuse };

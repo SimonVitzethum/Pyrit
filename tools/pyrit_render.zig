@@ -155,6 +155,8 @@ pub fn main(init: std.process.Init) !void {
     var no_jitter = false;
     var gpu_info = false;
     var resize_test = false;
+    var primary_only = false;
+    var coverage: u32 = 1;
     var super: u32 = 1;
     var chunks_per_update: u32 = 0;
     var bounces: u32 = 0;
@@ -243,6 +245,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--super") and i + 1 < args.len) {
             i += 1;
             super = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--coverage") and i + 1 < args.len) {
+            i += 1;
+            coverage = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--primary-only")) {
+            primary_only = true;
         } else if (std.mem.eql(u8, a, "--resize")) {
             resize_test = true;
         } else if (std.mem.eql(u8, a, "--gpu-info")) {
@@ -367,7 +374,7 @@ pub fn main(init: std.process.Init) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, no_jitter, resize_test, super, chunks_per_update, bounces, fog, async_post);
+    if (world_mode) return renderWorld(init, ctx, w, h, frames, gi, out_path, scale, fg, upscaler, profile, voxel_px, budget_mib, denoise, clamp_sigma, coarse_secondary, gi_distance, half_gi, sea_level, rt_leaf, static_cam, turn, flicker, view_distance, edit_test, edit_load, edit_file, chunk_capacity, edit_stream, fx_flags, materials, use_env, env_flat, firefly, alpha, no_shadows, no_jitter, primary_only, coverage, resize_test, super, chunks_per_update, bounces, fog, async_post);
 
     // Szene
     var voxels: []api.Voxel = undefined;
@@ -409,7 +416,11 @@ pub fn main(init: std.process.Init) !void {
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (std.c.getenv("PYRIT_GI_SHADOW_DEPTH")) |e| light.gi_shadow_depth = std.fmt.parseInt(u32, std.mem.span(e), 10) catch 1;
     if (no_shadows) light.flags &= ~types.lighting_shadows;
+    // Nur Primärstrahlen: keine Schatten, keine GI, keine Verdeckung, keine
+    // Reflexionen. Der Rest der Zeit gehört damit der Traversierung selbst.
+    if (primary_only) light.flags &= ~(types.lighting_shadows | types.lighting_gi | types.lighting_ao | types.lighting_reflections | types.lighting_gi_half);
     if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
@@ -573,7 +584,7 @@ fn msSince(init: std.process.Init, t: std.Io.Timestamp) f64 {
 }
 
 /// Große Welt: Gelände auf der GPU, LOD-Streaming, Flug über die Landschaft
-fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, no_jitter: bool, resize_test: bool, super: u32, chunks_per_update: u32, bounces: u32, fog: f32, async_post: bool) !void {
+fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32, frames: u32, gi: bool, out_path: []const u8, scale: u32, fg: bool, upscaler: u32, profile: bool, voxel_px: f32, budget_mib: u32, denoise: u32, clamp_sigma: f32, coarse_secondary: bool, gi_distance: f32, half_gi: bool, sea_level: f32, rt_leaf: u32, static_cam: bool, turn: f32, flicker: bool, view_distance: f32, edit_test: bool, edit_load: bool, edit_file: ?[]const u8, chunk_capacity: u32, edit_stream: bool, fx_flags: u32, materials: bool, use_env: bool, env_flat: bool, firefly: f32, alpha: f32, no_shadows: bool, no_jitter: bool, primary_only: bool, coverage: u32, resize_test: bool, super: u32, chunks_per_update: u32, bounces: u32, fog: f32, async_post: bool) !void {
     // Supersampling: alles läuft in super-facher Auflösung, erst ganz am Ende
     // wird gemittelt. Damit entscheidet sich die Deckung einer Voxelkante
     // schon *innerhalb* eines Frames statt über die Zeit.
@@ -704,7 +715,11 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
     var light: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&light);
     if (bounces > 0) light.gi_bounces = bounces;
+    if (std.c.getenv("PYRIT_GI_SHADOW_DEPTH")) |e| light.gi_shadow_depth = std.fmt.parseInt(u32, std.mem.span(e), 10) catch 1;
     if (no_shadows) light.flags &= ~types.lighting_shadows;
+    // Nur Primärstrahlen: keine Schatten, keine GI, keine Verdeckung, keine
+    // Reflexionen. Der Rest der Zeit gehört damit der Traversierung selbst.
+    if (primary_only) light.flags &= ~(types.lighting_shadows | types.lighting_gi | types.lighting_ao | types.lighting_reflections | types.lighting_gi_half);
     if (firefly > 0) light.firefly_clamp = firefly;
     if (fog > 0) {
         light.fog_density = fog;
@@ -781,6 +796,7 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
         // DLSS Ray Reconstruction bekommt Rauheit und Metall je Pixel
         if (upscaler == api.upscaler_dlss_rr) tgs[si].material = devAlloc(n * 8);
         tgs[si].ray_mask = 0x1;
+        tgs[si].coverage = coverage;
         if (coarse_secondary) tgs[si].secondary_mask = 0x2;
     }
     var tg = tgs[0];

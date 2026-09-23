@@ -438,6 +438,7 @@ const Targets = struct {
         self.tg.normal = devAlloc(n * 16);
         self.tg.albedo = devAlloc(n * 16);
         self.tg.ray_mask = 0x1;
+        self.tg.coverage = 2;
         self.ldr = devAlloc(n_out * 4);
         self.ldr_fg = devAlloc(n_out * 4);
         self.w = w;
@@ -881,9 +882,12 @@ pub fn main(init: std.process.Init) !void {
         };
         pyrit.pyr_camera_look_at(&cam, &eye, &target, &.{ 0, 1, 0 });
         pyrit.pyr_camera_perspective(&cam, 1.1, rw, rh, 0.1);
-        var jitter: [2]f32 = undefined;
-        pyrit.pyr_jitter_ordered(frame, &jitter);
-        cam.jitter = jitter;
+        // Kein Jitter: er war die Ursache der wandernden Schatten. An einer
+        // Voxelkante entschied er jeden Frame neu, welche der beiden
+        // verschieden beleuchteten Flächen das Pixel sieht – ein echtes
+        // Wechselsignal, das kein Filter glätten kann. Die Kantenglättung
+        // macht stattdessen `tg.coverage` innerhalb eines Frames.
+        cam.jitter = .{ 0, 0 };
 
         req(pyrit.pyr_world_update(@ptrCast(ctx), @ptrCast(world), &pos, &origin, &cam));
         const fi = api.FrameInfo{ .time = now, .origin = origin };

@@ -629,15 +629,24 @@ fn transmission(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: 
 
 /// Direktes Licht (Sonne + Punktlichter) an Punkt p mit Normale n
 fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
-    var c = splat(0);
-    const shadows = l.flags & types.lighting_shadows != 0;
+    return directAt(tracer, s, l, p, n, v, sf, rng, mask, trans_mask, true);
+}
 
+fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32, want_shadows: bool) Vec3 {
+    var c = splat(0);
+    const shadows = want_shadows and l.flags & types.lighting_shadows != 0;
+
+    // Schwarze Sonne (ihr Licht steckt in der Umgebungskarte): dann gar nicht
+    // erst einen Schattenstrahl werfen. Das Ergebnis wäre null, der Strahl
+    // kostet aber voll – und zwar an *jedem* Schattierungspunkt, also auch an
+    // jedem GI-Treffer.
+    const sun_lit = l.sun_always != 0 or l.sun_color[0] > 0 or l.sun_color[1] > 0 or l.sun_color[2] > 0;
     const sd = vec.normalize(l.sun_direction);
     const ld = if (shadows) coneSample(sd, fm.tan(l.sun_angular_radius), rng) else sd;
     const ndl = vec.dot(n, ld);
     // Mit Unterflächenstreuung zählt auch Licht von hinten (es wandert durch
     // das Material); brdf() liefert dafür den Rückseitenanteil.
-    if (ndl > 0 or (sf.subsurface > 0 and ndl > -1)) {
+    if (sun_lit and (ndl > 0 or (sf.subsurface > 0 and ndl > -1))) {
         var tint = splat(@as(f32, 1));
         var lit = true;
         if (shadows) {
@@ -833,7 +842,11 @@ pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
                 // Indirekte Treffer brauchen kein Detail: gröbste Stufe
                 const gsf = surfaceAt(s, g.attribute, hp, gn, 1e6);
                 const gp = hp + gn * splat(1e-3 * voxelSize(ginst));
-                acc += clampContribution(l, throughput * r.att * (gsf.emission + direct(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask)));
+                // Schattenstrahlen an indirekten Treffern sind der teuerste
+                // Posten der ganzen Beleuchtung. Bis gi_shadow_depth werfen
+                // sie welche, darüber nehmen sie das Licht ungeschattet.
+                const want_sh = b < l.gi_shadow_depth;
+                acc += clampContribution(l, throughput * r.att * (gsf.emission + directAt(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask, want_sh)));
                 if (b + 1 >= bounces) break;
                 // Weiter mit dem diffusen Anteil der getroffenen Fläche
                 throughput *= r.att * gsf.albedo * splat(1 - gsf.metallic);

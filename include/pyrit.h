@@ -267,6 +267,8 @@ typedef struct PyrLighting {
     float    env_total;
     float    env_mean;
     uint32_t gi_bounces;        /* indirekte Reflexionen, 0/1 = eine */
+    uint32_t gi_shadow_depth;   /* bis zu welcher Bounce-Tiefe geschattet wird */
+    uint32_t sun_always;        /* Diagnose */
     /* Teilnehmendes Medium: Nebel und Lichtschaechte */
     float    fog_density;       /* je Welteinheit auf Hoehe fog_height, 0 = aus */
     float    fog_color[3];
@@ -276,6 +278,7 @@ typedef struct PyrLighting {
     uint32_t fog_steps;         /* 0 = 12 */
     float    firefly_clamp;     /* Obergrenze je Abtastung, 0 = aus */
     uint32_t reserved[1];
+
     PyrLight lights[PYR_MAX_LIGHTS];
 } PyrLighting;
 
@@ -501,6 +504,7 @@ typedef struct PyrTargets {
     /* Maske für Schatten-, GI- und Reflexionsstrahlen; 0 = wie ray_mask. So
      * sehen Sekundärstrahlen z. B. nur die gröbere Fassung der Welt. */
     uint32_t secondary_mask;
+    uint32_t coverage;            /* Abtastungen je Pixel fuer die Deckung (1..4; 0/1 = aus) */
 } PyrTargets;
 
 PYR_API PyrResult pyr_view_create(PyrContext* ctx, PyrView* out);
