@@ -40,9 +40,30 @@ fn valueNoise(x: f32, z: f32, seed: u32) f32 {
 
 /// Geländehöhe in Grundvoxeln an (x, z). `min_wavelength`: Oktaven, deren
 /// Wellenlänge darunter liegt, trägt die Stufe nicht mehr (kein Aliasing).
+///
+/// Aufbau: erst wird die Abtastposition von einem groben Rauschen verschoben
+/// (Domain-Warping) – das biegt die Grate und nimmt der Landschaft das
+/// Gitterhafte. Darauf ein gratartiges Multifraktal: jede Oktave wird mit dem
+/// Ergebnis der vorigen gewichtet, wodurch sich feine Grate auf den
+/// Höhenzügen sammeln statt gleichmäßig über die Ebene zu streuen. Genau das
+/// unterscheidet ein Gebirge von verrauschten Hügeln.
 pub fn height(t: *const types.TerrainParams, x: f32, z: f32, min_wavelength: f32) f32 {
+    // 1. Domain-Warping mit der doppelten Grundwellenlänge
+    const wwl = t.wavelength * 2;
+    var wx = x;
+    var wz = z;
+    if (min_wavelength < wwl) {
+        const w1 = valueNoise(x / wwl + 11.3, z / wwl - 4.7, t.seed ^ 0x2f1d) - 0.5;
+        const w2 = valueNoise(x / wwl - 8.1, z / wwl + 15.9, t.seed ^ 0x7c3b) - 0.5;
+        const amount = t.wavelength * 0.75;
+        wx += w1 * amount;
+        wz += w2 * amount;
+    }
+
+    // 2. Gratartiges Multifraktal
     var wl = t.wavelength;
     var amp: f32 = 1;
+    var weight: f32 = 1;
     var sum: f32 = 0;
     var norm: f32 = 0;
     var o: u32 = 0;
@@ -52,25 +73,40 @@ pub fn height(t: *const types.TerrainParams, x: f32, z: f32, min_wavelength: f32
         // dieselben Gitterachsen und die Landschaft bekommt ein Karomuster
         const ca = fm.cos(0.7 * @as(f32, @floatFromInt(o)));
         const sa = fm.sin(0.7 * @as(f32, @floatFromInt(o)));
-        const rx = (x * ca - z * sa) / wl + @as(f32, @floatFromInt(o)) * 37.0;
-        const rz = (x * sa + z * ca) / wl - @as(f32, @floatFromInt(o)) * 19.0;
+        const rx = (wx * ca - wz * sa) / wl + @as(f32, @floatFromInt(o)) * 37.0;
+        const rz = (wx * sa + wz * ca) / wl - @as(f32, @floatFromInt(o)) * 19.0;
         const n = valueNoise(rx, rz, t.seed +% o *% 0x9e3779b9);
-        // leicht gratartig in den oberen Oktaven
-        const v = if (o == 0) n else 1 - @abs(2 * n - 1);
+        // Grat: Spitze dort, wo das Rauschen die Mitte kreuzt
+        var r = 1 - @abs(2 * n - 1);
+        r *= r; // schärfer
+        const v = r * weight;
+        // Die nächste Oktave zählt nur dort voll, wo diese schon hoch liegt
+        weight = @min(@max(r * 1.8, 0), 1);
         sum += v * amp;
         norm += amp;
         amp *= 0.5;
         wl *= 0.5;
     }
-    // restliche Amplitude als Mittelwert, damit die Höhe über die Stufen stabil bleibt
+    // Restliche Amplitude als Erwartungswert, damit die Höhe über die
+    // LOD-Stufen stabil bleibt (der Grat hat im Mittel etwa 1/3)
     while (o < t.octaves) : (o += 1) {
-        sum += 0.5 * amp;
+        sum += 0.333 * weight * amp;
         norm += amp;
         amp *= 0.5;
     }
     const h = sum / @max(norm, 1e-6);
     // Täler flacher, Gipfel steiler
     return t.base_height + t.amplitude * h * h * 1.6;
+}
+
+/// Höhe, ab der Schnee liegt – keine Linie, sondern ein von Rauschen und
+/// Hangneigung aufgelöster Übergang. Eine feste Grenze sieht an einem Berg
+/// sofort künstlich aus.
+fn snowLine(t: *const types.TerrainParams, x: f32, z: f32) f32 {
+    const band = @max(t.amplitude * 0.12, 24);
+    const n = valueNoise(x / (t.wavelength * 0.22), z / (t.wavelength * 0.22), t.seed ^ 0x51a7);
+    const n2 = valueNoise(x / (t.wavelength * 0.05) + 5.5, z / (t.wavelength * 0.05) - 3.3, t.seed ^ 0x9e12);
+    return t.snow_height + (n - 0.5) * band * 2 + (n2 - 0.5) * band * 0.6;
 }
 
 fn pick(a: u32, default: u32) u32 {
@@ -142,6 +178,7 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
     const bot: i32 = @max(@as(i32, @intFromFloat(@floor(bot_f))), 0);
     if (bot > top) return;
 
+    const snow_h = snowLine(t, wx, wz);
     const surface_y = @floor((h - y0w) / step - 0.5); // lokale Höhe der obersten Zelle
     var y = top;
     while (y >= bot) : (y -= 1) {
@@ -150,7 +187,9 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
         const wy = y0w + (yf + 0.5) * step;
         const a: u32 = blk: {
             if (slope > t.rock_slope) break :blk pick(t.attr_rock, rgb(118, 112, 106));
-            if (wy > t.snow_height) break :blk pick(t.attr_snow, rgb(236, 240, 245));
+            // Schnee: über der aufgelösten Grenze, und je steiler der Hang,
+            // desto höher muss es dafür sein – auf einer Felswand hält er nicht.
+            if (wy > snow_h + slope * t.amplitude * 0.05) break :blk pick(t.attr_snow, rgb(236, 240, 245));
             if (wy < t.sea_level + 2) break :blk pick(t.attr_sand, rgb(214, 196, 142));
             if (depth < 1.0) break :blk pick(t.attr_grass, rgb(84, 140, 58));
             if (depth < 4.0) break :blk pick(t.attr_dirt, rgb(122, 92, 62));
@@ -163,7 +202,7 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
     // Auflösung sichtbar, darüber zu klein)
     if (t.attr_leaves == 0 or key.lod > 1 or slope > t.rock_slope) return;
     const wy_top = y0w + (surface_y + 0.5) * step;
-    if (wy_top < t.sea_level + 1 or wy_top > t.snow_height) return;
+    if (wy_top < t.sea_level + 1 or wy_top > snow_h) return;
     const r = lattice(@intFromFloat(wx), @intFromFloat(wz), t.seed ^ 0x51ed);
     if (r > t.tree_density) return;
     const trunk = pick(t.attr_wood, rgb(96, 68, 44));
