@@ -454,7 +454,8 @@ pub fn main(init: std.process.Init) !void {
     var scale: u32 = 1;
     var flags: u32 = 0;
     var voxel_px: f32 = 0;
-    var sea: f32 = 0;
+    // Meeresspiegel der Demo: hoch genug, dass Buchten und Küste in Sicht sind
+    var sea: f32 = 300;
     var fg = false;
     var half_gi = true;
     var vsync = true;

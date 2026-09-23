@@ -249,31 +249,51 @@ pub fn terrainColumn(g: *const types.WorldGenParams, t: *const types.TerrainPara
     if (r > @min(t.tree_density * cover, 1.0)) return;
 
     const trunk = pick(t.attr_wood, rgb(96, 68, 44));
-    // Jeder Baum bekommt seinen eigenen Grünton, sonst stehen lauter Klone
-    const leaf_f = 0.72 + lattice(@intFromFloat(wx * 1.7), @intFromFloat(wz * 1.3), t.seed ^ 0x2ab1) * 0.55;
-    const leaf = tint(t.attr_leaves, leaf_f, 0);
-    // 5 bis 7 Grundvoxel Stamm, 2 Grundvoxel Kronenradius
-    const trunk_base: f32 = 5 + @as(f32, @floatFromInt(@mod(@as(i32, @intFromFloat(r * 400)), 3)));
+    // Zweite Zufallszahl je Baum: Art, Größe und Grünton
+    const r2 = lattice(@intFromFloat(wx * 1.7), @intFromFloat(wz * 1.3), t.seed ^ 0x2ab1);
+    const conifer = r2 > 0.55; // Nadelbaum: schmal und spitz, sonst rundkronig
+    const leaf = tint(t.attr_leaves, 0.70 + r2 * 0.55, if (conifer) 0 else 0.10);
+
+    // Maße in Grundvoxeln, dann auf die Voxelgröße der Stufe umgerechnet
+    const trunk_base: f32 = if (conifer) 7 + r * 260 else 4 + r * 160;
+    const crown_base: f32 = if (conifer) 2.2 + r2 * 0.8 else 2.6 + r2 * 1.2;
     const trunk_h: i32 = @max(@as(i32, @intFromFloat(@round(trunk_base / step))), 1);
-    const crown_r: i32 = @max(@as(i32, @intFromFloat(@round(2.5 / step))), 1);
+    const crown_r: i32 = @max(@as(i32, @intFromFloat(@round(crown_base / step))), 1);
 
     var ty: i32 = 1;
     while (ty <= trunk_h) : (ty += 1) {
         const vy = @as(i32, @intFromFloat(surface_y)) + ty;
         if (vy >= 0 and vy < ni) emit(g, c, base, counts, out, lx, vy, lz, trunk);
     }
-    // Krone: Kugel um die Stammspitze, innerhalb des Chunks
-    const rr = crown_r * crown_r + crown_r;
-    var dz: i32 = -crown_r;
-    while (dz <= crown_r) : (dz += 1) {
-        var dx: i32 = -crown_r;
-        while (dx <= crown_r) : (dx += 1) {
-            var dy: i32 = -@divTrunc(crown_r, 2);
-            while (dy <= crown_r) : (dy += 1) {
-                if (dx * dx + dy * dy + dz * dz > rr) continue;
+
+    // Krone: Nadelbaum kegelförmig von unten nach oben schmaler, Laubbaum
+    // kugelig. Beide mit leicht unregelmäßigem Rand, sonst sieht man die Form.
+    const top_y = @as(i32, @intFromFloat(surface_y)) + trunk_h;
+    const h_lo: i32 = if (conifer) 0 - @max(@divTrunc(trunk_h * 2, 3), @as(i32, 1)) else 0 - @divTrunc(crown_r, 2);
+    const h_hi: i32 = if (conifer) @max(@divTrunc(crown_r * 3, 2), @as(i32, 1)) else crown_r;
+    var dy: i32 = h_lo;
+    while (dy <= h_hi) : (dy += 1) {
+        // Radius auf dieser Höhe
+        var rad: f32 = undefined;
+        if (conifer) {
+            const f = @as(f32, @floatFromInt(dy - h_lo)) / @as(f32, @floatFromInt(@max(h_hi - h_lo, 1)));
+            rad = @as(f32, @floatFromInt(crown_r)) * (1 - f) + 0.3;
+        } else {
+            const f = @as(f32, @floatFromInt(dy)) / @as(f32, @floatFromInt(@max(crown_r, 1)));
+            rad = @as(f32, @floatFromInt(crown_r)) * @sqrt(@max(1 - f * f * 0.75, 0));
+        }
+        const ri: i32 = @intFromFloat(@floor(rad));
+        var dz: i32 = -ri;
+        while (dz <= ri) : (dz += 1) {
+            var dx: i32 = -ri;
+            while (dx <= ri) : (dx += 1) {
+                const d2 = @as(f32, @floatFromInt(dx * dx + dz * dz));
+                // unregelmäßiger Rand
+                const jitter = lattice(@as(i32, @intFromFloat(wx)) + dx * 7, @as(i32, @intFromFloat(wz)) + dz * 11 + dy * 3, t.seed ^ 0x77b5);
+                if (d2 > rad * rad * (0.75 + jitter * 0.5)) continue;
                 const vx = @as(i32, @intCast(lx)) + dx;
                 const vz = @as(i32, @intCast(lz)) + dz;
-                const vy = @as(i32, @intFromFloat(surface_y)) + trunk_h + dy;
+                const vy = top_y + dy;
                 if (vx < 0 or vz < 0 or vx >= ni or vz >= ni or vy < 0 or vy >= ni) continue;
                 emit(g, c, base, counts, out, @intCast(vx), vy, @intCast(vz), leaf);
             }
