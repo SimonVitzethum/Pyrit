@@ -399,13 +399,15 @@ pub fn main(init: std.process.Init) !void {
                 var dp = phi - sun_phi;
                 if (dp > std.math.pi) dp -= 2 * std.math.pi;
                 if (dp < -std.math.pi) dp += 2 * std.math.pi;
-                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                const sun_r: f32 = if (std.c.getenv("PYRIT_SUN_R")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 0.03) else 0.03;
+                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < sun_r * sun_r) {
                     // Strahldichte so gewaehlt, dass L * Raumwinkel etwa der
                     // Beleuchtungsstaerke der analytischen Sonne entspricht
                     // (0.03 rad Scheibe -> 0.00283 sr, 2.6 / 0.00283 ~ 920)
-                    r += 920;
-                    g += 870;
-                    b += 780;
+                    const peak = 2.6 / (std.math.pi * sun_r * sun_r);
+                    r += peak;
+                    g += peak * 0.94;
+                    b += peak * 0.84;
                 }
                 const o = (y * ew + x) * 4;
                 env[o + 0] = r;
@@ -692,13 +694,15 @@ fn renderWorld(init: std.process.Init, ctx: ?*anyopaque, out_w: u32, out_h: u32,
                 var dp = phi - sun_phi;
                 if (dp > std.math.pi) dp -= 2 * std.math.pi;
                 if (dp < -std.math.pi) dp += 2 * std.math.pi;
-                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < 0.03 * 0.03) {
+                const sun_r: f32 = if (std.c.getenv("PYRIT_SUN_R")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 0.03) else 0.03;
+                if (!env_flat and dt * dt + dp * dp * @sin(theta) * @sin(theta) < sun_r * sun_r) {
                     // Strahldichte so gewaehlt, dass L * Raumwinkel etwa der
                     // Beleuchtungsstaerke der analytischen Sonne entspricht
                     // (0.03 rad Scheibe -> 0.00283 sr, 2.6 / 0.00283 ~ 920)
-                    r += 920;
-                    g += 870;
-                    b += 780;
+                    const peak = 2.6 / (std.math.pi * sun_r * sun_r);
+                    r += peak;
+                    g += peak * 0.94;
+                    b += peak * 0.84;
                 }
                 const o = (y * ew + x) * 4;
                 env[o + 0] = r;
