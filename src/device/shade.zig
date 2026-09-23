@@ -445,8 +445,21 @@ fn coneSample(d: Vec3, spread: f32, rng: *Rng) Vec3 {
 /// Fallen mehrere Wellen auf ein Pixel, springt die Normale von Pixel zu Pixel
 /// und die Spiegelung mit ihr – das sieht als fleckige Wasserfläche aus.
 /// Deshalb werden die Wellen ausgeblendet, sobald sie feiner als das Pixel
-/// werden; die Fläche wird dann glatt, was in der Ferne auch richtig ist.
-pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Vec3 {
+/// werden.
+///
+/// Die dabei verlorene Neigung wird aber *nicht* weggeworfen, sondern in
+/// Rauheit umgerechnet: eine Fläche mit Wellen unterhalb der Pixelgröße ist
+/// nicht glatt, sie ist rau. Wirft man sie weg, bleibt ein spiegelglattes
+/// Wasser mit einem einzigen scharfen Sonnenglanz übrig, der bei jeder
+/// kleinsten Änderung springt – gemessen die groesste verbleibende Quelle
+/// der Bildunruhe. Als Rauheit wird daraus ein breiter, ruhiger Glanz.
+pub const Waves = struct {
+    normal: Vec3,
+    /// zusätzliche Rauheit aus der ausgeblendeten Neigung
+    roughness: f32,
+};
+
+pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Waves {
     const wl = @max(m.wave_length, 1e-3);
     const k = 6.2831853 / wl;
     const t: f32 = @floatCast(s.time);
@@ -455,7 +468,11 @@ pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: V
     // Deutlich früher ausblenden: schon wenn eine Welle nur noch acht Pixel
     // breit ist, beginnt die Spiegelung zu sprenkeln.
     const fade = if (footprint > 0) @min(@max(wl / (16 * footprint), 0), 1) else 1;
-    if (fade <= 0.01) return n;
+    // Neigungsmaß der vollen Wellen; was `fade` davon wegnimmt, wird Rauheit.
+    const slope = m.wave_height * k;
+    const lost = @sqrt(@max(slope * slope * (1 - fade * fade), 0));
+    const extra = @min(0.5 * lost, 1);
+    if (fade <= 0.01) return .{ .normal = n, .roughness = extra };
     const a = m.wave_height * fade;
     const dhdx = a * k * (fm.cos(k * p[0] + ph) + 0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
     const dhdz = a * k * (0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
@@ -464,7 +481,7 @@ pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: V
     if (@abs(n[0]) > 0.9) t1 = .{ 0, 1, 0 };
     const b1 = vec.normalize(vec.cross(n, t1));
     const b2 = vec.cross(n, b1);
-    return vec.normalize(n - b1 * splat(dhdx) - b2 * splat(dhdz));
+    return .{ .normal = vec.normalize(n - b1 * splat(dhdx) - b2 * splat(dhdz)), .roughness = extra };
 }
 
 pub fn worldNormal(inst: *const types.InstanceData, face: u32) Vec3 {
@@ -986,9 +1003,17 @@ pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: V
         // reicht bis zum Untergrund.
         const own_instance = trans_mask != 0 and inst.mask & trans_mask != 0;
         const m = &mats[th.attribute & 0xFF];
-        const sf = surface(s, th.attribute);
+        var sf = surface(s, th.attribute);
         var n = worldNormal(inst, th.face);
-        if (m.flags & types.material_waves != 0) n = waveNormal(s, m, o + d * splat(th.t), n, footprint * th.t);
+        if (m.flags & types.material_waves != 0) {
+            const w = waveNormal(s, m, o + d * splat(th.t), n, footprint * th.t);
+            n = w.normal;
+            sf.roughness = @min(@sqrt(sf.roughness * sf.roughness + w.roughness * w.roughness), 1);
+            // Der scharfe Glanz sitzt auf der Lackschicht, nicht auf dem
+            // Grundmaterial: sie muss genauso aufgeweitet werden.
+            sf.clearcoat_roughness = @min(@sqrt(sf.clearcoat_roughness * sf.clearcoat_roughness +
+                w.roughness * w.roughness), 1);
+        }
         if (vec.dot(n, d) > 0) n = -n;
         const eps = 1e-3 * voxelSize(inst);
         const p = o + d * splat(th.t);

@@ -1282,7 +1282,8 @@ pub const Context = struct {
         self.time_prev = self.time;
         self.origin_prev = self.origin;
         if (info) |fi| {
-            self.time = fi.time;
+            // Diagnose: PYRIT_NOTIME haelt die Szenenzeit an (Wellen stehen).
+            self.time = if (std.c.getenv("PYRIT_NOTIME") != null) 0 else fi.time;
             self.origin = fi.origin;
         }
 
@@ -1385,7 +1386,10 @@ pub const Context = struct {
             .normal = targets.normal,
             .albedo = targets.albedo,
             .material = targets.material,
-            .frame_index = @truncate(self.frame),
+            // Diagnose: PYRIT_NOISE_STATIC friert den Zaehler ein. Damit
+            // haengt keine Abtastung mehr vom Frame ab - jede verbleibende
+            // Unruhe bei stehender Kamera hat dann eine andere Ursache.
+            .frame_index = if (std.c.getenv("PYRIT_NOISE_STATIC") != null) 0 else @truncate(self.frame),
             .transparent_mask = targets.transparent_mask,
             .secondary_mask = targets.secondary_mask,
             .gi = 0,
@@ -1632,6 +1636,9 @@ pub const Context = struct {
         self.lighting.env_total = if (std.c.getenv("PYRIT_ENV_NOMIS") != null) 0 else self.env_total;
         self.lighting.env_mean = self.env_mean;
         self.lighting.sun_always = @intFromBool(std.c.getenv("PYRIT_SUN_ALWAYS") != null);
+        // Diagnose: PYRIT_NOTIME haelt die Szenenzeit an. Damit stehen die
+        // Wellen still - alles andere bleibt unveraendert.
+        if (std.c.getenv("PYRIT_NOTIME") != null) self.time = 0;
         if (self.env_data != 0 and self.lighting.env_intensity == 0) self.lighting.env_intensity = 1;
         try self.uploadValue(self.lighting_dev, &self.lighting);
     }

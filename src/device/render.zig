@@ -286,12 +286,16 @@ inline fn giLoad(ptr: u64, i: u64) [4]f32 {
     return .{ h[0], h[1], h[2], h[3] };
 }
 
-/// Abtastpixel eines 2x2-Blocks; der Versatz wandert mit dem Frame.
-/// (Ein fester Versatz wurde gemessen: am Flimmern ändert er nichts – 0,887
-/// gegen 0,891 –, kostet aber die Abdeckung über die Zeit.)
+/// Abtastpixel eines 2x2-Blocks. Der Versatz ist *fest*.
+///
+/// Wanderte er mit dem Frame, sprang die indirekte Beleuchtung eines Blocks
+/// an Voxelkanten jeden Frame auf eine andere Fläche – dieselbe Ursache wie
+/// beim Jitter: ein echter Signalwechsel, den kein Filter glätten kann.
+/// Die zeitliche Abdeckung, die der wandernde Versatz brachte, ist ohne
+/// Jitter ohnehin nicht mehr vorhanden.
 pub inline fn giSample(p: *const types.RenderParams, hx: u32, hy: u32) [2]u32 {
-    const ox = p.frame_index & 1;
-    const oy = (p.frame_index >> 1) & 1;
+    const ox: u32 = 0;
+    const oy: u32 = 0;
     return .{
         @min(hx * 2 + ox, p.cur.camera.width - 1),
         @min(hy * 2 + oy, p.cur.camera.height - 1),
