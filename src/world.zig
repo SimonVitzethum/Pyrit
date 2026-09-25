@@ -84,6 +84,9 @@ fn cellVoxels(lod: u32) u64 {
 /// Voxel – das kommt nicht vor, also wird dort nicht mehr gezählt.
 const rm_track_max: u32 = 8;
 
+/// Neu planen erst nach so viel Kamerabewegung (Grundvoxel)
+const replan_distance: f64 = 1;
+
 pub const World = struct {
     ctx: *Context,
     plan: world_plan.Plan,
@@ -175,6 +178,9 @@ pub const World = struct {
     /// nächstfeinere Stufe darunter.
     replan: bool = true,
     last_refine_k: f64 = 0,
+    /// Kameraposition beim letzten Planerlauf (siehe replan_distance)
+    plan_cam: [3]f64 = .{ std.math.nan(f64), 0, 0 },
+    plan_refine_k: f64 = 0,
     quiet_frames: u64 = 0,
     /// Zeiten im Auftrag (nur mit PYRIT_WORLD_PROFILE)
     job_gen_ms: f64 = 0,
@@ -569,7 +575,20 @@ pub const World = struct {
         // sichtbaren Chunks und baut deren Kinder dauernd neu (gemessen: 1250
         // Chunks blieben dann dauerhaft offen). Übersprungen wird nur der
         // vollständig ruhende Frame weiter oben.
-        try oom(self.plan.update(camera));
+        // Der Planer läuft nur, wenn sich die Kamera merklich bewegt hat.
+        // Seine Auswahl kippt erst, wenn ein Chunk eine Schwelle überquert;
+        // die liegen alle mindestens refine_k weit weg, ein Block Weg
+        // verschiebt sie unsichtbar wenig. Vorher lief er bei jeder Bewegung
+        // über alle Knoten – im Flug 11 ms je Frame auf dem Hauptthread
+        // (18 600 Chunks), in denen die GPU wartete.
+        var moved: f64 = 0;
+        for (0..3) |a| moved = @max(moved, @abs(camera[a] - self.plan_cam[a]));
+        const planned = self.replan or !(moved < replan_distance) or self.plan.cfg.refine_k != self.plan_refine_k;
+        if (planned) {
+            try oom(self.plan.update(camera));
+            self.plan_cam = camera;
+            self.plan_refine_k = self.plan.cfg.refine_k;
+        }
         self.replan = false;
         self.lap(1, &t0); // Planer
         self.stats.built_chunks = 0;
@@ -599,10 +618,13 @@ pub const World = struct {
         self.lap(3, &t0); // Auftrag stellen
         // Ein ersetzter Chunk (Änderung) verändert die Auswahl nicht – nur
         // neu fertig gewordene tun das.
-        if (self.built_new > 0) try oom(self.plan.collect(camera));
-        // gröbere Auswahl für Schatten und GI (Vorfahren, schon im Speicher)
-        if (self.secondary_mask != 0) try oom(self.plan.collectCoarse(camera, self.secondary_factor));
-        try self.applyVisibility();
+        if (self.built_new > 0) try oom(self.plan.collect(self.plan_cam));
+        // Auswahl und Sichtbarkeit ändern sich nur mit dem Plan oder neuen Chunks
+        if (planned or self.built_new > 0) {
+            // gröbere Auswahl für Schatten und GI (Vorfahren, schon im Speicher)
+            if (self.secondary_mask != 0) try oom(self.plan.collectCoarse(self.plan_cam, self.secondary_factor));
+            try self.applyVisibility();
+        }
         self.lap(4, &t0); // Auswahl und Sichtbarkeit
         try self.evict();
         self.lap(5, &t0); // Verdrängung

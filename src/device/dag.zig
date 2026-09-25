@@ -116,7 +116,10 @@ pub fn traceExit(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32) ?DagHit 
     return walk(true, g, o, d, tmin, tmax, false, null, .{});
 }
 
-/// Loch im festen 4x4-Muster der Fläche, durch die der Strahl in den Voxel
+/// Zellen je Voxelkante im Lochmuster (siehe material_cutout)
+pub const cutout_cells: u32 = 3;
+
+/// Loch im festen Muster der Fläche, durch die der Strahl in den Voxel
 /// eintritt? `p`: Eintrittspunkt im Objektraum, `axis`: Achse der Fläche.
 inline fn cutHole(c: Cut, attribute: u32, voxel: [3]i32, p: Vec3, axis: u32) bool {
     if (!skipped(c.cut, attribute)) return false;
@@ -125,12 +128,12 @@ inline fn cutHole(c: Cut, attribute: u32, voxel: [3]i32, p: Vec3, axis: u32) boo
     inline for (0..3) |a| {
         if (a != axis) {
             const f = @min(@max(p[a] - @as(f32, @floatFromInt(voxel[a])), 0), 0.999);
-            sub[k] = @intFromFloat(f * 4);
+            sub[k] = @intFromFloat(f * @as(f32, @floatFromInt(cutout_cells)));
             k += 1;
         }
     }
     var h: u32 = @as(u32, @bitCast(voxel[0] +% c.base[0])) *% 0x8da6b343 +% @as(u32, @bitCast(voxel[1] +% c.base[1])) *% 0xd8163841 +%
-        @as(u32, @bitCast(voxel[2] +% c.base[2])) *% 0xcb1ab31f +% (attribute >> 8) *% 0x2545f491 +% axis *% 0x9e3779b9 +% (sub[0] * 4 + sub[1]) *% 0x632be5ab;
+        @as(u32, @bitCast(voxel[2] +% c.base[2])) *% 0xcb1ab31f +% (attribute >> 8) *% 0x2545f491 +% axis *% 0x9e3779b9 +% (sub[0] * cutout_cells + sub[1]) *% 0x632be5ab;
     h ^= h >> 15;
     h *%= 0x2c1b3c6d;
     h ^= h >> 12;

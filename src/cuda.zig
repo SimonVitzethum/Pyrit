@@ -23,6 +23,7 @@ pub const CU_AD_FORMAT_HALF: c_int = 0x10;
 pub const CU_AD_FORMAT_FLOAT: c_int = 0x20;
 pub const CUDA_ARRAY3D_SURFACE_LDST: c_uint = 0x02;
 pub const CU_RESOURCE_TYPE_ARRAY: c_int = 0;
+pub const CU_MEMORYTYPE_HOST: c_int = 1;
 pub const CU_MEMORYTYPE_DEVICE: c_int = 2;
 pub const CU_MEMORYTYPE_ARRAY: c_int = 3;
 pub const CU_TR_ADDRESS_MODE_CLAMP: c_int = 1;
@@ -35,6 +36,59 @@ pub const CUDA_ARRAY3D_DESCRIPTOR = extern struct {
     Format: c_int,
     NumChannels: c_uint,
     Flags: c_uint,
+};
+
+// --- Externer Speicher und Semaphoren (Interop mit Vulkan) ---------------
+pub const CUexternalMemory = ?*opaque {};
+pub const CUexternalSemaphore = ?*opaque {};
+pub const CUmipmappedArray = ?*opaque {};
+pub const CU_AD_FORMAT_UNSIGNED_INT8: c_int = 0x01;
+pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
+pub const CUDA_EXTERNAL_MEMORY_DEDICATED: c_uint = 1;
+pub const CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD: c_uint = 9;
+
+comptime {
+    // Größen wie in cuda.h (x86_64)
+    std.debug.assert(@sizeOf(CUDA_EXTERNAL_SEMAPHORE_PARAMS) == 144);
+}
+
+pub const CUDA_EXTERNAL_MEMORY_HANDLE_DESC = extern struct {
+    type: c_uint,
+    handle: extern union {
+        fd: c_int,
+        win32: extern struct { handle: ?*anyopaque, name: ?*const anyopaque },
+    },
+    size: u64,
+    flags: c_uint,
+    reserved: [16]c_uint = .{0} ** 16,
+};
+
+pub const CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC = extern struct {
+    offset: u64,
+    arrayDesc: CUDA_ARRAY3D_DESCRIPTOR,
+    numLevels: c_uint,
+    reserved: [16]c_uint = .{0} ** 16,
+};
+
+pub const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC = extern struct {
+    type: c_uint,
+    handle: extern union {
+        fd: c_int,
+        win32: extern struct { handle: ?*anyopaque, name: ?*const anyopaque },
+    },
+    flags: c_uint,
+    reserved: [16]c_uint = .{0} ** 16,
+};
+
+/// Signal- und Warteparameter: nur der Zähler der Timeline-Semaphore zählt
+pub const CUDA_EXTERNAL_SEMAPHORE_PARAMS = extern struct {
+    fence_value: u64,
+    nv_sci_sync: u64 = 0,
+    keyed_mutex_key: u64 = 0,
+    keyed_mutex_timeout: c_uint = 0,
+    reserved_params: [11]c_uint = .{0} ** 11,
+    flags: c_uint = 0,
+    reserved: [16]c_uint = .{0} ** 16,
 };
 
 pub const CUDA_RESOURCE_DESC = extern struct {
@@ -148,6 +202,15 @@ pub const Driver = struct {
     cuModuleUnload: *const fn (CUmodule) callconv(.c) CUresult,
     cuModuleGetFunction: *const fn (*CUfunction, CUmodule, [*:0]const u8) callconv(.c) CUresult,
     cuLaunchKernel: *const fn (CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream, ?[*]?*anyopaque, ?[*]?*anyopaque) callconv(.c) CUresult,
+    cuImportExternalMemory: *const fn (*CUexternalMemory, *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC) callconv(.c) CUresult,
+    cuExternalMemoryGetMappedMipmappedArray: *const fn (*CUmipmappedArray, CUexternalMemory, *const CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC) callconv(.c) CUresult,
+    cuMipmappedArrayGetLevel: *const fn (*CUarray, CUmipmappedArray, c_uint) callconv(.c) CUresult,
+    cuMipmappedArrayDestroy: *const fn (CUmipmappedArray) callconv(.c) CUresult,
+    cuDestroyExternalMemory: *const fn (CUexternalMemory) callconv(.c) CUresult,
+    cuImportExternalSemaphore: *const fn (*CUexternalSemaphore, *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC) callconv(.c) CUresult,
+    cuSignalExternalSemaphoresAsync: *const fn ([*]const CUexternalSemaphore, [*]const CUDA_EXTERNAL_SEMAPHORE_PARAMS, c_uint, CUstream) callconv(.c) CUresult,
+    cuWaitExternalSemaphoresAsync: *const fn ([*]const CUexternalSemaphore, [*]const CUDA_EXTERNAL_SEMAPHORE_PARAMS, c_uint, CUstream) callconv(.c) CUresult,
+    cuDestroyExternalSemaphore: *const fn (CUexternalSemaphore) callconv(.c) CUresult,
 
     pub fn load() error{NotFound}!Driver {
         const names: []const []const u8 = if (builtin.os.tag == .windows) &.{"nvcuda.dll"} else &.{ "libcuda.so.1", "libcuda.so" };

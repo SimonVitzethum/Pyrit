@@ -42,16 +42,11 @@ pub fn build(b: *std.Build) void {
     const ptx = to_ptx.addOutputFileArg("pyrit_kernels.ptx");
     b.getInstallStep().dependOn(&b.addInstallFile(ptx, "share/pyrit/pyrit_kernels.ptx").step);
 
-    // OptiX-Programme (RT-Cores): derselbe Weg, eigenes Modul
-    const rt_nv = b.addObject(.{ .name = "pyrit_rt", .root_module = kernelModuleFrom(b, nvptx, "src/rt_kernels.zig") });
-    const run_rt_fixup = b.addRunArtifact(fixup);
-    run_rt_fixup.addFileArg(rt_nv.getEmittedLlvmIr());
-    const rt_ir = run_rt_fixup.addOutputFileArg("pyrit_rt.ll");
-    const rt_to_ptx = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "nvptx64-cuda", b.fmt("-mcpu={s}", .{ptx_arch}), "-O3", "-S", "-Wno-unused-command-line-argument" });
-    rt_to_ptx.addFileArg(rt_ir);
-    rt_to_ptx.addArg("-o");
-    const rt_ptx = rt_to_ptx.addOutputFileArg("pyrit_rt.ptx");
-    b.getInstallStep().dependOn(&b.addInstallFile(rt_ptx, "share/pyrit/pyrit_rt.ptx").step);
+    // OptiX-Programme (RT-Cores): nur Traversierung und Strahllisten. Die
+    // Schattierung läuft in CUDA (src/device/replay.zig) – mit optixTrace in
+    // der Schattierung brauchte OptiX zum Übersetzen Minuten und GB.
+    const rt_ptx = ptxOf(b, fixup, nvptx, ptx_arch, "src/rt_kernels.zig", "pyrit_rt");
+
     // Kernel der Demo (Geländegenerator): derselbe Weg, eigenes Modul. Pyrit
     // kennt ihn nicht – die Demo lädt ihn selbst und hängt ihn über
     // PyrWorldInfo.generate ein.
@@ -79,17 +74,48 @@ pub fn build(b: *std.Build) void {
         const header = wf.add("ngx_wrap.h",
             \\#include <stddef.h>
             \\#include <wchar.h>
+            \\#include <vulkan/vulkan.h>
+            \\#include "nvsdk_ngx_vk.h"
             \\#include "nvsdk_ngx.h"
             \\#include "nvsdk_ngx_defs.h"
             \\#include "nvsdk_ngx_params.h"
             \\#include "nvsdk_ngx_defs_dlssd.h"
             \\#include "nvsdk_ngx_params_dlssd.h"
+            \\#include "nvsdk_ngx_defs_dlssg.h"
             \\
         );
         const tc = b.addTranslateC(.{ .root_source_file = header, .target = target, .optimize = optimize, .link_libc = true });
         tc.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{sdk}) });
         ngx = tc.createModule();
     }
+    // Machbarkeitsprobe DLSS Frame Generation über NGX-Vulkan (kopflos, nur Interop)
+    if (dlss_sdk) |sdk| {
+        const wf2 = b.addWriteFiles();
+        const vkh = wf2.add("ngx_vk_wrap.h",
+            \\#include <stddef.h>
+            \\#include <wchar.h>
+            \\#include <vulkan/vulkan.h>
+            \\#include "nvsdk_ngx_vk.h"
+            \\#include "nvsdk_ngx_defs.h"
+            \\#include "nvsdk_ngx_params.h"
+            \\#include "nvsdk_ngx_defs_dlssg.h"
+            \\
+        );
+        const tcv = b.addTranslateC(.{ .root_source_file = vkh, .target = target, .optimize = optimize, .link_libc = true });
+        tcv.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{sdk}) });
+        const pm = b.createModule(.{ .root_source_file = b.path("tools/dlssg_probe.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        pm.addImport("ngxvk", tcv.createModule());
+        pm.addOptions("build_options", options);
+        pm.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/Linux_x86_64/libnvsdk_ngx.a", .{sdk}) });
+        const stdcxx = std.mem.trim(u8, b.run(&.{ "cc", "-print-file-name=libstdc++.so.6" }), " \n\r\t");
+        pm.addObjectFile(.{ .cwd_relative = stdcxx });
+        pm.linkSystemLibrary("vulkan", .{});
+        const probe = b.addExecutable(.{ .name = "pyrit-dlssg-probe", .root_module = pm });
+        b.installArtifact(probe);
+        const run_probe = b.addRunArtifact(probe);
+        b.step("dlssg-probe", "DLSS Frame Generation über NGX-Vulkan prüfen (braucht -Ddlss-sdk)").dependOn(&run_probe.step);
+    }
+
     const ptx_files = PtxFiles{ .kernels = ptx, .rt = rt_ptx, .options = options, .ngx = ngx, .dlss_sdk = dlss_sdk };
 
     // ------------------------------------------------------------------
@@ -263,4 +289,18 @@ fn demoUserModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTar
     demo.addAnonymousImport("demo_ptx", .{ .root_source_file = demo_ptx });
     m.addImport("demo", demo);
     return m;
+}
+
+/// Zig-Kernel -> LLVM-IR -> Alias-Korrektur -> PTX, installiert unter share/pyrit
+fn ptxOf(b: *std.Build, fixup: *std.Build.Step.Compile, nvptx: std.Build.ResolvedTarget, ptx_arch: []const u8, root: []const u8, name: []const u8) std.Build.LazyPath {
+    const obj = b.addObject(.{ .name = name, .root_module = kernelModuleFrom(b, nvptx, root) });
+    const run = b.addRunArtifact(fixup);
+    run.addFileArg(obj.getEmittedLlvmIr());
+    const ir = run.addOutputFileArg(b.fmt("{s}.ll", .{name}));
+    const to_ptx = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "nvptx64-cuda", b.fmt("-mcpu={s}", .{ptx_arch}), "-O3", "-S", "-Wno-unused-command-line-argument" });
+    to_ptx.addFileArg(ir);
+    to_ptx.addArg("-o");
+    const out = to_ptx.addOutputFileArg(b.fmt("{s}.ptx", .{name}));
+    b.getInstallStep().dependOn(&b.addInstallFile(out, b.fmt("share/pyrit/{s}.ptx", .{name})).step);
+    return out;
 }

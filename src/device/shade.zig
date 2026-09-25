@@ -119,14 +119,20 @@ fn texel(t: *const types.TextureData, off: u64, w: u32, h: u32, x: i32, y: i32) 
     return .{ @as(f32, @floatFromInt(px[0])) * inv, @as(f32, @floatFromInt(px[1])) * inv, @as(f32, @floatFromInt(px[2])) * inv };
 }
 
-fn sampleLevel(t: *const types.TextureData, lod: u32, u: f32, v: f32) Vec3 {
+/// `sharp`: Bildschirmpixel je Texel beim Vergrößern (≤ 1 = gewöhnlich
+/// bilinear). Größer als 1 wird der Übergang zwischen zwei Texeln auf ein
+/// Pixel zusammengezogen: Texel bleiben scharfe Quadrate wie bei nächstem
+/// Nachbarn, die Kante ist aber über ein Pixel geglättet und flimmert nicht.
+/// Bilinear vergrößert verwusch eine 32er-Blocktextur aus der Nähe zu Brei.
+fn sampleLevel(t: *const types.TextureData, lod: u32, u: f32, v: f32, sharp: f32) Vec3 {
     const li = levelInfo(t, lod);
     const fx = u * @as(f32, @floatFromInt(li.w)) - 0.5;
     const fy = v * @as(f32, @floatFromInt(li.h)) - 0.5;
     const x0: i32 = @intFromFloat(@floor(fx));
     const y0: i32 = @intFromFloat(@floor(fy));
-    const tx = fx - @floor(fx);
-    const ty = fy - @floor(fy);
+    const k = @max(sharp, 1);
+    const tx = @min(@max((fx - @floor(fx) - 0.5) * k + 0.5, 0), 1);
+    const ty = @min(@max((fy - @floor(fy) - 0.5) * k + 0.5, 0), 1);
     const a = texel(t, li.off, li.w, li.h, x0, y0);
     const b = texel(t, li.off, li.w, li.h, x0 + 1, y0);
     const c = texel(t, li.off, li.w, li.h, x0, y0 + 1);
@@ -139,19 +145,19 @@ fn sampleLevel(t: *const types.TextureData, lod: u32, u: f32, v: f32) Vec3 {
 /// `texels_per_pixel`: wie viele Texel der Grundstufe auf ein Bildschirmpixel
 /// fallen. Darüber wird die Verkleinerungsstufe gewählt und zwischen zwei
 /// Stufen überblendet – ohne das flimmert jede Textur in der Ferne.
-fn sampleTexture(s: *const types.Scene, index: u32, u: f32, v: f32, texels_per_pixel: f32) Vec3 {
+noinline fn sampleTexture(s: *const types.Scene, index: u32, u: f32, v: f32, texels_per_pixel: f32) Vec3 {
     if (index == 0 or index >= s.texture_count) return .{ 1, 1, 1 };
     const tt: [*]const types.TextureData = @ptrFromInt(s.textures);
     const t = &tt[index];
     if (t.data == 0) return .{ 1, 1, 1 };
     const levels = @max(t.levels, 1);
-    if (levels == 1 or texels_per_pixel <= 1) return sampleLevel(t, 0, u, v);
+    if (levels == 1 or texels_per_pixel <= 1) return sampleLevel(t, 0, u, v, 1 / @max(texels_per_pixel, 1e-3));
     const lod_f = @min(fm.log2(texels_per_pixel), @as(f32, @floatFromInt(levels - 1)));
     const lo: u32 = @intFromFloat(@floor(lod_f));
     const frac = lod_f - @floor(lod_f);
-    const a = sampleLevel(t, lo, u, v);
+    const a = sampleLevel(t, lo, u, v, 1);
     if (lo + 1 >= levels or frac <= 0) return a;
-    const b = sampleLevel(t, lo + 1, u, v);
+    const b = sampleLevel(t, lo + 1, u, v, 1);
     return a + (b - a) * splat(frac);
 }
 
@@ -475,7 +481,7 @@ pub const Waves = struct {
     roughness: f32,
 };
 
-pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Waves {
+pub noinline fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Waves {
     // Sechs gerichtete Wellen statt zwei: Längen fallen geometrisch ab, die
     // Richtungen streuen um eine Windrichtung. Mit nur zwei Kosinuswellen
     // entstand ein regelmäßiges Muster aus Ringen, das man auf offenem Meer
@@ -619,9 +625,23 @@ pub fn traceThrough(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tm
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     var att = splat(@as(f32, 1));
     var t0 = tmin;
+    // Offenes Medium einer nur über das Material markierten Fläche (die
+    // Wasseroberfläche einer Welt): es liegt *unter* der Fläche und reicht
+    // bis zum nächsten Treffer. Abgerechnet wird dort – ohne eigenen Strahl:
+    // jeder weitere Aufruf von trace ist im OptiX-Programm eine weitere
+    // eingebettete Kopie und ließ das Übersetzen minutenlang laufen.
+    var medium_from: f32 = -1;
+    var medium_color = splat(@as(f32, 1));
+    var medium_density: f32 = 0;
     var layer: u32 = 0;
     while (layer < types.max_transparent_layers + 1) : (layer += 1) {
-        const h = tracer.trace(s, o, d, t0, tmax, ray_mask, 0) orelse return .{ .hit = null, .att = att };
+        const found = tracer.trace(s, o, d, t0, tmax, ray_mask, 0);
+        if (medium_from >= 0) {
+            const t_end = if (found) |f| f.t else @min(tmax, medium_from + 256);
+            att *= absorb(medium_color, medium_density * @min(t_end - medium_from, 1e4));
+            medium_from = -1;
+        }
+        const h = found orelse return .{ .hit = null, .att = att };
         if (!hitTransparent(s, h, trans_mask)) return .{ .hit = h, .att = att };
         const inst = &tr.instances(s)[h.instance];
         const m = &mats[h.attribute & 0xFF];
@@ -629,16 +649,29 @@ pub fn traceThrough(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tm
         const eps = 1e-3 * voxelSize(inst);
         att *= splat(1 - m.opacity);
         const own = trans_mask != 0 and inst.mask & trans_mask != 0;
-        const rest = tmax - h.t;
-        var len = rest;
+        var len: f32 = 0;
         if (own) {
             const g = tr.dagOf(s, &tr.geometries(s)[inst.geometry]);
             const pin = o + d * splat(h.t + eps);
             const oo = vec.xformPoint(&inst.world_to_object, pin);
             const od = vec.xformVector(&inst.world_to_object, d);
-            if (dag.traceExit(&g, oo, od, 0, @min(rest, 1e6))) |e| len = e.t;
+            len = tmax - h.t;
+            if (dag.traceExit(&g, oo, od, 0, @min(len, 1e6))) |e| len = e.t;
+            if (m.density > 0) att *= absorb(sf.albedo, m.density * @min(len, 1e4));
+        } else if (m.density > 0) {
+            // Von unten getroffen lief der Strahl schon im Wasser: die Strecke
+            // bis hierher zählt, danach ist Luft. Von oben beginnt das Medium
+            // hier. (Vorher zählte in beiden Fällen der ganze Rest des Strahls
+            // bis 10 000: jeder Schattenstrahl vom Meeresgrund zur Sonne wurde
+            // schwarz, und im Wasser sah man nichts.)
+            if (worldNormal(inst, h.face)[1] < -0.5) {
+                att *= absorb(sf.albedo, m.density * @min(h.t - t0, 1e4));
+            } else {
+                medium_from = h.t;
+                medium_color = sf.albedo;
+                medium_density = m.density;
+            }
         }
-        if (m.density > 0) att *= absorb(sf.albedo, m.density * @min(len, 1e4));
         if (@reduce(.Max, att) < 1e-3) return .{ .hit = h, .att = splat(0) };
         t0 = h.t + (if (own) len else 0) + eps;
         if (!(t0 < tmax)) return .{ .hit = null, .att = att };
@@ -679,7 +712,7 @@ fn transmission(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: 
 }
 
 /// Durchlässigkeit der Wolkenschicht für die Sonne am Punkt p (1 = frei)
-pub fn cloudShadow(s: *const types.Scene, l: *const types.Lighting, p: Vec3, ld: Vec3) f32 {
+pub noinline fn cloudShadow(s: *const types.Scene, l: *const types.Lighting, p: Vec3, ld: Vec3) f32 {
     if (ld[1] <= 0.02 or l.sun_shadow_scale <= 0) return 1;
     const t = (l.sun_shadow_height - p[1]) / ld[1];
     if (t <= 0) return 1;
@@ -997,7 +1030,7 @@ fn refract(d: Vec3, n: Vec3, eta: f32) ?Vec3 {
 /// Untergrund (Wasser auf Boden), endet es dort.
 /// `behind`: fertige Farbe des Untergrunds entlang des ungebrochenen Strahls
 /// (bis `t_opaque`), wiederverwendet, solange nichts gebrochen hat.
-pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: Vec3, tmin: f32, t_opaque: f32, behind: Vec3, ray_mask: u32, trans_mask: u32, opaque_mask: u32, secondary_mask: u32, rng: *Rng, footprint: f32) Vec3 {
+pub noinline fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: Vec3, tmin: f32, t_opaque: f32, behind: Vec3, ray_mask: u32, trans_mask: u32, opaque_mask: u32, secondary_mask: u32, rng: *Rng, footprint: f32) Vec3 {
     const l: *const types.Lighting = @ptrFromInt(s.lighting);
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     // aktueller Strahl o + t d mit t in [0, t_end); t_end = Untergrund (flt_max: Himmel)
@@ -1138,6 +1171,10 @@ pub fn transparentLayers(tracer: anytype, s: *const types.Scene, o0: Vec3, d0: V
     return result + throughput * bg;
 }
 
+pub fn absorbPublic(color: Vec3, k: f32) Vec3 {
+    return absorb(color, k);
+}
+
 inline fn absorb(color: Vec3, k: f32) Vec3 {
     return .{ fm.pow(@max(color[0], 1e-4), k), fm.pow(@max(color[1], 1e-4), k), fm.pow(@max(color[2], 1e-4), k) };
 }
@@ -1186,13 +1223,13 @@ pub const Fogged = struct {
     transmittance: f32,
 };
 
-pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, o: Vec3, d: Vec3, dist: f32, color: Vec3, rng: *Rng, mask: u32) Fogged {
+pub noinline fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, o: Vec3, d: Vec3, dist: f32, color: Vec3, rng: *Rng, mask: u32) Fogged {
     // Reichweite des Mediums: der Himmel liegt dahinter, in Sichtweite
     const far_max: f32 = 16384;
     const total = @min(dist, far_max);
     if (!(total > 0)) return .{ .color = color, .transmittance = 1 };
     const near = @min(total, if (l.gi_distance > 0) l.gi_distance * 4 else 4096);
-    const steps: u32 = if (l.fog_steps == 0) 12 else @min(l.fog_steps, 64);
+    const steps: u32 = if (l.fog_steps == 0) 8 else @min(l.fog_steps, 64);
     const sd = vec.normalize(l.sun_direction);
     const phase = phaseHG(l.fog_anisotropy, vec.dot(d, sd));
     const shadows = l.flags & types.lighting_shadows != 0;
@@ -1206,12 +1243,12 @@ pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
     // (Vorher stand hier der Himmel im Zenit durch 4π: zwölfmal zu dunkel,
     // der Dunst am Horizont wurde zu einem dunklen Band.)
     const sun_in = @as(Vec3, l.sun_color) * splat(pi * phase);
-    var sky_in = sky(l, .{ 0, 1, 0 }, false);
-    inline for (0..8) |q| {
-        const ang = @as(f32, @floatFromInt(q)) * (pi / 4.0);
-        sky_in += sky(l, vec.normalize(.{ fm.cos(ang), 0.3, fm.sin(ang) }), false);
-    }
-    sky_in *= splat(1.0 / 9.0);
+    // mit Karte: einmal je Karte gemittelt (pyr_environment_set), statt je
+    // Pixel neun Richtungen nachzuschlagen
+    const sky_in: Vec3 = if (hasEnv(l))
+        @as(Vec3, l.env_ambient) * splat(l.env_intensity)
+    else
+        (sky(l, .{ 0, 1, 0 }, false) + sky(l, .{ 1, 0.3, 0 }, false) + sky(l, .{ -1, 0.3, 0 }, false)) * splat(1.0 / 3.0);
     const fog_c: Vec3 = l.fog_color;
 
     var transmittance: f32 = 1;
@@ -1273,7 +1310,7 @@ pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
 
     // Ferner Abschnitt: Schritte wachsen geometrisch, keine Strahlen
     if (total > near and transmittance >= 0.01) {
-        const far_steps: u32 = 10;
+        const far_steps: u32 = 6;
         const ratio = total / near;
         var t0 = near;
         var k: u32 = 0;

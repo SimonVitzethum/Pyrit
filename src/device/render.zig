@@ -102,17 +102,29 @@ pub fn renderPixel(p: *const types.RenderParams, s: *const types.Scene, x: u32, 
 
 /// Primärstrahl, Tiefe und Motion Vector eines Pixels. `tracer.trace` liefert
 /// den nächsten Treffer samt exakter Ruheposition (p_object).
+/// Primärstrahl eines Pixels: Maske und Flags, wie renderPixelWith ihn
+/// verfolgt (die Wiederholungs-Wavefront trägt ihn damit vorab bitgleich ein)
+pub const Primary = struct { ray: CameraRay, mask: u32, flags: u32 };
+
+pub inline fn primaryRay(p: *const types.RenderParams, x: u32, y: u32) Primary {
+    const cam = &p.cur.camera;
+    const px = @as(f32, @floatFromInt(x)) + 0.5 + cam.jitter[0];
+    const py = @as(f32, @floatFromInt(y)) + 0.5 + cam.jitter[1];
+    return .{ .ray = cameraRay(cam, px, py), .mask = p.ray_mask & ~p.transparent_mask, .flags = p.flags | types.trace_skip_transparent };
+}
+
 pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const types.Scene, x: u32, y: u32) PixelResult {
     const cam = &p.cur.camera;
     const px = @as(f32, @floatFromInt(x)) + 0.5 + cam.jitter[0];
     const py = @as(f32, @floatFromInt(y)) + 0.5 + cam.jitter[1];
-    const ray = cameraRay(cam, px, py);
+    const prim = primaryRay(p, x, y);
+    const ray = prim.ray;
     const opaque_mask = p.ray_mask & ~p.transparent_mask;
     // Schatten, GI und Reflexionen dürfen eine andere (gröbere) Auswahl sehen
     const secondary_mask = if (p.secondary_mask != 0) p.secondary_mask else opaque_mask;
     // durchsichtige Voxel überspringt die Traversierung selbst
     const trans_mask = p.ray_mask & p.transparent_mask;
-    const found = tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, opaque_mask, p.flags | types.trace_skip_transparent);
+    const found = tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, prim.mask, prim.flags);
 
     var r = PixelResult{ .hit = tr.toHit(found), .depth = types.flt_max, .motion = .{ 0, 0 } };
     r.hit.meta |= @as(u32, 0xFF) << types.hit_fog_shift; // klar, bis der Dunst etwas anderes sagt
@@ -158,7 +170,8 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             // Daraus wählt das Shading die Verkleinerungsstufe der Texturen
             // und blendet die Detailnormale aus, bevor sie flimmern kann.
             const cm = &p.cur.camera;
-            const px_per_unit = 2 * cm.scale[1] / @as(f32, @floatFromInt(@max(cm.height, 1)));
+            // in *Ausgabe*pixeln: beim Hochskalieren sind sie um detail_scale kleiner
+            const px_per_unit = 2 * cm.scale[1] / (@as(f32, @floatFromInt(@max(cm.height, 1))) * @max(p.detail_scale, 1));
             const footprint = if (cm.projection == types.projection_orthographic) px_per_unit else h.t * px_per_unit;
             const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint);
             var col = vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
@@ -185,11 +198,16 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
                 inline for (0..3) |a| w2o += inst.world_to_object[a] * inst.world_to_object[a];
                 const fp_obj = footprint * @sqrt(w2o);
                 const axis = (h.face & types.hit_face_mask) >> 1;
+                // Laub mit Lochmuster: die Kanten der Lochzellen zählen wie
+                // Voxelkanten, sonst flimmerten die Löcher bei Bewegung
+                const mats: [*]const types.Material = @ptrFromInt(s.materials);
+                const cells: f32 = if (mats[h.attribute & 0xFF].flags & types.material_cutout != 0) @floatFromInt(@import("dag.zig").cutout_cells) else 1;
                 var near_edge = false;
                 inline for (0..3) |a| {
                     if (a != axis) {
-                        const f = h.p_object[a] - @floor(h.p_object[a]);
-                        if (@min(f, 1 - f) < 0.75 * fp_obj) near_edge = true;
+                        const q = h.p_object[a] * cells;
+                        const f = q - @floor(q);
+                        if (@min(f, 1 - f) < 0.75 * fp_obj * cells) near_edge = true;
                     }
                 }
                 if (!near_edge) cov = 1;
@@ -262,14 +280,32 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             var rng = shade.Rng.init(x, y, p.frame_index, 1);
             const behind = vec.Vec3{ r.color[0], r.color[1], r.color[2] };
             const cm2 = &p.cur.camera;
-            const fp_scale = 2 * cm2.scale[1] / @as(f32, @floatFromInt(@max(cm2.height, 1)));
+            const fp_scale = 2 * cm2.scale[1] / (@as(f32, @floatFromInt(@max(cm2.height, 1))) * @max(p.detail_scale, 1));
             var c = shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng, fp_scale);
             // Ohne durchsichtige Schicht kommt `behind` bitgleich zurück
             if (@reduce(.Or, c != behind)) r.hit.meta |= types.hit_through_transparent;
             // Nebel ganz zum Schluss: er dämpft alles dahinter, auch die
             // transparenten Schichten, und steuert die Lichtschächte bei.
             const lg: *const types.Lighting = @ptrFromInt(s.lighting);
-            if (shade.hasFog(lg)) {
+            if (lg.camera_medium_density > 0) {
+                // Kamera im Medium (unter Wasser): bis zum Treffer oder bis
+                // zur Oberfläche darüber
+                var dist = @min(t_behind, 1e4);
+                if (ray.d[1] > 1e-4) dist = @min(dist, @max((lg.camera_medium_top - ray.o[1]) / ray.d[1], 0));
+                const tm = shade.absorbPublic(lg.camera_medium_color, lg.camera_medium_density * dist);
+                const sc: vec.Vec3 = lg.camera_medium_scatter;
+                c = c * tm + sc * (vec.splat(1) - tm);
+                // der verschleierte Anteil zählt mit Albedo 1 (wie beim Dunst)
+                if (r.color[3] > 0.5) {
+                    const tv = @min(@max((tm[0] + tm[1] + tm[2]) / 3, 0), 1);
+                    if (lg.flags & types.lighting_gi_half != 0) {
+                        r.hit.meta = (r.hit.meta & ~(@as(u32, 0xFF) << types.hit_fog_shift)) |
+                            (@as(u32, @intFromFloat(tv * 255 + 0.5)) << types.hit_fog_shift);
+                    } else {
+                        inline for (0..3) |k| r.albedo[k] = r.albedo[k] * tv + (1 - tv);
+                    }
+                }
+            } else if (shade.hasFog(lg)) {
                 var frng = shade.Rng.init(x, y, p.frame_index, 3);
                 const cv = vec.Vec3{ c[0], c[1], c[2] };
                 const fogged = shade.applyFog(tracer, s, lg, ray.o, ray.d, t_behind, cv, &frng, secondary_mask);

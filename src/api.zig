@@ -133,6 +133,11 @@ pub const Targets = extern struct {
     /// Zusätzliche Primärstrahlen sind billig; geschattet wird nur, was sich
     /// unterscheidet, also fast nur an Kanten.
     coverage: u32,
+    /// Ausgabeauflösung / Renderauflösung (Hochskalieren: 2 bei DLSS 2x),
+    /// 0 = 1. Texturen und Detailnormalen werden dann so scharf abgetastet,
+    /// wie das *Ausgabebild* sie zeigt (sonst wären sie um diesen Faktor zu
+    /// weich – der Upscaler kann verlorene Texturdetails nicht zurückholen).
+    detail_scale: f32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +150,18 @@ pub const post_reset: u32 = 0x1;
 pub const post_no_temporal: u32 = 0x2;
 /// output_ldr als BGRA statt RGBA (Fenstersysteme wie X11)
 pub const post_bgra: u32 = 0x4;
+/// FrameGenInfo.flags: NVIDIA DLSS Frame Generation (NGX über eine kopflose
+/// Vulkan-Interop-Schicht) statt der eingebauten; braucht output_ldr in
+/// pyr_postprocess und liefert output_ldr
+pub const framegen_dlss: u32 = 0x100;
+/// Mit framegen_dlss: Zahl der Zwischenbilder je gerendertem Frame − 1 in den
+/// Bits 12–14 (Multi Frame Generation, 4x = 3, 6x = 5 Zwischenbilder; wie
+/// viele gehen, sagt der Treiber). Das k-te
+/// Zwischenbild (k = 1..n) holt pyr_frame_generate mit t = k / (n + 1).
+pub const framegen_count_shift: u5 = 12;
+pub fn framegenCount(n: u32) u32 {
+    return (@max(n, 1) - 1) << framegen_count_shift;
+}
 
 pub const PostInfo = extern struct {
     /// [4]f32 pro Pixel oder 0

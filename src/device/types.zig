@@ -184,7 +184,7 @@ pub const material_transparent: u32 = 0x4;
 /// Wellen: die Normale wird zeitabhängig gestört (Wasser). Die Geometrie
 /// bleibt stehen, damit Treffer, Tiefe und Motion Vectors exakt bleiben.
 pub const material_waves: u32 = 0x8;
-/// Durchbrochen (Laub): jede Voxelfläche trägt ein festes 4x4-Muster mit
+/// Durchbrochen (Laub): jede Voxelfläche trägt ein festes 3x3-Muster mit
 /// etwa 30 % Löchern. Strahlen, die ein Loch treffen, laufen durch den Voxel
 /// hindurch – auch Schattenstrahlen, das ergibt Lichtflecken am Boden. Das
 /// Muster hängt nur von Voxel, Fläche und Attribut ab: es rauscht nicht.
@@ -367,6 +367,19 @@ pub const Lighting = extern struct {
     sun_shadow_scale: f32,
     sun_shadow_strength: f32,
     sun_shadow_offset: [2]f32,
+    /// Medium um die Kamera (Kamera unter Wasser): jeder Sichtstrahl wird
+    /// auf seinem Weg darin gedämpft (Farbe hoch Dichte · Strecke, wie bei
+    /// transparenten Materialien) und bekommt `camera_medium_scatter`
+    /// (Strahldichte des Streulichts im Medium) dazu. Das Medium reicht bis
+    /// zur Höhe `camera_medium_top` (Wasseroberfläche). Dichte 0 = aus; die
+    /// Anwendung setzt es, solange die Kamera darin ist.
+    camera_medium_density: f32,
+    camera_medium_color: [3]f32,
+    camera_medium_scatter: [3]f32,
+    camera_medium_top: f32,
+    /// Mittlere Strahldichte der Umgebungskarte über die ganze Kugel;
+    /// setzt pyr_environment_set, nicht der Aufrufer (Streulicht im Dunst)
+    env_ambient: [3]f32,
     reserved: [1]u32,
     lights: [max_lights]Light,
 };
@@ -411,7 +424,8 @@ pub const RenderParams = extern struct {
     history_valid: u32,
     ray_mask: u32,
     flags: u32,
-    reserved: u32,
+    /// Ausgabe- / Renderauflösung: Texturen für die Ausgabe scharf (≥ 1)
+    detail_scale: f32,
     /// Hit[width * height] oder 0
     hits: u64,
     /// f32[width * height], lineare Tiefe entlang der Blickachse
@@ -508,6 +522,51 @@ pub const RtHitRecord = extern struct {
 };
 
 /// Launch-Parameter (OptiX-Konstantenspeicher, Name "pyr_rt_params")
+/// Wiederholungs-Wavefront (src/device/replay.zig): Schattierung in CUDA,
+/// Strahlen gesammelt über OptiX. Alles bezieht sich auf einen Streifen des
+/// Bildes (Zeilen y0 .. y0+rows) mit `replay_slots` Strahlplätzen je Pixel.
+pub const replay_slots: u32 = 16;
+
+pub const ReplayRay = extern struct {
+    o: [3]f32,
+    tmin: f32,
+    d: [3]f32,
+    tmax: f32,
+    mask: u32,
+    flags: u32,
+};
+
+pub const ReplayHit = extern struct {
+    t: f32,
+    instance: u32,
+    attribute: u32,
+    face: u32,
+};
+
+pub const ReplayParams = extern struct {
+    /// ReplayRay / ReplayHit / u32-Zustand je Platz (Pixel · slots + i);
+    /// Zustand 0 leer, 1 angefragt, 2 beantwortet
+    rays: u64,
+    hits: u64,
+    state: u64,
+    /// u32 je Pixel: fertig (keine offene Anfrage mehr)
+    done: u64,
+    /// Liste der Plätze, die dieser Durchgang verfolgen soll, und ihr Zähler
+    list: u64,
+    count: u64,
+    capacity: u32,
+    y0: u32,
+    rows: u32,
+    /// 1 = Pixel des GI-Durchgangs (halbe Auflösung)
+    gi: u32,
+    /// 0 = nach der ersten offenen Anfrage eines Pixels keine weiteren
+    /// Strahlen eintragen (sie hingen von einem noch unbekannten Treffer ab)
+    speculate: u32,
+    reserved: u32 = 0,
+};
+
+pub const replay_block: u32 = 128;
+
 pub const RtParams = extern struct {
     /// IAS aller Instanzen; 0 = leere Szene
     handle: u64,
@@ -517,6 +576,7 @@ pub const RtParams = extern struct {
     reserved: u32,
     render: RenderParams,
     trace: TraceParams,
+    replay: ReplayParams,
 };
 
 // ---------------------------------------------------------------------------

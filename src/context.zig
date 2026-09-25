@@ -18,6 +18,7 @@ const Rt = @import("rt.zig").Rt;
 const rt_prims = @import("rt_prims.zig");
 const gpu_build = @import("gpu_build.zig");
 const dlss = @import("dlss.zig");
+const dlssg = @import("dlssg.zig");
 const anim = @import("anim.zig");
 
 const Error = diag.Error;
@@ -127,6 +128,9 @@ const ViewSlot = struct {
     spec_buf: cuda.CUdeviceptr = 0,
     /// Frame Generation: vorwärts projizierte Tiefe und Bewegung
     fg_depth: cuda.CUdeviceptr = 0,
+    /// letztes LDR-Bild aus pyr_postprocess (Eingang der DLSS Frame Generation)
+    last_ldr: u64 = 0,
+    dlssg_frame: u64 = 0,
     fg_mv: cuda.CUdeviceptr = 0,
     /// indirekte Beleuchtung in halber Auflösung ([4]f16)
     gi_buf: cuda.CUdeviceptr = 0,
@@ -163,6 +167,9 @@ const ExecState = struct {
     stream: cuda.CUstream,
 };
 
+/// Intern: Nachbearbeitung schreibt HDR halbgenau (Vorlauf für DLSS SR)
+const post_internal_hdr_half: u32 = 0x8000_0000;
+
 pub const Context = struct {
     gpa: Allocator,
     drv: cuda.Driver,
@@ -189,6 +196,9 @@ pub const Context = struct {
     log_fn: api.LogFn,
     log_user: ?*anyopaque,
     debug: bool,
+    /// Diagnose PYRIT_GPU_TIMING=1: GPU-Zeit je Abschnitt (Ereignisse zwischen
+    /// den Abschnitten, gemittelt, alle 60 Frames ausgegeben)
+    timing: ?*GpuTiming = null,
     force_rt: bool,
 
     module: cuda.CUmodule = null,
@@ -203,12 +213,18 @@ pub const Context = struct {
     fn_present: cuda.CUfunction = null,
     fn_animate: cuda.CUfunction = null,
     fn_gi: cuda.CUfunction = null,
+    fn_replay_render: cuda.CUfunction = null,
+    fn_replay_gi: cuda.CUfunction = null,
+    fn_replay_primary: cuda.CUfunction = null,
     fn_dlss_prepare: cuda.CUfunction = null,
+    fn_dlssg_prepare: cuda.CUfunction = null,
     fn_gi_combine: cuda.CUfunction = null,
     /// Skelettanimation (auf der GPU abgespielt)
     anim: anim.Animation = .{},
     /// NVIDIA NGX (DLSS), beim ersten Gebrauch geladen
     ngx: ?*dlss.Ngx = null,
+    /// DLSS Frame Generation (Vulkan-Interop), erst bei Bedarf angelegt
+    dlssg: ?*dlssg.DlssG = null,
     fn_framegen: cuda.CUfunction = null,
     fn_fg_splat: cuda.CUfunction = null,
     fn_fg_splat_mv: cuda.CUfunction = null,
@@ -252,6 +268,7 @@ pub const Context = struct {
     env_h: u32 = 0,
     env_total: f32 = 0,
     env_mean: f32 = 0,
+    env_ambient: [3]f32 = .{ 0, 0, 0 },
     instance_buf: [2]cuda.CUdeviceptr = .{ 0, 0 },
     update_scratch: cuda.CUdeviceptr = 0,
     scene_dev: cuda.CUdeviceptr = 0,
@@ -354,6 +371,12 @@ pub const Context = struct {
         try self.check(drv.cuEventCreate(&self.post_done, cuda.CU_EVENT_DISABLE_TIMING), "cuEventCreate");
         self.async_post = info.flags & api.create_async_post != 0;
         try self.check(drv.cuEventCreate(&self.aux_event, cuda.CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        if (std.c.getenv("PYRIT_GPU_TIMING") != null) {
+            const t = self.gpa.create(GpuTiming) catch return fail(error.OutOfMemory, "Host-Speicher", .{});
+            t.* = .{};
+            self.timing = t;
+            for (&t.ev) |*e| try self.check(drv.cuEventCreate(e, 0), "cuEventCreate");
+        }
         self.exec_main = .{ .ctx = self, .stream = self.stream };
         self.exec_aux = .{ .ctx = self, .stream = self.aux_stream };
         // Bauspeicher im Pool behalten statt nach jedem Sync ans System zurückzugeben
@@ -442,9 +465,13 @@ pub const Context = struct {
     fn loadKernels(self: *Context) Error!void {
         var err_log: [8192]u8 = undefined;
         @memset(&err_log, 0);
-        const opts = [_]c_int{ cuda.CU_JIT_ERROR_LOG_BUFFER, cuda.CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES };
-        var vals = [_]?*anyopaque{ @ptrCast(&err_log), @ptrFromInt(err_log.len) };
-        const r = self.drv.cuModuleLoadDataEx(&self.module, ptx.ptr, opts.len, &opts, &vals);
+        // Diagnose PYRIT_MAXREG: Registergrenze für das ganze Modul (Belegung
+        // gegen Auslagerung abwägen)
+        const maxreg: usize = if (std.c.getenv("PYRIT_MAXREG")) |e| (std.fmt.parseInt(usize, std.mem.span(e), 10) catch 0) else 0;
+        const opts = [_]c_int{ cuda.CU_JIT_ERROR_LOG_BUFFER, cuda.CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, 0 };
+        var vals = [_]?*anyopaque{ @ptrCast(&err_log), @ptrFromInt(err_log.len), @ptrFromInt(maxreg) };
+        const n_opts: c_uint = if (maxreg > 0) 3 else 2;
+        const r = self.drv.cuModuleLoadDataEx(&self.module, ptx.ptr, n_opts, &opts, &vals);
         if (r != cuda.CUDA_SUCCESS)
             return fail(error.Compile, "PTX laden: {s}\n{s}", .{ self.drv.errorString(r), std.mem.sliceTo(&err_log, 0) });
         try self.check(self.drv.cuModuleGetFunction(&self.fn_update, self.module, "pyr_k_update_instances"), "cuModuleGetFunction");
@@ -458,8 +485,12 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_present, self.module, "pyr_k_present"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_animate, self.module, "pyr_k_animate"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gi, self.module, "pyr_k_gi"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_render, self.module, "pyr_k_replay_render"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_gi, self.module, "pyr_k_replay_gi"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_primary, self.module, "pyr_k_replay_primary"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gi_combine, self.module, "pyr_k_gi_combine"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_dlss_prepare, self.module, "pyr_k_dlss_prepare"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_dlssg_prepare, self.module, "pyr_k_dlssg_prepare"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_framegen, self.module, "pyr_k_framegen"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat, self.module, "pyr_k_fg_splat"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat_mv, self.module, "pyr_k_fg_splat_mv"), "cuModuleGetFunction");
@@ -498,6 +529,13 @@ pub const Context = struct {
         const drv = &self.drv;
         if (self.rt) |r| r.deinit(self);
         self.rt = null;
+        if (self.timing) |t| {
+            for (t.ev) |e| if (e != null) {
+                _ = drv.cuEventDestroy_v2(e);
+            };
+            self.gpa.destroy(t);
+            self.timing = null;
+        }
         self.anim.deinit(self);
         for (self.deferred.items) |d| {
             if (d.event != null) _ = drv.cuEventDestroy_v2(d.event);
@@ -519,6 +557,8 @@ pub const Context = struct {
             freePost(drv, v);
             self.freeDlss(v);
         }
+        if (self.dlssg) |g| g.destroy(self);
+        self.dlssg = null;
         if (self.ngx) |n| n.deinit(self.gpa);
         self.ngx = null;
         for ([_]cuda.CUdeviceptr{ self.materials_dev, self.lighting_dev }) |p| {
@@ -628,7 +668,37 @@ pub const Context = struct {
         return self.activeStream();
     }
 
-    fn activeStream(self: *Context) cuda.CUstream {
+    /// Abschnittsgrenze für PYRIT_GPU_TIMING (sonst nichts)
+    pub fn mark(self: *Context, name: []const u8) void {
+        const t = self.timing orelse return;
+        if (t.n >= t.ev.len) return;
+        _ = self.drv.cuEventRecord(t.ev[t.n], self.activeStream());
+        t.names[t.n] = name;
+        t.n += 1;
+    }
+
+    fn timingCollect(self: *Context) void {
+        const t = self.timing orelse return;
+        defer t.n = 0;
+        if (t.n < 2) return;
+        _ = self.drv.cuEventSynchronize(t.ev[t.n - 1]);
+        for (1..t.n) |i| {
+            var ms: f32 = 0;
+            if (self.drv.cuEventElapsedTime(&ms, t.ev[i - 1], t.ev[i]) != cuda.CUDA_SUCCESS) continue;
+            t.add(t.names[i], ms);
+        }
+        var total: f32 = 0;
+        if (self.drv.cuEventElapsedTime(&total, t.ev[0], t.ev[t.n - 1]) == cuda.CUDA_SUCCESS) t.add("= gesamt", total);
+        if (t.frames == 30 and std.c.getenv("PYRIT_GPU_TIMING_ORDER") != null) {
+            std.debug.print("[pyrit] Abschnitte:", .{});
+            for (t.names[0..t.n]) |nm| std.debug.print(" {s} |", .{nm});
+            std.debug.print("\n", .{});
+        }
+        t.frames += 1;
+        if (t.frames == 60) t.report();
+    }
+
+    pub fn activeStream(self: *Context) cuda.CUstream {
         return if (self.on_post) self.post_stream else self.stream;
     }
 
@@ -1253,6 +1323,8 @@ pub const Context = struct {
     // -----------------------------------------------------------------------
 
     pub fn commit(self: *Context, info: ?*const api.FrameInfo) Error!void {
+        self.mark("Beginn");
+        defer self.mark("Szene");
         const next_frame = self.frame + 1;
 
         // Einträge des Vorframes, die jetzt nicht neu geschrieben werden, nach vorn kopieren
@@ -1377,7 +1449,7 @@ pub const Context = struct {
             .history_valid = @intFromBool(prev_ok),
             .ray_mask = if (targets.ray_mask == 0) 0xFFFFFFFF else targets.ray_mask,
             .flags = targets.flags,
-            .reserved = 0,
+            .detail_scale = if (targets.detail_scale >= 1) targets.detail_scale else 1,
             .hits = targets.hits,
             .depth = targets.depth,
             .motion = targets.motion,
@@ -1419,6 +1491,7 @@ pub const Context = struct {
         const by = types.render_block_y;
         const block = [3]u32{ bx, by, 1 };
         const params_ptr = [_]?*anyopaque{@ptrCast(&params)};
+        if (self.timing) |t| if (t.n == 0) self.mark("Beginn");
         if (self.useRt(params.color != 0 or params.normal != 0 or params.albedo != 0)) |r| {
             try r.render(self, &params);
             if (half_gi) try r.renderGi(self, &params);
@@ -1430,9 +1503,11 @@ pub const Context = struct {
                 try self.launch(self.fn_gi, gg, block, &params_ptr);
             }
         }
+        if (!self.on_post and self.useRt(true) == null) self.mark("Rendern (CUDA)");
         if (half_gi) {
             const grid = [3]u32{ (camera.width + bx - 1) / bx, (camera.height + by - 1) / by, 1 };
             try self.launch(self.fn_gi_combine, grid, block, &params_ptr);
+            self.mark("GI kombinieren");
         }
     }
 
@@ -1639,6 +1714,7 @@ pub const Context = struct {
         // es bleibt reines Abtasten über den Cosinus-Lappen (A/B-Vergleich).
         self.lighting.env_total = if (std.c.getenv("PYRIT_ENV_NOMIS") != null) 0 else self.env_total;
         self.lighting.env_mean = self.env_mean;
+        self.lighting.env_ambient = self.env_ambient;
         self.lighting.sun_always = @intFromBool(std.c.getenv("PYRIT_SUN_ALWAYS") != null);
         // Diagnose: PYRIT_NOTIME haelt die Szenenzeit an. Damit stehen die
         // Wellen still - alles andere bleibt unveraendert.
@@ -1682,6 +1758,18 @@ pub const Context = struct {
         // Lichtabtastung auf genau die Spitzen, die dem Cosinus-Strahl
         // entgehen; wo der Überschuss 0 ist, übernimmt ihn die GI ganz
         // (MIS bleibt dabei erwartungstreu).
+        // mittlere Strahldichte über die Kugel (nach Raumwinkel gewichtet)
+        var amb = [3]f64{ 0, 0, 0 };
+        var amb_w: f64 = 0;
+        for (0..h) |y| {
+            const st = @sin((@as(f64, @floatFromInt(y)) + 0.5) / @as(f64, @floatFromInt(h)) * std.math.pi);
+            for (0..w) |x| {
+                const px = pixels[(@as(usize, y) * w + x) * 4 ..][0..3];
+                inline for (0..3) |q| amb[q] += px[q] * st;
+            }
+            amb_w += st * @as(f64, @floatFromInt(w));
+        }
+        self.env_ambient = .{ @floatCast(amb[0] / amb_w), @floatCast(amb[1] / amb_w), @floatCast(amb[2] / amb_w) };
         var mean: f64 = 0;
         for (0..@as(usize, h) * w) |k| {
             const px = pixels[k * 4 ..][0..3];
@@ -1736,6 +1824,7 @@ pub const Context = struct {
         self.env_h = 0;
         self.env_total = 0;
         self.env_mean = 0;
+        self.env_ambient = .{ 0, 0, 0 };
     }
 
     // -----------------------------------------------------------------------
@@ -2022,12 +2111,19 @@ pub const Context = struct {
         // Tensorkernen, während die Shader-Einheiten schon den nächsten Frame
         // rechnen. Ohne PYR_CREATE_ASYNC_POST wartet der nächste Frame
         // trotzdem, weil er sonst in dieselben Ziele schreiben würde.
-        if (self.post_stream != null) {
+        // Verschachtelt (DLSS ruft für seine Vorstufe pyr_postprocess erneut
+        // auf): nur der äußere Aufruf schaltet um und zurück. Sonst setzte
+        // die Vorstufe on_post am Ende zurück, und der Rest der Nachbearbeitung
+        // (DLSS, Endbild, Effekte) lief ungewollt auf dem Hauptstream – die
+        // Frame Generation las dann auf dem Nachbearbeitungsstream noch das
+        // Bild des vorigen Frames (gemessen: DLSS-G lag einen Frame zurück).
+        const outer = !self.on_post;
+        if (self.post_stream != null and outer) {
             try self.check(self.drv.cuEventRecord(self.render_done, self.stream), "cuEventRecord");
             try self.check(self.drv.cuStreamWaitEvent(self.post_stream, self.render_done, 0), "cuStreamWaitEvent");
             self.on_post = true;
         }
-        defer if (self.on_post) {
+        defer if (self.on_post and outer) {
             self.on_post = false;
             _ = self.drv.cuEventRecord(self.post_done, self.post_stream);
             self.post_pending = true;
@@ -2035,8 +2131,11 @@ pub const Context = struct {
             // überschreibt er die Ziele, aus denen hier noch gelesen wird.
             if (!self.async_post) _ = self.drv.cuStreamWaitEvent(self.stream, self.post_done, 0);
         };
+        defer self.mark("Nachbearbeitung");
         const v = try self.viewSlot(view);
         if (!v.has_last) return fail(error.InvalidArgument, "pyr_postprocess vor dem ersten pyr_render dieser Ansicht", .{});
+        // die interne Vorstufe von DLSS (nur HDR) zählt nicht als Ausgabe
+        if (info.flags & post_internal_hdr_half == 0) v.last_ldr = info.output_ldr;
         if (in.color == 0 or in.normal == 0 or in.albedo == 0 or in.motion == 0 or in.hits == 0)
             return fail(error.InvalidArgument, "pyr_postprocess braucht color, normal, albedo, motion und hits aus pyr_render", .{});
         const w = v.last.camera.width;
@@ -2103,6 +2202,7 @@ pub const Context = struct {
         const block = [3]u32{ b, b, 1 };
         const params_ptr = [_]?*anyopaque{@ptrCast(&p)};
         try self.launch(self.fn_temporal, grid, block, &params_ptr);
+        self.mark("Temporal");
 
         // Diagnose: PYRIT_POST_STATS=1 meldet, wie viele Frames der Verlauf je
         // Pixel im Mittel hält. Bricht der Wert bei Bewegung ein, scheitert die
@@ -2138,6 +2238,8 @@ pub const Context = struct {
                 try self.launch(self.fn_resolve, grid, block, &params_ptr);
                 try self.runFx(v, in, info, f, w, h, v.fx_buf[0], 0);
             } else {
+                // interner Vorlauf für DLSS SR: halbgenaues HDR, wie NGX es liest
+                p.hdr_half = @intFromBool(info.flags & post_internal_hdr_half != 0);
                 try self.launch(self.fn_resolve, grid, block, &params_ptr);
             }
         } else {
@@ -2220,10 +2322,15 @@ pub const Context = struct {
         var color = in.color;
         if (!rr) {
             // eigener temporaler Denoiser + À-trous bis zur HDR-Farbe in Renderauflösung
+            // Vorlauf ohne Bildeffekte (sie kommen hinter DLSS) und halbgenau:
+            // vorher schrieb er f32 bzw. die Ausgabe der Effektkette in einen
+            // halbgenauen Puffer, und DLSS las Bytesalat
             var mod = info.*;
             mod.upscaler = api.upscaler_none;
             mod.output_width = 0;
             mod.output_height = 0;
+            mod.fx = null;
+            mod.flags |= post_internal_hdr_half;
             try self.ensurePost(v, w, h);
             if (v.lr_buf == 0) v.lr_buf = try self.devAlloc(@as(u64, n) * 8, "Nachbearbeitung");
             mod.output_hdr = v.lr_buf;
@@ -2247,6 +2354,7 @@ pub const Context = struct {
         };
         cameraMatrices(&v.last, &inputs.world_to_view, &inputs.view_to_clip);
         try f.evaluate(ngx, self, &inputs);
+        self.mark("DLSS");
 
         // Ausgabe, Verlauf und MVs für die Frame Generation
         if (v.up_w != out_w or v.up_h != out_h) {
@@ -2280,9 +2388,18 @@ pub const Context = struct {
         u.clamp_sigma = if (std.c.getenv("PYRIT_TAAU_CLAMP")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 2.5) else 2.5;
         u.out_hdr = info.output_hdr;
         u.out_ldr = info.output_ldr;
+        // Bildeffekte (Belichtungsautomatik, Bloom, Farbkorrektur) hinter DLSS,
+        // wie hinter TAAU. Vorher fielen sie im DLSS-Pfad ganz weg.
+        const fx: ?*const api.PostFx = if (info.fx) |fp| (if (fp.flags != 0) fp else null) else null;
+        if (fx) |fp| {
+            try self.ensureFx(v, out_w, out_h, if (fp.flags & api.postfx_bloom != 0) @min(if (fp.bloom_levels == 0) 5 else fp.bloom_levels, 8) else 0);
+            u.out_hdr = v.fx_buf[0];
+            u.out_ldr = 0;
+        }
         const b = types.upscale_block;
         const params_ptr = [_]?*anyopaque{@ptrCast(&u)};
         try self.launch(self.fn_present, .{ (out_w + b - 1) / b, (out_h + b - 1) / b, 1 }, .{ b, b, 1 }, &params_ptr);
+        if (fx) |fp| try self.runFx(v, in, info, fp, out_w, out_h, v.fx_buf[0], v.up_buf[2]);
         v.up_parity = cur ^ 1;
         v.up_frames = if (history_ok) v.up_frames + 1 else 1;
         v.up_valid = true;
@@ -2355,6 +2472,7 @@ pub const Context = struct {
         const b = types.upscale_block;
         const params_ptr = [_]?*anyopaque{@ptrCast(&u)};
         try self.launch(self.fn_taau, .{ (out_w + b - 1) / b, (out_h + b - 1) / b, 1 }, .{ b, b, 1 }, &params_ptr);
+        self.mark("TAAU");
         if (fx) |f| try self.runFx(v, in, info, f, out_w, out_h, v.fx_buf[0], v.up_buf[2]);
         v.up_parity = cur ^ 1;
         v.up_frames = if (ok) v.up_frames + 1 else 1;
@@ -2376,9 +2494,11 @@ pub const Context = struct {
             self.post_pending = true;
             if (!self.async_post) _ = self.drv.cuStreamWaitEvent(self.stream, self.post_done, 0);
         };
+        defer self.mark("Zwischenbild");
         const v = try self.viewSlot(view);
         if (!v.up_valid or v.up_frames < 2)
             return fail(error.InvalidArgument, "Frame Generation braucht zwei aufeinanderfolgende pyr_postprocess mit TAAU", .{});
+        if (info.flags & api.framegen_dlss != 0) return self.frameGenerateDlss(v, info);
         var f = std.mem.zeroes(types.FrameGenParams);
         f.width = v.up_w;
         f.height = v.up_h;
@@ -2416,6 +2536,58 @@ pub const Context = struct {
         try self.launch(self.fn_framegen, grid, block, &params_ptr);
     }
 
+    /// DLSS Frame Generation: NGX erzeugt das Zwischenbild aus dem letzten
+    /// LDR-Bild, Bewegung und Tiefe (src/dlssg.zig)
+    fn frameGenerateDlss(self: *Context, v: *ViewSlot, info: *const api.FrameGenInfo) Error!void {
+        if (info.output_ldr == 0 or v.last_ldr == 0)
+            return fail(error.InvalidArgument, "DLSS Frame Generation braucht output_ldr in pyr_postprocess und pyr_frame_generate", .{});
+        const g = self.dlssg orelse blk: {
+            self.dlssg = try dlssg.DlssG.create(self);
+            break :blk self.dlssg.?;
+        };
+        const count: u32 = ((info.flags >> api.framegen_count_shift) & 7) + 1;
+        if (count > g.multi_max)
+            return fail(error.NotFound, "DLSS Frame Generation: {d} Zwischenbilder verlangt, GPU/Treiber können {d}", .{ count, g.multi_max });
+        const t = if (info.t > 0) info.t else 0.5;
+        const kf = t * @as(f32, @floatFromInt(count + 1));
+        const index: u32 = @intFromFloat(@round(kf));
+        if (index < 1 or index > count or @abs(kf - @as(f32, @floatFromInt(index))) > 0.05)
+            return fail(error.InvalidArgument, "DLSS Frame Generation: t = {d:.3} ist bei {d} Zwischenbildern keines von k/{d}", .{ t, count, count + 1 });
+        var in = std.mem.zeroes(dlssg.Inputs);
+        in.ldr = v.last_ldr;
+        in.bgra = info.flags & api.post_bgra != 0;
+        in.motion_depth = v.up_buf[2];
+        in.out = info.output_ldr;
+        in.width = v.up_w;
+        in.height = v.up_h;
+        // Eigene Tiefenskala für DLSS-G: es linearisiert als 1/Tiefe und
+        // trennt bei 600 nahe von fernen Flächen; ferne bewegt es nur mit den
+        // Kameramatrizen, die Bewegungsvektoren wirken dort nicht. Mit der
+        // Kameranähe (ohne Angabe 0,001) lag schon alles ab 0,6 Einheiten
+        // "fern" – bewegte Objekte verschmierten, die Vektoren blieben
+        // wirkungslos (gemessen: Vorzeichen umdrehen änderte nichts). 0,1
+        // Einheiten wie in Spielen üblich (Meter): Grenze bei 60 Einheiten.
+        // Tiefe und Matrizen nutzen dieselbe Nähe, damit sie zusammenpassen.
+        const fg_near: f32 = if (std.c.getenv("PYRIT_DLSSG_NEAR")) |e| (std.fmt.parseFloat(f32, std.mem.span(e)) catch 0.1) else 0.1;
+        in.near = fg_near;
+        in.fov_y = 2 * std.math.atan(v.last.camera.scale[1]);
+        var cur_cd = v.last;
+        cur_cd.camera.near_plane = fg_near;
+        cameraMatrices(&cur_cd, &in.world_to_view, &in.view_to_clip);
+        var prev_cd = if (v.has_before) v.before else v.last;
+        prev_cd.camera.near_plane = fg_near;
+        cameraMatrices(&prev_cd, &in.prev_world_to_view, &in.prev_view_to_clip);
+        in.multi_count = count;
+        in.multi_index = index;
+        if (index == 1) {
+            in.reset = v.dlssg_frame + 1 != v.up_frame or v.up_frames < 3;
+            v.dlssg_frame = v.up_frame;
+        } else if (v.dlssg_frame != v.up_frame) {
+            return fail(error.InvalidArgument, "DLSS Frame Generation: Zwischenbild {d} vor Zwischenbild 1 dieses Frames", .{index});
+        }
+        try g.evaluate(self, &in);
+    }
+
     pub fn stats(self: *const Context) api.Stats {
         var live_instances: u32 = 0;
         for (self.instances[0..self.instance_high]) |i| live_instances += @intFromBool(i.alive);
@@ -2446,7 +2618,39 @@ pub const Context = struct {
             try self.check(self.drv.cuStreamSynchronize(self.post_stream), "cuStreamSynchronize");
             self.post_pending = false;
         }
+        self.timingCollect();
         try self.releaseDeferred(false);
+    }
+};
+
+const GpuTiming = struct {
+    ev: [512]cuda.CUevent = .{null} ** 512,
+    names: [512][]const u8 = undefined,
+    n: usize = 0,
+    frames: u32 = 0,
+    sum_names: [32][]const u8 = undefined,
+    sum_ms: [32]f64 = .{0} ** 32,
+    sums: usize = 0,
+
+    fn add(t: *GpuTiming, name: []const u8, ms: f32) void {
+        for (t.sum_names[0..t.sums], 0..) |nm, i| {
+            if (std.mem.eql(u8, nm, name)) {
+                t.sum_ms[i] += ms;
+                return;
+            }
+        }
+        if (t.sums == t.sum_names.len) return;
+        t.sum_names[t.sums] = name;
+        t.sum_ms[t.sums] = ms;
+        t.sums += 1;
+    }
+
+    fn report(t: *GpuTiming) void {
+        std.debug.print("[pyrit] GPU-Zeit je Frame (Mittel über {d}):", .{t.frames});
+        for (t.sum_names[0..t.sums], t.sum_ms[0..t.sums]) |nm, ms| std.debug.print("  {s} {d:.2}", .{ nm, ms / @as(f64, @floatFromInt(t.frames)) });
+        std.debug.print(" ms\n", .{});
+        t.sums = 0;
+        t.frames = 0;
     }
 };
 

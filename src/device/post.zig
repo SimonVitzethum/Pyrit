@@ -308,7 +308,7 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
         // 6,6 % und 6 % – das Rauschen im Einzelframe ist kleiner als der
         // Fehler, den ein langer, verwischter Verlauf mitbringt.
         const fast = @min(@max((speed - 0.5) / 1.5, 0), 1);
-        limit = @max(limit * (1 - 0.95 * fast), 1);
+        limit = @max(limit * (1 - 0.95 * fast), 8);
         // Hinter Wasser und Glas: Spiegelung und Brechung bewegen sich nicht
         // mit dem Untergrund, nach dessen Motion Vector reprojiziert wird, und
         // Wellen ändern sich mit der Zeit. Lange gemittelt verschmierten die

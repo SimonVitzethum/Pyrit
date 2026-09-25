@@ -178,7 +178,7 @@ typedef struct PyrScene {
 /* Wellen: zeitabhängig gestörte Normale (Wasser). Die Geometrie bleibt stehen,
  * Treffer, Tiefe und Motion Vectors bleiben exakt. */
 #define PYR_MATERIAL_WAVES 0x8u
-/* Durchbrochen (Laub): festes 4x4-Lochmuster je Voxelfläche, ~30 % Löcher;
+/* Durchbrochen (Laub): festes 3x3-Lochmuster je Voxelfläche, ~30 % Löcher;
  * Strahlen (auch Schatten) laufen durch die Löcher hindurch */
 #define PYR_MATERIAL_CUTOUT 0x10u
 #define PYR_MAX_TRANSPARENT_LAYERS 4u
@@ -293,6 +293,14 @@ typedef struct PyrLighting {
     float    sun_shadow_scale;
     float    sun_shadow_strength;
     float    sun_shadow_offset[2];
+    /* Medium um die Kamera (unter Wasser): Sichtstrahlen werden bis zur
+     * Höhe camera_medium_top gedämpft (color hoch density · Strecke) und
+     * bekommen scatter als Streulicht dazu. density 0 = aus. */
+    float    camera_medium_density;
+    float    camera_medium_color[3];
+    float    camera_medium_scatter[3];
+    float    camera_medium_top;
+    float    env_ambient[3];    /* mittlere Strahldichte der Karte; setzt pyr_environment_set */
     uint32_t reserved[1];
 
     PyrLight lights[PYR_MAX_LIGHTS];
@@ -521,6 +529,7 @@ typedef struct PyrTargets {
      * sehen Sekundärstrahlen z. B. nur die gröbere Fassung der Welt. */
     uint32_t secondary_mask;
     uint32_t coverage;            /* Abtastungen je Pixel fuer die Deckung (1..4; 0/1 = aus) */
+    float    detail_scale;        /* Ausgabe- / Renderaufloesung (DLSS 2x: 2), 0 = 1: Texturen fuer die Ausgabe scharf */
 } PyrTargets;
 
 PYR_API PyrResult pyr_view_create(PyrContext* ctx, PyrView* out);
@@ -564,6 +573,9 @@ PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g,
 #define PYR_POST_RESET       0x1u  /* Verlauf verwerfen */
 #define PYR_POST_NO_TEMPORAL 0x2u
 #define PYR_POST_BGRA        0x4u  /* output_ldr als BGRA (X11 und andere Fenster) */
+#define PYR_FRAMEGEN_DLSS    0x100u /* pyr_frame_generate: DLSS Frame Generation (NGX, Vulkan nur als Interop) */
+/* Multi Frame Generation: n Zwischenbilder je Frame (1..8, der Treiber begrenzt), das k-te mit t = k/(n+1) */
+#define PYR_FRAMEGEN_COUNT(n) ((((n) < 1 ? 1u : (uint32_t)(n)) - 1u) << 12)
 
 /* Hochskalieren: gerendert wird in der Auflösung der Kamera, ausgegeben in
  * output_width x output_height. Jitter (pyr_jitter_halton) ist für TAAU und

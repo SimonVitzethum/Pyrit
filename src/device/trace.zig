@@ -86,8 +86,9 @@ pub fn traceScene(s: *const types.Scene, o: Vec3, d: Vec3, tmin: f32, tmax: f32,
         // durchsichtige Materialien und Löcher im Laub überspringt schon die
         // Traversierung (die Löcher für jeden Strahl, auch den durch Wasser)
         const skip: ?*const [4]u64 = if (flags & types.trace_skip_transparent != 0) &s.transparent_materials else null;
-        const hit = if (skip != null or cut != null)
-            dag.traceSkipping(&g, oo, dd, tmin, best, want_attribute, skip, cut, .{ 0, 0, 0 })
+        const icut = if (cutoutHere(in)) cut else null;
+        const hit = if (skip != null or icut != null)
+            dag.traceSkipping(&g, oo, dd, tmin, best, want_attribute, skip, icut, .{ 0, 0, 0 })
         else
             dag.trace(&g, oo, dd, tmin, best, want_attribute);
         if (hit) |h| {
@@ -154,4 +155,14 @@ pub fn hitNormal(s: *const types.Scene, h: types.Hit) Vec3 {
 /// ohne jede Zusatzprüfung.
 pub inline fn anyCutout(s: *const types.Scene) bool {
     return (s.cutout_materials[0] | s.cutout_materials[1] | s.cutout_materials[2] | s.cutout_materials[3]) != 0;
+}
+
+/// Lochmuster nur auf der feinsten Stufe (ein Voxel höchstens so groß wie
+/// eine Welteinheit). Auf gröberen Stufen läge eine Lochzelle unter einem
+/// Pixel: ohne Jitter und TAA flimmerte das Muster bei jeder Bewegung und
+/// sah aus wie Rauschen.
+pub inline fn cutoutHere(in: *const types.InstanceData) bool {
+    var w2o: f32 = 0;
+    inline for (0..3) |a| w2o += in.world_to_object[a] * in.world_to_object[a];
+    return w2o > 0.5; // Voxelkante <= ~1,4 Welteinheiten
 }

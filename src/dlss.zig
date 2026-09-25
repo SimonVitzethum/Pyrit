@@ -68,7 +68,39 @@ pub const Ngx = struct {
         if (ok(c.NVSDK_NGX_Parameter_GetI(self.params, c.NVSDK_NGX_Parameter_SuperSampling_Available, &v))) self.sr = v != 0;
         v = 0;
         if (ok(c.NVSDK_NGX_Parameter_GetI(self.params, c.NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &v))) self.rr = v != 0;
+        if (std.c.getenv("PYRIT_PROBE_DLSSG") != null) self.probeFrameGeneration();
         return self;
+    }
+
+    /// Diagnose (PYRIT_PROBE_DLSSG=1): DLSS-FG über den CUDA-Weg von NGX.
+    ///
+    /// Ergebnis am 25.09.2026 (RTX 5070, SDK 310.9.1): geht nicht und ist
+    /// auch nicht freizuschalten. Der Treiber meldet FrameGeneration.Available
+    /// = 0 (InitResult 0xBAD00001), CUDA_CreateFeature(FrameGeneration)
+    /// liefert 0xBAD00001. Die NVSDK_NGX_CUDA_*-Einsprünge in
+    /// libnvidia-ngx-dlssg.so sind fest verdrahtete Stummel
+    /// (`mov $0xbad00001, %eax; ret`); umgesetzt ist die Frame Generation nur
+    /// im Vulkan-Teil. Pyrit nutzt deshalb seine eigene (pyr_frame_generate).
+    fn probeFrameGeneration(self: *Ngx) void {
+        var v: c_int = -1;
+        const r1 = c.NVSDK_NGX_Parameter_GetI(self.params, c.NVSDK_NGX_Parameter_FrameGeneration_Available, &v);
+        var init_r: c_int = -1;
+        const r2 = c.NVSDK_NGX_Parameter_GetI(self.params, c.NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &init_r);
+        var fi: c_int = -1;
+        const r3 = c.NVSDK_NGX_Parameter_GetI(self.params, c.NVSDK_NGX_Parameter_FrameInterpolation_Available, &fi);
+        std.debug.print("DLSSG-Probe: FrameGeneration.Available={d} (0x{x}), InitResult=0x{x} (0x{x}), FrameInterpolation.Available={d} (0x{x})\n", .{ v, r1, @as(u32, @bitCast(init_r)), r2, fi, r3 });
+        var h: ?*Handle = null;
+        const p = self.params;
+        c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_Parameter_Width, 1280);
+        c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_Parameter_Height, 720);
+        c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_DLSSG_Parameter_Width, 1280);
+        c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_DLSSG_Parameter_Height, 720);
+        c.NVSDK_NGX_Parameter_SetUI(p, c.NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, 28); // R8G8B8A8_UNORM (DXGI)
+        for ([_]c_int{ c.NVSDK_NGX_Feature_FrameGeneration, c.NVSDK_NGX_Feature_SlowMotion }) |feat| {
+            const r = c.NVSDK_NGX_CUDA_CreateFeature(@intCast(feat), p, &h);
+            std.debug.print("DLSSG-Probe: CUDA_CreateFeature({d}) = 0x{x}\n", .{ feat, r });
+            if (ok(r)) _ = c.NVSDK_NGX_CUDA_ReleaseFeature(h);
+        }
     }
 
     pub fn deinit(self: *Ngx, gpa: std.mem.Allocator) void {

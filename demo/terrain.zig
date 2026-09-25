@@ -74,7 +74,12 @@ pub const Block = enum(u8) {
             .sandstone => rgb(mat_sand, 170, 154, 108),
             .gravel => rgb(mat_gravel, 128, 122, 118),
             .snow => rgb(mat_snow, 188, 194, 206),
-            .water => rgb(mat_water, 40, 90, 140),
+            // Wasser: die Farbe ist zugleich der Absorptionston (Farbe hoch
+            // Dichte · Strecke). Mit Dichte 0,08 ergibt (30, 170, 210) etwa
+            // 0,35 / 0,07 / 0,04 je Block für Rot/Grün/Blau – klares
+            // Meerwasser: Rot ist nach wenigen Blöcken fort, Blaugrün reicht
+            // gut 20 Blöcke weit.
+            .water => rgb(mat_water, 30, 170, 210),
             .oak_log => rgb(mat_wood, 100, 86, 66),
             .birch_log => rgb(mat_wood, 214, 210, 196),
             .spruce_log => rgb(mat_wood, 62, 52, 42),

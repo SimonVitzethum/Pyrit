@@ -227,6 +227,16 @@ export fn pyr_k_dlss_prepare(
     specular[i] = f0;
 }
 
+/// Eingaben für DLSS Frame Generation (src/dlssg.zig): Bewegung in Pixeln
+/// (Vorframe − jetzt) und Tiefe umgekehrt unendlich (near / Abstand, Himmel 0)
+export fn pyr_k_dlssg_prepare(mvd: [*]const [4]f32, mv: [*][2]f32, depth: [*]f32, count: u32, near: f32) callconv(kernel) void {
+    const i = @workGroupId(0) * types.update_block + @workItemId(0);
+    if (i >= count) return;
+    const m = mvd[i];
+    mv[i] = .{ m[0], m[1] };
+    depth[i] = if (m[2] > 0 and m[2] < 1e30) @min(near / m[2], 1.0) else 0;
+}
+
 // ---------------------------------------------------------------------------
 // Skelettanimation (Logik in src/device/anim.zig)
 // ---------------------------------------------------------------------------
@@ -237,6 +247,22 @@ export fn pyr_k_animate(p: types.AnimParams) callconv(kernel) void {
 }
 
 /// Indirekte Beleuchtung in halber Auflösung (CUDA-Pfad)
+/// Wiederholungs-Wavefront (RT-Cores): ein Schattierungsdurchgang
+export fn pyr_k_replay_render(p: types.RenderParams, rp: types.ReplayParams, trace_flags: u32) callconv(kernel) void {
+    const i = @workGroupId(0) * types.replay_block + @workItemId(0);
+    pyr.replay.renderPass(&p, &rp, @ptrFromInt(p.scene), i, trace_flags);
+}
+
+export fn pyr_k_replay_primary(p: types.RenderParams, rp: types.ReplayParams, trace_flags: u32) callconv(kernel) void {
+    const i = @workGroupId(0) * types.replay_block + @workItemId(0);
+    pyr.replay.primaryPass(&p, &rp, i, trace_flags);
+}
+
+export fn pyr_k_replay_gi(p: types.RenderParams, rp: types.ReplayParams, trace_flags: u32) callconv(kernel) void {
+    const i = @workGroupId(0) * types.replay_block + @workItemId(0);
+    pyr.replay.giPass(&p, &rp, @ptrFromInt(p.scene), i, trace_flags);
+}
+
 export fn pyr_k_gi(p: types.RenderParams) callconv(kernel) void {
     const x = @workGroupId(0) * types.render_block_x + @workItemId(0);
     const y = @workGroupId(1) * types.render_block_y + @workItemId(1);

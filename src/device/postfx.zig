@@ -294,7 +294,11 @@ pub fn exposeApply(p: *const types.PostFxParams, i: u64) void {
     }
     const prev = state[1];
     // gedämpft: exponentiell mit der Zeitkonstante `expose_speed`
-    const a = if (prev > 0) @min(@max(p.expose_speed, 0), 1) else 1;
+    // Große Sprünge (Laden, Szenenwechsel) holt sie schneller ein: ab einer
+    // Blende Abstand wächst die Rate mit, sonst lag das Bild nach dem Start
+    // sekundenlang fast weiß im Dunst
+    const stops = if (prev > 0 and target > 0) @abs(fm.log2(target / prev)) else 0;
+    const a = if (prev > 0) @min(@max(p.expose_speed, 0) * @max(1, stops * stops), 1) else 1;
     const cur = if (prev > 0) prev + (target - prev) * a else target;
     state[0] = target;
     state[1] = cur;

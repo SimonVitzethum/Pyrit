@@ -1,14 +1,17 @@
 //! Pyrit-Demo: eine Minecraft-artige Welt, auf der GPU erzeugt (eigener
 //! CUDA-Kernel in demo/kernels.zig), 1024 Chunks Sichtweite, Zuschauermodus.
 //!
-//!   zig build demo -- [--size 1280x720] [--scale 2] [--seed 1] [--fg]
+//!   zig build demo -Ddlss-sdk=$PWD/DLSS -- [--mode native|taau|dlaa|dlss|rr]
+//!                     [--size 1280x720] [--scale 2] [--seed 1] [--fg [dlss|dlss3|dlss4|dlss6]]
 //!                     [--super 2] [--voxel-px 4] [--no-rt] [--no-vsync]
 //!   zig build demo -- --record bilder [--still 10] [--move 10] [--warm 40]
 //!
 //! Steuerung (Zuschauermodus): W/S fliegen in Blickrichtung, A/D seitlich,
 //! Leertaste hoch, Umschalt runter, Strg schneller, Maus ziehen dreht,
 //! Q/E drehen die Sonne, +/- ändern die Zielgröße der Voxel,
-//! F Zwischenbilder, B/T/U Bloom/Tiefenschärfe/Bewegungsunschärfe,
+//! 1–5 Bildaufbau: nativ, TAAU, DLAA, DLSS, DLSS Ray Reconstruction,
+//! F Zwischenbilder: aus, eigene CUDA-Frame-Generation, DLSS Frame Generation
+//! (nur mit TAAU/DLAA/DLSS/RR), B/T/U Bloom/Tiefenschärfe/Bewegungsunschärfe,
 //! N Nebel, G Bounces, K Mittelung, J Filter, M/L/V Diagnose, Esc beendet.
 //!
 //! --record rendert ohne Fenster: erst Einschwingen, dann stehende und
@@ -92,6 +95,10 @@ const Win = struct {
     zoom_in: bool = false,
     zoom_out: bool = false,
     toggle_fg: bool = false,
+    /// F3: Debugbildschirm
+    debug: bool = false,
+    /// Tasten 1–5: Bildaufbau (Mode) wählen
+    mode_key: ?u8 = null,
     /// Umschalter für die Bildeffekte (Tasten B, T, U, N, G)
     toggle: [10]bool = .{false} ** 10,
 
@@ -164,6 +171,7 @@ const ToplevelListener = extern struct {
 };
 
 fn onToplevelConfigure(_: ?*anyopaque, _: *wl.Proxy, w: i32, h: i32, _: *anyopaque) callconv(.c) void {
+    if (std.c.getenv("PYRIT_DEMO_DEBUG") != null) std.debug.print("configure {d}x{d}\n", .{ w, h });
     if (w > 0 and h > 0) {
         W.width = @intCast(w);
         W.height = @intCast(h);
@@ -248,6 +256,7 @@ fn onKey(_: ?*anyopaque, _: *wl.Proxy, _: u32, _: u32, key: u32, state: u32) cal
         wl.key_equal => W.zoom_in = true,
         wl.key_minus => W.zoom_out = true,
         wl.key_f => W.toggle_fg = true,
+        wl.key_f3 => W.debug = !W.debug,
         wl.key_b => W.toggle[0] = true,
         wl.key_t => W.toggle[1] = true,
         wl.key_u => W.toggle[2] = true,
@@ -259,6 +268,7 @@ fn onKey(_: ?*anyopaque, _: *wl.Proxy, _: u32, _: u32, key: u32, state: u32) cal
         wl.key_m => W.toggle[7] = true, // zeitliche Mittelung (TAA) aus/an
         wl.key_l => W.toggle[8] = true, // LOD und Nachladen einfrieren
         wl.key_v => W.toggle[9] = true, // Wellen aus/an
+        wl.key_1, wl.key_2, wl.key_3, wl.key_4, wl.key_5 => W.mode_key = @intCast(key - wl.key_1),
         else => {},
     }
 }
@@ -355,6 +365,7 @@ fn openWindow(title: [*:0]const u8, w: u32, h: u32) !void {
 /// Legt Pool und zwei Puffer in der gewünschten Größe an.
 fn resizeBuffers(w: u32, h: u32) !void {
     if (W.buf_w == w and W.buf_h == h) return;
+    if (std.c.getenv("PYRIT_DEMO_DEBUG") != null) std.debug.print("Puffer {d}x{d}\n", .{ w, h });
     for (&W.bufs) |*b| if (b.*) |p| {
         W.c.proxy_destroy(p);
         b.* = null;
@@ -428,13 +439,25 @@ const Targets = struct {
     out_h: u32 = 0,
     tg: api.Targets = std.mem.zeroes(api.Targets),
     ldr: u64 = 0,
-    ldr_fg: u64 = 0,
+    /// Zwischenbilder (bis zu fünf je Frame: DLSS Multi Frame Generation 6x)
+    ldr_fg: [max_gens]u64 = .{0} ** max_gens,
+    coverage: u32 = 4,
 
     fn free(self: *Targets) void {
-        for ([_]u64{ self.tg.hits, self.tg.motion, self.tg.color, self.tg.normal, self.tg.albedo, self.ldr, self.ldr_fg }) |b| {
+        for ([_]u64{ self.tg.hits, self.tg.motion, self.tg.color, self.tg.normal, self.tg.albedo, self.tg.material, self.ldr }) |b| {
             if (b != 0) _ = drv.cuMemFree_v2(b);
         }
-        self.* = .{};
+        for (self.ldr_fg) |b| {
+            if (b != 0) _ = drv.cuMemFree_v2(b);
+        }
+        self.* = .{ .coverage = self.coverage };
+    }
+
+    /// Deckungsabtastung nur ohne Jitter (dort übernimmt sie die
+    /// Kantenglättung); mit Jitter macht das der Upscaler über die Zeit.
+    fn setMode(self: *Targets, m: Mode) void {
+        self.coverage = if (m.jitter()) 1 else 2;
+        self.tg.coverage = self.coverage;
     }
 
     fn resize(self: *Targets, w: u32, h: u32, out_w: u32, out_h: u32) void {
@@ -448,16 +471,60 @@ const Targets = struct {
         self.tg.color = devAlloc(n * 16);
         self.tg.normal = devAlloc(n * 16);
         self.tg.albedo = devAlloc(n * 16);
+        // Rauheit und Metall je Pixel für DLSS Ray Reconstruction
+        self.tg.material = devAlloc(n * 8);
         self.tg.ray_mask = 0x1;
         // Deckung an Kanten: 4 Abtastungen. Nur Kantenpixel zahlen dafür;
         // mit 2 blieben ferne Grate gegen den Himmel treppig.
-        self.tg.coverage = 4;
+        self.tg.coverage = self.coverage;
+        // Texturen für die Ausgabe scharf abtasten, nicht für die Renderauflösung
+        self.tg.detail_scale = @as(f32, @floatFromInt(out_h)) / @as(f32, @floatFromInt(h));
         self.ldr = devAlloc(n_out * 4);
-        self.ldr_fg = devAlloc(n_out * 4);
+        for (&self.ldr_fg) |*b| b.* = devAlloc(n_out * 4);
         self.w = w;
         self.h = h;
         self.out_w = out_w;
         self.out_h = out_h;
+    }
+};
+
+/// höchstens so viele Zwischenbilder je Frame (6x)
+const max_gens = 5;
+
+fn sleepUntil(init: std.process.Init, t: f64) void {
+    const d = t - nowSeconds(init);
+    if (d <= 0.0002) return;
+    const ts = std.c.timespec{ .sec = @intFromFloat(@floor(d)), .nsec = @intFromFloat((d - @floor(d)) * 1e9) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Angehefteter Zwischenspeicher eines Frames: die Zwischenbilder
+/// (host[0..max_gens]) und das gerenderte Bild (host[max_gens])
+const Stage = struct {
+    host: [max_gens + 1][]u8 = .{&.{}} ** (max_gens + 1),
+    bytes: usize = 0,
+    gens: u32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
+    valid: bool = false,
+
+    fn ensure(self: *Stage, bytes: usize) !void {
+        if (self.bytes >= bytes) return;
+        self.free();
+        for (&self.host) |*hb| {
+            var ptr: ?*anyopaque = null;
+            cu(drv.cuMemHostAlloc(&ptr, bytes, 0));
+            hb.* = @as([*]u8, @ptrCast(ptr.?))[0..bytes];
+        }
+        self.bytes = bytes;
+    }
+
+    fn free(self: *Stage) void {
+        for (&self.host) |*hb| if (hb.len != 0) {
+            _ = drv.cuMemFreeHost(hb.ptr);
+            hb.* = &.{};
+        };
+        self.* = .{};
     }
 };
 
@@ -481,7 +548,7 @@ const Spectator = struct {
         return .{ @floor(self.pos[0] / 1024) * 1024, 0, @floor(self.pos[2] / 1024) * 1024 };
     }
 
-    fn camera(self: *const Spectator, cam: *types.Camera, w: u32, h: u32) void {
+    fn camera(self: *const Spectator, cam: *types.Camera, w: u32, h: u32, jitter_frame: ?u32) void {
         const o = self.origin();
         const d = self.dir();
         const eye = [3]f32{ @floatCast(self.pos[0] - o[0]), @floatCast(self.pos[1] - o[1]), @floatCast(self.pos[2] - o[2]) };
@@ -497,6 +564,102 @@ const Spectator = struct {
         // echtes Wechselsignal, das kein Filter glätten kann (wandernde
         // Schatten). Die Kantenglättung macht `tg.coverage` im Frame.
         cam.jitter = .{ 0, 0 };
+        if (jitter_frame) |f| pyrit.pyr_jitter_halton(f, &cam.jitter);
+    }
+};
+
+/// Bildaufbau: eigener Denoiser in voller Auflösung oder Hochskalieren.
+/// DLSS und TAAU brauchen Subpixel-Jitter, um Details zu rekonstruieren – sie
+/// sind dafür gebaut und verteilen ihn sauber über die Zeit. Nur der eigene
+/// Denoiser läuft ohne: dort verursachte der Jitter die wandernden Schatten.
+/// Zwischenbilder (Taste F) macht Pyrits eigene Frame Generation oder DLSS
+/// Frame Generation (NGX über die kopflose Vulkan-Interop-Schicht, src/dlssg.zig).
+/// Zwischenbild je Frame
+const overlay = @import("overlay.zig");
+
+const Fg = enum {
+    off,
+    pyrit,
+    /// DLSS Frame Generation 2x, 3x, 4x (1–3 Zwischenbilder, Multi Frame Generation)
+    dlss,
+    dlss3,
+    dlss4,
+    dlss6,
+
+    fn next(f: Fg) Fg {
+        return switch (f) {
+            .off => .pyrit,
+            .pyrit => .dlss,
+            .dlss => .dlss3,
+            .dlss3 => .dlss4,
+            .dlss4 => .dlss6,
+            .dlss6 => .off,
+        };
+    }
+    fn isDlss(f: Fg) bool {
+        return f == .dlss or f == .dlss3 or f == .dlss4 or f == .dlss6;
+    }
+    /// Zwischenbilder je gerendertem Frame
+    fn count(f: Fg) u32 {
+        return switch (f) {
+            .off => 0,
+            .pyrit, .dlss => 1,
+            .dlss3 => 2,
+            .dlss4 => 3,
+            .dlss6 => 5,
+        };
+    }
+    fn flags(f: Fg) u32 {
+        return if (f.isDlss()) api.framegen_dlss | api.framegenCount(f.count()) else 0;
+    }
+    fn label(f: Fg) []const u8 {
+        return switch (f) {
+            .off => "",
+            .pyrit => " +Zwischenbild",
+            .dlss => " +DLSS-FG 2x",
+            .dlss3 => " +DLSS-FG 3x",
+            .dlss4 => " +DLSS-FG 4x",
+            .dlss6 => " +DLSS-FG 6x",
+        };
+    }
+};
+
+const Mode = enum {
+    native,
+    taau,
+    dlaa,
+    dlss,
+    rr,
+
+    fn upscaler(m: Mode) u32 {
+        return switch (m) {
+            .native => api.upscaler_none,
+            .taau => api.upscaler_taau,
+            .dlaa, .dlss => api.upscaler_dlss,
+            .rr => api.upscaler_dlss_rr,
+        };
+    }
+
+    /// Teiler der Renderauflösung
+    fn scale(m: Mode) u32 {
+        return switch (m) {
+            .native, .dlaa, .rr => 1,
+            .taau, .dlss => 2,
+        };
+    }
+
+    fn jitter(m: Mode) bool {
+        return m != .native;
+    }
+
+    fn name(m: Mode) []const u8 {
+        return switch (m) {
+            .native => "nativ",
+            .taau => "TAAU 2x",
+            .dlaa => "DLAA",
+            .dlss => "DLSS 2x",
+            .rr => "DLSS Ray Reconstruction",
+        };
     }
 };
 
@@ -507,11 +670,15 @@ const sprint_factor: f64 = 4;
 const Options = struct {
     out_w: u32 = 1280,
     out_h: u32 = 720,
-    scale: u32 = 1,
+    /// 0 = nach Modus
+    scale: u32 = 0,
+    mode: Mode = .native,
     flags: u32 = 0,
-    voxel_px: f32 = 0,
+    /// Zielgröße eines Voxels in Ausgabepixeln, bevor die Welt gröbere Stufen
+    /// nimmt (4 ließ nahe Bereiche sichtbar grob; 1 sprengt das Chunk-Budget)
+    voxel_px: f32 = 2,
     seed: u32 = 1,
-    fg: bool = false,
+    fg: Fg = .off,
     half_gi: bool = true,
     vsync: bool = true,
     super: u32 = 1,
@@ -543,6 +710,12 @@ const Options = struct {
     exposure: f32 = 0,
     no_sun: bool = false,
     no_waves: bool = false,
+    /// Teilbaumgröße der RT-Primitive (2^n Voxel, 0 = Vorgabe)
+    rt_leaf: u32 = 0,
+    /// Messung am Ende der Aufnahme: so viele Blöcke setzen (0 = aus)
+    edit_bench: u32 = 0,
+    /// Prüfung der Bewegungsvektoren der Frame Generation (bewegter Würfel)
+    mv_test: bool = false,
 };
 
 fn parseArgs(args: []const [:0]const u8) !Options {
@@ -556,6 +729,12 @@ fn parseArgs(args: []const [:0]const u8) !Options {
             var it = std.mem.splitScalar(u8, args[i], 'x');
             o.out_w = try std.fmt.parseInt(u32, it.next() orelse "1280", 10);
             o.out_h = try std.fmt.parseInt(u32, it.next() orelse "720", 10);
+        } else if (std.mem.eql(u8, a, "--mode") and has_val) {
+            i += 1;
+            o.mode = std.meta.stringToEnum(Mode, args[i]) orelse {
+                std.debug.print("--mode: native, taau, dlaa, dlss oder rr\n", .{});
+                return error.Usage;
+            };
         } else if (std.mem.eql(u8, a, "--scale") and has_val) {
             i += 1;
             o.scale = try std.fmt.parseInt(u32, args[i], 10);
@@ -625,7 +804,13 @@ fn parseArgs(args: []const [:0]const u8) !Options {
             i += 1;
             o.turn = try std.fmt.parseFloat(f32, args[i]);
         } else if (std.mem.eql(u8, a, "--fg")) {
-            o.fg = true;
+            o.fg = .pyrit;
+            if (has_val) {
+                if (std.meta.stringToEnum(Fg, args[i + 1])) |f| {
+                    i += 1;
+                    o.fg = f;
+                }
+            }
         } else if (std.mem.eql(u8, a, "--check")) {
             o.check = true;
         } else if (std.mem.eql(u8, a, "--super") and has_val) {
@@ -635,6 +820,16 @@ fn parseArgs(args: []const [:0]const u8) !Options {
             o.vsync = false;
         } else if (std.mem.eql(u8, a, "--no-half-gi")) {
             o.half_gi = false;
+        } else if (std.mem.eql(u8, a, "--mv-test")) {
+            o.mv_test = true;
+        } else if (std.mem.eql(u8, a, "--no-images")) {
+            no_images = true;
+        } else if (std.mem.eql(u8, a, "--edit-bench") and has_val) {
+            i += 1;
+            o.edit_bench = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--rt-leaf") and has_val) {
+            i += 1;
+            o.rt_leaf = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, a, "--no-rt")) {
             o.flags |= api.create_no_rt;
         } else {
@@ -654,6 +849,7 @@ const App = struct {
     light: types.Lighting,
     water: types.Material,
     view: api.Handle = null,
+    stream: cuda.CUstream = null,
 
     fn init(self: *App, init_: std.process.Init, o: Options) !void {
         drv = cuda.Driver.load() catch return error.NoCuda;
@@ -664,7 +860,10 @@ const App = struct {
         cu(drv.cuDevicePrimaryCtxRetain(&cu_ctx, dev));
         cu(drv.cuCtxSetCurrent(cu_ctx));
 
+        // eigener Stream: die Demo hängt ihre Kopien zum Fenster daran an
+        cu(drv.cuStreamCreate(&self.stream, cuda.CU_STREAM_NON_BLOCKING));
         var ci = scene.createInfo(o.flags);
+        ci.cuda_stream = self.stream;
         req(pyrit.pyr_create(&ci, @ptrCast(&self.ctx)));
         try scene.materials(self.ctx, init_.gpa);
         self.water = scene.water();
@@ -676,6 +875,7 @@ const App = struct {
         // Adresse bleibt fest: Pyrit hält `user` für die Lebensdauer der Welt
         self.wi = self.gen.worldInfo();
         self.wi.voxel_pixels = o.voxel_px;
+        self.wi.rt_leaf_log2 = o.rt_leaf;
         req(pyrit.pyr_world_create(@ptrCast(self.ctx), &self.wi, @ptrCast(&self.world)));
 
         self.light = try scene.lighting(self.ctx, init_.gpa, .{});
@@ -714,6 +914,18 @@ const App = struct {
     }
 
     /// Ein Frame: Welt nachführen, rendern, nachbearbeiten
+    /// Welt nachführen (Planer, Laden, Sichtbarkeit). Die Welt wählt ihr LOD
+    /// nach der *Ausgabe*auflösung: beim Hochskalieren rendert die Kamera
+    /// kleiner, das Bild zeigt die Voxel aber in voller Größe (mit der
+    /// Renderkamera waren nahe Voxel doppelt so grob).
+    fn updateWorld(self: *App, sp: *const Spectator, cam: *const types.Camera, tgs: *const Targets) void {
+        const org = sp.origin();
+        var out_cam = cam.*;
+        out_cam.width = tgs.out_w;
+        out_cam.height = tgs.out_h;
+        req(pyrit.pyr_world_update(@ptrCast(self.ctx), @ptrCast(self.world), &sp.pos, &org, &out_cam));
+    }
+
     fn frame(self: *App, sp: *const Spectator, cam: *const types.Camera, time: f64, tgs: *Targets, post: *api.PostInfo, update_world: bool) void {
         self.frameOn(self.view, sp, cam, time, tgs, post, update_world);
     }
@@ -722,10 +934,17 @@ const App = struct {
         const org = sp.origin();
         // Wolkenschatten haften an der Welt, nicht am Render-Ursprung
         const before = self.light.sun_shadow_offset;
+        const medium_before = self.light.camera_medium_density;
         scene.cloudShadowOffset(&self.light, org);
-        if (before[0] != self.light.sun_shadow_offset[0] or before[1] != self.light.sun_shadow_offset[1])
+        // Unter Wasser: die Welt trägt nur die Oberfläche, das Medium darunter
+        // kennt die Anwendung (Kamera unter dem Meeresspiegel, über dem Grund)
+        const sea: f64 = self.gen.params.sea_level;
+        const under = sp.pos[1] < sea and self.gen.height(sp.pos[0], sp.pos[2]) < sp.pos[1];
+        scene.underwater(&self.light, under, @floatCast(sea - org[1]));
+        if (before[0] != self.light.sun_shadow_offset[0] or before[1] != self.light.sun_shadow_offset[1] or
+            medium_before != self.light.camera_medium_density)
             req(pyrit.pyr_set_lighting(@ptrCast(self.ctx), &self.light));
-        if (update_world) req(pyrit.pyr_world_update(@ptrCast(self.ctx), @ptrCast(self.world), &sp.pos, &org, cam));
+        if (update_world) self.updateWorld(sp, cam, tgs);
         const fi = api.FrameInfo{ .time = time, .origin = org };
         req(pyrit.pyr_commit(@ptrCast(self.ctx), &fi));
         req(pyrit.pyr_render(@ptrCast(self.ctx), view, cam, &tgs.tg));
@@ -737,7 +956,12 @@ const App = struct {
 };
 
 /// BGRA-Bild (w x h) als PPM schreiben
+/// --no-images: Aufnahmen messen nur (keine Dateien – /tmp ist eine RAM-Disk,
+/// und Hunderte Bilder zu 6 MB füllten sie)
+var no_images = false;
+
 fn writePpm(init: std.process.Init, path: []const u8, bgra: []const u8, w: u32, h: u32) !void {
+    if (no_images) return;
     const gpa = init.gpa;
     var file: std.ArrayList(u8) = .empty;
     defer file.deinit(gpa);
@@ -807,8 +1031,9 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
     const ss = @max(o.super, 1);
     const post_w = o.out_w * ss;
     const post_h = o.out_h * ss;
-    const rw = @max(post_w / o.scale, 16);
-    const rh = @max(post_h / o.scale, 16);
+    const div = if (o.scale > 0) o.scale else o.mode.scale();
+    const rw = @max(post_w / div, 16);
+    const rh = @max(post_h / div, 16);
     tgs.resize(rw, rh, post_w, post_h);
 
     var post = scene.post();
@@ -825,11 +1050,14 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
 
     var sp = app.spectatorAt(o);
     var cam = std.mem.zeroes(types.Camera);
-    sp.camera(&cam, rw, rh);
+    const jit = o.mode.jitter();
+    sp.camera(&cam, rw, rh, null);
     app.load(&sp, &cam);
 
     std.Io.Dir.cwd().createDirPath(init.io, dir) catch {};
     const bytes: usize = @as(usize, post_w) * post_h * 4;
+    post.upscaler = o.mode.upscaler();
+    tgs.setMode(o.mode);
     const px = try init.gpa.alloc(u8, bytes);
     defer init.gpa.free(px);
 
@@ -862,6 +1090,7 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
     const t0 = nowSeconds(init);
     var ms_still: f64 = 0;
     var ms_move: f64 = 0;
+    var ms_fg: f64 = 0;
     while (f < total) : (f += 1) {
         const moving = f >= o.warm + o.still;
         if (moving) {
@@ -870,12 +1099,28 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
             for (0..3) |k| sp.pos[k] += d[k] * fly_speed * dt;
             sp.yaw += o.turn;
         }
-        sp.camera(&cam, rw, rh);
+        sp.camera(&cam, rw, rh, if (jit) f else null);
         const tf = nowSeconds(init);
         // Diagnose: im Flug die Welt einfrieren (keine LOD-Wechsel)
         app.frame(&sp, &cam, t, &tgs, &post, !(o.freeze_lod and moving));
         req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
         const ms = (nowSeconds(init) - tf) * 1000;
+        var kf: u32 = 1;
+        while (f >= o.warm and o.fg != .off and o.mode != .native and kf <= o.fg.count()) : (kf += 1) {
+            // Zwischenbilder vor diesem Frame (mid_N_k liegt zwischen frame_N-1 und frame_N)
+            var fgi = std.mem.zeroes(api.FrameGenInfo);
+            fgi.output_ldr = tgs.ldr_fg[0];
+            fgi.flags = (post.flags & api.post_bgra) | o.fg.flags();
+            fgi.t = @as(f32, @floatFromInt(kf)) / @as(f32, @floatFromInt(o.fg.count() + 1));
+            const tg = nowSeconds(init);
+            req(pyrit.pyr_frame_generate(@ptrCast(app.ctx), app.view, &fgi));
+            req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+            ms_fg += (nowSeconds(init) - tg) * 1000;
+            cu(drv.cuMemcpyDtoH_v2(px.ptr, tgs.ldr_fg[0], bytes));
+            var buf: [512]u8 = undefined;
+            const path = try std.fmt.bufPrint(&buf, "{s}/mid_{d:0>3}_{d}.ppm", .{ dir, n_out, kf });
+            try writePpm(init, path, px, post_w, post_h);
+        }
         if (f >= o.warm) {
             if (moving) ms_move += ms else ms_still += ms;
             cu(drv.cuMemcpyDtoH_v2(px.ptr, tgs.ldr, bytes));
@@ -918,6 +1163,7 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
     }
     if (still_n > 0) std.debug.print("Stehend: {d:.3} % der Pixel ändern sich von Frame zu Frame um mehr als 4 Stufen\n", .{still_loud / @as(f64, @floatFromInt(still_n))});
     if (err_n > 0) std.debug.print("Im Flug gegen eingeschwungene Referenz: mittlerer Fehler {d:.3} Stufen, {d:.3} % der Pixel über 8 Stufen (Karten: diff_*.pgm)\n", .{ err_sum / @as(f64, @floatFromInt(err_n)), loud_sum / @as(f64, @floatFromInt(err_n)) });
+    if (ms_fg > 0) std.debug.print("Zwischenbild ({s}): {d:.2} ms je Bild (mid_*.ppm)\n", .{ @tagName(o.fg), ms_fg / @as(f64, @floatFromInt(@max((o.still + o.move) * o.fg.count(), 1))) });
     var st: api.WorldStats = undefined;
     req(pyrit.pyr_world_stats(@ptrCast(app.world), &st));
     std.debug.print("Aufnahme: {d} Bilder in {s} ({d} stehend, {d} im Flug), {d}x{d}, Frame {d:.1} ms stehend / {d:.1} ms im Flug, gesamt {d:.1} s, {d} Chunks, {d:.0} MiB\n", .{
@@ -925,6 +1171,141 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
         ms_still / @as(f64, @floatFromInt(@max(o.still, 1))), ms_move / @as(f64, @floatFromInt(@max(o.move, 1))), nowSeconds(init) - t0,
         st.resident_chunks,                                      @as(f64, @floatFromInt(st.bytes)) / (1 << 20),
     });
+    if (o.mv_test) mvTest(init, &app, &sp, &cam, &tgs, &post, dir);
+    if (o.edit_bench > 0) {
+        editBench(init, &app, &sp, &cam, &tgs, &post, o.edit_bench, false);
+        editBench(init, &app, &sp, &cam, &tgs, &post, o.edit_bench, true);
+    }
+}
+
+/// Prüfung der Bewegungsvektoren für die Frame Generation: ein Würfel
+/// (eigene Instanz) fliegt quer durchs Bild, die Kamera steht. Schreibt die
+/// Zwischenbilder als mvtest_<k>.ppm; zwei Läufe mit PYRIT_DLSSG_MV=+/-1
+/// vergleichen – sind sie gleich, liest DLSS-G die Vektoren nicht.
+fn mvTest(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Camera, tgs: *Targets, post: *api.PostInfo, dir: []const u8) void {
+    // die sechs Prüfbilder auch mit --no-images schreiben
+    const saved = no_images;
+    no_images = false;
+    defer no_images = saved;
+    var vox: [512]api.Voxel = undefined;
+    for (&vox, 0..) |*v, i| v.* = .{ .x = @intCast(i % 8), .y = @intCast((i / 8) % 8), .z = @intCast(i / 64), .attribute = scene.terrain.Block.snow.attribute() };
+    var geo: api.Handle = null;
+    req(pyrit.pyr_geometry_build(@ptrCast(app.ctx), 3, &vox, vox.len, api.build_host_input, @ptrCast(&geo)));
+    var inst: api.Handle = null;
+    req(pyrit.pyr_instance_create(@ptrCast(app.ctx), @ptrCast(geo), @ptrCast(&inst)));
+    req(pyrit.pyr_instance_set_mask(@ptrCast(app.ctx), @ptrCast(inst), 0x1));
+    const d = sp.dir();
+    const org = sp.origin();
+    const r = sp.right();
+    // 50 Blöcke voraus, 6 über dem Boden; startet links und fliegt nach rechts
+    const base = [3]f64{ sp.pos[0] + d[0] * 50, 0, sp.pos[2] + d[2] * 50 };
+    const ground = app.gen.height(base[0], base[2]);
+    var k: u32 = 0;
+    while (k < 16) : (k += 1) {
+        const off = (@as(f64, @floatFromInt(k)) - 8) * 1.5;
+        const pos = [3]f64{ base[0] + r[0] * off - org[0], ground + 6 - org[1], base[2] + r[2] * off - org[2] };
+        const xf = [12]f32{ 1, 0, 0, @floatCast(pos[0]), 0, 1, 0, @floatCast(pos[1]), 0, 0, 1, @floatCast(pos[2]) };
+        req(pyrit.pyr_instance_set_transform(@ptrCast(app.ctx), @ptrCast(inst), &xf));
+        sp.camera(cam, tgs.w, tgs.h, k);
+        app.frame(sp, cam, nowSeconds(init), tgs, post, false);
+        if (k >= 4) {
+            var fgi = std.mem.zeroes(api.FrameGenInfo);
+            fgi.output_ldr = tgs.ldr_fg[0];
+            fgi.flags = (post.flags & api.post_bgra) | api.framegen_dlss;
+            req(pyrit.pyr_frame_generate(@ptrCast(app.ctx), app.view, &fgi));
+        }
+        req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+        if (k >= 10 and k < 13) {
+            const bytes = @as(usize, tgs.out_w) * tgs.out_h * 4;
+            const px = init.gpa.alloc(u8, bytes) catch return;
+            defer init.gpa.free(px);
+            var buf: [512]u8 = undefined;
+            cu(drv.cuMemcpyDtoH_v2(px.ptr, tgs.ldr_fg[0], bytes));
+            writePpm(init, std.fmt.bufPrint(&buf, "{s}/mvtest_mid_{d}.ppm", .{ dir, k }) catch return, px, tgs.out_w, tgs.out_h) catch {};
+            cu(drv.cuMemcpyDtoH_v2(px.ptr, tgs.ldr, bytes));
+            writePpm(init, std.fmt.bufPrint(&buf, "{s}/mvtest_echt_{d}.ppm", .{ dir, k }) catch return, px, tgs.out_w, tgs.out_h) catch {};
+        }
+    }
+    _ = pyrit.pyr_instance_destroy(@ptrCast(app.ctx), @ptrCast(inst));
+}
+
+/// Messung: n Blöcke setzen und die Zeit, bis alle betroffenen Chunks neu
+/// gebaut sind und ein Frame sie zeigt. `spread`: über 60 Blöcke um die
+/// Kamera verstreut, sonst als Haufen direkt vor der Kamera.
+fn editBench(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Camera, tgs: *Targets, post: *api.PostInfo, n: u32, spread: bool) void {
+    var edits: [4096]api.WorldEdit = undefined;
+    const count = @min(n, edits.len);
+    var prng = std.Random.DefaultPrng.init(if (spread) 7 else 3);
+    const rnd = prng.random();
+    const d = sp.dir();
+    const cx = sp.pos[0] + d[0] * 80;
+    const cz = sp.pos[2] + d[2] * 80;
+    for (edits[0..count], 0..) |*e, i| {
+        var x: f64 = undefined;
+        var z: f64 = undefined;
+        if (spread) {
+            x = sp.pos[0] + (rnd.float(f64) * 2 - 1) * 60;
+            z = sp.pos[2] + (rnd.float(f64) * 2 - 1) * 60;
+        } else {
+            x = cx + @as(f64, @floatFromInt(i % 5)) - 2;
+            z = cz + @as(f64, @floatFromInt((i / 5) % 5)) - 2;
+        }
+        const ground = app.gen.height(x, z);
+        const y = @floor(ground) + 1 + (if (spread) 0 else @as(f64, @floatFromInt(i / 25)));
+        e.* = .{ .x = @intFromFloat(@floor(x)), .y = @intFromFloat(y), .z = @intFromFloat(@floor(z)), .attribute = scene.terrain.Block.stone.attribute() };
+    }
+    // Blick von oben auf die Stelle (Beweisbild vorher/nachher)
+    var top = sp.*;
+    top.pos = .{ cx, app.gen.height(cx, cz) + 14, cz - 6 };
+    top.pitch = -1.1;
+    top.yaw = 0;
+    const shot = std.c.getenv("PYRIT_EDIT_SHOT");
+    if (shot != null and !spread) editShot(init, app, &top, cam, tgs, post, "vorher");
+    req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+    const t0 = nowSeconds(init);
+    req(pyrit.pyr_world_edit(@ptrCast(app.ctx), @ptrCast(app.world), &edits, count));
+    const t1 = nowSeconds(init);
+    var built: u64 = 0;
+    var rounds: u32 = 0;
+    while (rounds < 1000) : (rounds += 1) {
+        app.updateWorld(sp, cam, tgs);
+        var ws: api.WorldStats = undefined;
+        req(pyrit.pyr_world_stats(@ptrCast(app.world), &ws));
+        built += ws.built_chunks;
+        if (ws.pending_chunks == 0 and rounds > 0 and ws.built_chunks == 0) break;
+        req(pyrit.pyr_world_wait(@ptrCast(app.ctx), @ptrCast(app.world), &sp.pos));
+        // pyr_world_wait übernimmt den Auftrag selbst: seine Chunks zählen hier
+        req(pyrit.pyr_world_stats(@ptrCast(app.world), &ws));
+        built += ws.built_chunks;
+    }
+    const t2 = nowSeconds(init);
+    app.frame(sp, cam, t2, tgs, post, false);
+    req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+    const t3 = nowSeconds(init);
+    if (shot != null and !spread) editShot(init, app, &top, cam, tgs, post, "nachher");
+    std.debug.print("Änderung ({s}): {d} Blöcke, Aufruf {d:.2} ms, Neubau {d:.1} ms ({d} Chunks in {d} Runden), sichtbar nach {d:.1} ms\n", .{
+        if (spread) "verstreut" else "Haufen", count, (t1 - t0) * 1000, (t2 - t1) * 1000, built, rounds, (t3 - t0) * 1000,
+    });
+}
+
+/// Einige Frames aus `view` rendern (Welt nachführen, Verlauf einschwingen)
+/// und das letzte als <PYRIT_EDIT_SHOT>_<name>.ppm speichern
+fn editShot(init: std.process.Init, app: *App, view: *const Spectator, cam: *types.Camera, tgs: *Targets, post: *api.PostInfo, name: []const u8) void {
+    var k: u32 = 0;
+    while (k < 30) : (k += 1) {
+        view.camera(cam, tgs.w, tgs.h, k);
+        app.updateWorld(view, cam, tgs);
+        req(pyrit.pyr_world_wait(@ptrCast(app.ctx), @ptrCast(app.world), &view.pos));
+        app.frame(view, cam, nowSeconds(init), tgs, post, false);
+        req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+    }
+    const bytes = @as(usize, tgs.out_w) * tgs.out_h * 4;
+    const px = init.gpa.alloc(u8, bytes) catch return;
+    defer init.gpa.free(px);
+    cu(drv.cuMemcpyDtoH_v2(px.ptr, tgs.ldr, bytes));
+    var buf: [512]u8 = undefined;
+    const f = std.fmt.bufPrint(&buf, "{s}_{s}.ppm", .{ std.mem.span(std.c.getenv("PYRIT_EDIT_SHOT").?), name }) catch return;
+    writePpm(init, f, px, tgs.out_w, tgs.out_h) catch {};
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -973,6 +1354,7 @@ pub fn main(init: std.process.Init) !void {
     var water = app.water;
     var fg = o.fg;
     var voxel_px = o.voxel_px;
+    var mode = o.mode;
     var taa_off = false;
     var lod_frozen = false;
     var waves_off = false;
@@ -997,6 +1379,23 @@ pub fn main(init: std.process.Init) !void {
     var win_h = W.height;
     var last_shot: []u8 = &.{};
     defer if (last_shot.len != 0) gpa.free(last_shot);
+    // Zwischenspeicher (angeheftet) für zwei Frames im Wechsel: in den einen
+    // kopiert die GPU, aus dem anderen zeigt die CPU
+    var stage = [2]Stage{ .{}, .{} };
+    defer for (&stage) |*st| st.free();
+    var stage_cur: u1 = 0;
+    var shown: u64 = 0;
+    var rendered: u64 = 0;
+    var rendered_fps: f64 = 0;
+    // F3-Bildschirm: Zeilen, alle 0,5 s neu
+    var dbg_buf: [10][96]u8 = undefined;
+    var dbg_lines: [10][]const u8 = undefined;
+    var dbg_n: usize = 0;
+    var cycle_s: f64 = 0;
+    var slept: f64 = 0;
+    var cycle_at = t_prev;
+    var shown_at = t_prev;
+    var shown_fps: f64 = 0;
 
     while (W.running) {
         // Ereignisse abholen (nicht blockierend; bei vsync wartet present())
@@ -1006,7 +1405,7 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
         if (W.toggle_fg) {
-            fg = !fg;
+            fg = fg.next();
             W.toggle_fg = false;
         }
         if (W.toggle[0]) {
@@ -1108,32 +1507,115 @@ pub fn main(init: std.process.Init) !void {
         const ss = @max(o.super, 1);
         const post_w = win_w * ss;
         const post_h = win_h * ss;
-        const rw = @max(post_w / o.scale, 16);
-        const rh = @max(post_h / o.scale, 16);
+        if (W.mode_key) |mk| {
+            mode = @enumFromInt(mk);
+            W.mode_key = null;
+        }
+        post.upscaler = mode.upscaler();
+        tgs.setMode(mode);
+        const div = if (o.scale > 0) o.scale else mode.scale();
+        const rw = @max(post_w / div, 16);
+        const rh = @max(post_h / div, 16);
         tgs.resize(rw, rh, post_w, post_h);
         const frame_bytes: usize = @as(usize, win_w) * win_h * 4;
         fxi.supersample = ss;
 
         // Kamera zuerst: die Welt wählt danach ihr LOD
-        sp.camera(&cam, rw, rh);
-        app.frame(&sp, &cam, now, &tgs, &post, !lod_frozen);
-
-        if (fg and frame > 2) {
-            fgi.output_ldr = tgs.ldr_fg;
-            req(pyrit.pyr_frame_generate(@ptrCast(app.ctx), app.view, &fgi));
-            req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
-            const idx = try acquireBuffer();
-            cu(drv.cuMemcpyDtoH_v2(W.mem.ptr + idx * frame_bytes, tgs.ldr_fg, frame_bytes));
-            present(idx, o.vsync);
-            if (o.vsync) while (!W.frame_done and W.running) {
-                if (W.c.display_dispatch(W.display) < 0) break;
-            };
+        sp.camera(&cam, rw, rh, if (mode.jitter()) frame else null);
+        // Vor dem ersten Bild die Welt um die Kamera laden (höchstens 3 s):
+        // sonst sah man zuerst nur Dunst mit nahen Bäumen, und die Ferne kam
+        // nach und nach dazu – das wirkte wie Herauszoomen
+        if (frame == 0) {
+            const t_load = nowSeconds(init);
+            while (nowSeconds(init) - t_load < 3) {
+                app.updateWorld(&sp, &cam, &tgs);
+                req(pyrit.pyr_world_wait(@ptrCast(app.ctx), @ptrCast(app.world), &sp.pos));
+                var ws: api.WorldStats = undefined;
+                req(pyrit.pyr_world_stats(@ptrCast(app.world), &ws));
+                if (ws.pending_chunks == 0) break;
+            }
         }
+        // Die Welt wird hinter dem Einreihen des vorigen Frames nachgeführt
+        // (unten), während die GPU rechnet
+        app.frame(&sp, &cam, now, &tgs, &post, false);
 
+        // Zwischenbilder (brauchen Bewegung und Tiefe in Ausgabeauflösung, die
+        // liefern nur TAAU und DLSS) gleich hinter dem Frame einreihen, dann
+        // alles asynchron in den Zwischenspeicher kopieren
+        const cur = &stage[stage_cur];
+        try cur.ensure(frame_bytes);
+        cur.gens = 0;
+        cur.w = win_w;
+        cur.h = win_h;
+        var k: u32 = 1;
+        while (fg != .off and mode != .native and frame > 2 and k <= fg.count()) : (k += 1) {
+            fgi.output_ldr = tgs.ldr_fg[k - 1];
+            fgi.flags = api.post_bgra | fg.flags();
+            fgi.t = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(fg.count() + 1));
+            const r = pyrit.pyr_frame_generate(@ptrCast(app.ctx), app.view, &fgi);
+            if (r != api.ok and fg.isDlss()) {
+                // ohne DLSS-SDK, Treiber, Vulkan oder Multi Frame Generation:
+                // weiter ohne Zwischenbild
+                std.debug.print("DLSS Frame Generation: {s}\n", .{pyrit.pyr_error_message()});
+                fg = .off;
+                break;
+            }
+            req(r);
+            cu(drv.cuMemcpyDtoHAsync_v2(cur.host[k - 1].ptr, tgs.ldr_fg[k - 1], frame_bytes, app.stream));
+            cur.gens = k;
+        }
+        cu(drv.cuMemcpyDtoHAsync_v2(cur.host[max_gens].ptr, tgs.ldr, frame_bytes, app.stream));
+        cur.valid = true;
+
+        // Während die GPU diesen Frame rechnet, zeigt die CPU den vorigen:
+        // erst seine Zwischenbilder, dann ihn selbst. Die Bilder werden
+        // gleichmäßig über die gemessene Dauer eines Frames verteilt (eigenes
+        // Frame-Pacing) – nur im Bildtakt des Compositors kamen sie sonst
+        // schnell hintereinander, und dann klaffte bis zum nächsten Frame
+        // eine Lücke: das Ruckeln bei 4x und 6x.
+        var idx: usize = 0;
+        const prev_stage = &stage[stage_cur ^ 1];
+        if (prev_stage.valid and prev_stage.w == win_w and prev_stage.h == win_h) {
+            const n_show = prev_stage.gens + 1;
+            // höchstens 0,1 s je Frame verteilen, auch wenn die Messung (noch) Unsinn sagt
+            const step = @min(cycle_s, 0.1) / @as(f64, @floatFromInt(n_show));
+            const t_first = nowSeconds(init);
+            var q: u32 = 0;
+            while (q < n_show and W.running) : (q += 1) {
+                // Takt: frühestens zum geplanten Zeitpunkt und nie schneller,
+                // als der Compositor Bilder abnimmt
+                const target = t_first + step * @as(f64, @floatFromInt(q));
+                const t_sleep = nowSeconds(init);
+                sleepUntil(init, target);
+                slept += nowSeconds(init) - t_sleep;
+                if (o.vsync) while (!W.frame_done and W.running) {
+                    if (W.c.display_dispatch(W.display) < 0) break;
+                };
+                const src = if (q < prev_stage.gens) prev_stage.host[q] else prev_stage.host[max_gens];
+                idx = try acquireBuffer();
+                @memcpy(W.mem[idx * frame_bytes ..][0..frame_bytes], src[0..frame_bytes]);
+                if (W.debug) overlay.draw(W.mem[idx * frame_bytes ..][0..frame_bytes], win_w, win_h, dbg_lines[0..dbg_n], if (win_h >= 1000) 3 else 2);
+                present(idx, o.vsync);
+                shown += 1;
+            }
+        }
         req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
-        const idx = try acquireBuffer();
-        cu(drv.cuMemcpyDtoH_v2(W.mem.ptr + idx * frame_bytes, tgs.ldr, frame_bytes));
-        present(idx, o.vsync);
+        cu(drv.cuStreamSynchronize(app.stream));
+        // Welt erst nachführen, wenn die GPU mit dem Frame fertig ist: die
+        // Übernahme schreibt neue Chunks in Pool-Bereiche, die verdrängte
+        // Chunks frei gemacht haben – lief sie parallel zum Rendern, las der
+        // laufende Frame halb überschriebene Geometrie (verformte Formen)
+        if (!lod_frozen) app.updateWorld(&sp, &cam, &tgs);
+        stage_cur ^= 1;
+        // Arbeitszeit eines Durchlaufs, geglättet: danach richtet sich der
+        // Takt. Die eigenen Pausen zählen nicht mit – sonst schaukelte sich
+        // der Takt auf (der erste Durchlauf enthält das Laden der Welt, und
+        // jede Pause verlängerte den nächsten Durchlauf um genau sich selbst).
+        const t_cycle = nowSeconds(init);
+        const work = @max(t_cycle - cycle_at - slept, 0);
+        if (frame > 0) cycle_s = if (cycle_s == 0) work else cycle_s * 0.9 + work * 0.1;
+        cycle_at = t_cycle;
+        slept = 0;
 
         frame += 1;
         if (o.max_frames > 0 and frame >= o.max_frames) {
@@ -1147,14 +1629,47 @@ pub fn main(init: std.process.Init) !void {
             W.running = false;
         }
         frame_ms = frame_ms * 0.9 + (nowSeconds(init) - now) * 1000 * 0.1;
+        rendered += 1;
         if (now - title_time > 0.5) {
+            shown_fps = @as(f64, @floatFromInt(shown)) / @max(now - shown_at, 1e-3);
+            rendered_fps = @as(f64, @floatFromInt(rendered)) / @max(now - shown_at, 1e-3);
+            shown = 0;
+            rendered = 0;
+            shown_at = now;
+            {
+                var ws: api.WorldStats = undefined;
+                req(pyrit.pyr_world_stats(@ptrCast(app.world), &ws));
+                const L = struct {
+                    fn line(buf: *[96]u8, comptime fmt: []const u8, a: anytype) []const u8 {
+                        return std.fmt.bufPrint(buf, fmt, a) catch buf[0..0];
+                    }
+                };
+                dbg_n = 0;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "PYRIT DEMO (F3)", .{});
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "FPS {d:.0} ANGEZEIGT, {d:.0} GERENDERT", .{ shown_fps, rendered_fps });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "FRAME {d:.1} MS ARBEIT, {d:.1} MS DURCHLAUF", .{ cycle_s * 1000, frame_ms });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "MODUS {s}  FG {s}", .{ mode.name(), if (fg == .off) " AUS" else fg.label() });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "RENDER {d}X{d} -> {d}X{d}", .{ tgs.w, tgs.h, tgs.out_w, tgs.out_h });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "POS {d:.1} {d:.1} {d:.1}", .{ sp.pos[0], sp.pos[1], sp.pos[2] });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "CHUNKS {d} SICHTBAR {d} OFFEN {d}", .{ ws.resident_chunks, ws.visible_chunks, ws.pending_chunks });
+                dbg_n += 1;
+                dbg_lines[dbg_n] = L.line(&dbg_buf[dbg_n], "SPEICHER {d:.0} MIB  LOD {d:.1} PX JE VOXEL", .{ @as(f64, @floatFromInt(ws.bytes)) / (1 << 20), ws.voxel_pixels });
+                dbg_n += 1;
+            }
             title_time = now;
             var st: api.WorldStats = undefined;
             req(pyrit.pyr_world_stats(@ptrCast(app.world), &st));
             var buf: [256]u8 = undefined;
-            const title = try std.fmt.bufPrintZ(&buf, "Pyrit-Demo – {d:.1} ms ({d:.0} fps){s} · {d}x{d} · {d} Chunks, {d:.0} MiB · x {d:.0} y {d:.0} z {d:.0}", .{
-                frame_ms,           1000 / @max(frame_ms, 0.001),
-                if (fg) " +Zwischenbild" else "", rw,
+            const title = try std.fmt.bufPrintZ(&buf, "Pyrit-Demo – {s} – {d:.1} ms je Frame, {d:.0} Bilder/s{s} · {d}x{d} · {d} Chunks, {d:.0} MiB · x {d:.0} y {d:.0} z {d:.0}", .{
+                mode.name(),        frame_ms,
+                shown_fps,
+                if (fg != .off and mode == .native) " (FG braucht TAAU/DLSS)" else fg.label(), rw,
                 rh,                 st.resident_chunks,
                 @as(f64, @floatFromInt(st.bytes)) / (1 << 20),
                 sp.pos[0],          sp.pos[1],
@@ -1163,15 +1678,12 @@ pub fn main(init: std.process.Init) !void {
             _ = W.marshal(W.toplevel.?, wl.toplevel_set_title, null, .{title.ptr});
         }
 
-        // Bildtakt: auf das nächste Frame-Ereignis des Compositors warten
-        if (o.vsync) while (!W.frame_done and W.running) {
-            if (W.c.display_dispatch(W.display) < 0) {
-                W.running = false;
-                break;
-            }
-        };
+        // Den Bildtakt des Compositors wartet das Zeigen oben ab – dann
+        // rechnet die GPU schon am nächsten Frame
+        if (W.c.display_dispatch_pending(W.display) < 0) W.running = false;
     }
 
+    std.debug.print("Demo: {s}{s}, zuletzt {d:.1} ms je gerendertem Frame, {d:.0} angezeigte Bilder/s\n", .{ mode.name(), fg.label(), frame_ms, shown_fps });
     // Für Prüfläufe: das zuletzt gezeigte Bild speichern (BGRA -> RGB)
     if (o.shot) |path| {
         const src = if (last_shot.len != 0) last_shot else W.mem[0 .. @as(usize, win_w) * win_h * 4];

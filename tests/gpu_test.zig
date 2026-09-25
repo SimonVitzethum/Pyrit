@@ -844,7 +844,8 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
         print("  bei ({d:.0}, {d:.0}): {d} Updates, {d:.1} ms, {d} Chunks resident, {d} sichtbar, {d:.2} MiB\n", .{ xz[0], xz[1], updates + 1, ms, st.resident_chunks, st.visible_chunks, @as(f64, @floatFromInt(st.bytes)) / (1 << 20) });
         check(st.pending_chunks == 0 and st.visible_chunks > 0, "Welt nicht fertig", .{});
 
-        // senkrechte Strahlen im Umkreis von 60 Voxeln (feinste Stufe)
+        // senkrechte Strahlen im Umkreis von 24 Voxeln: dort sicher feinste
+        // Stufe (mit 8 px je Voxel beginnt Stufe 2 schon gut 50 Blöcke weit)
         const count = 4096;
         const rays = try gpa.alloc(types.Ray, count);
         defer gpa.free(rays);
@@ -854,7 +855,7 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
         const rnd = prng.random();
         for (rays, cols) |*r, *c| {
             // Spaltenmitte, damit das Höhenfeld dort exakt ausgewertet werden kann
-            c.* = .{ @floor(cam[0] + (rnd.float(f64) * 2 - 1) * 60) + 0.5, @floor(cam[2] + (rnd.float(f64) * 2 - 1) * 60) + 0.5 };
+            c.* = .{ @floor(cam[0] + (rnd.float(f64) * 2 - 1) * 24) + 0.5, @floor(cam[2] + (rnd.float(f64) * 2 - 1) * 24) + 0.5 };
             r.* = .{ .origin = .{ @floatCast(c[0] - origin[0]), 2000, @floatCast(c[1] - origin[2]) }, .tmin = 0, .direction = .{ 0, -1, 0 }, .tmax = types.flt_max };
         }
         const d_rays = devAlloc(count * @sizeOf(types.Ray));
@@ -875,8 +876,9 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
                 continue;
             }
             const y = 2000 - @as(f64, h.t);
-            const ref = gen.height(c[0], c[1]);
-            // Stufe 0 nutzt Oktaven bis zur Wellenlänge 2; die volle Höhe weicht davon kaum ab
+            // Über flachem Ufer trifft der Strahl die Wasseroberfläche, nicht den Grund
+            const land = gen.heightFinest(c[0], c[1]);
+            const ref = if (gen.params.water != 0) @max(land, gen.params.sea_level) else land;
             worst = @max(worst, @abs(y - ref));
         }
         print("  {d} senkrechte Strahlen: {d} ohne Treffer, größte Höhenabweichung {d:.3}\n", .{ count, miss, worst });

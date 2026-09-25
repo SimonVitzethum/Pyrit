@@ -44,11 +44,16 @@ pub const Rt = struct {
     rtcore_version: u32 = 0,
     rt_log2: u32,
 
+    /// Nur Traversierung und Strahllisten; die Schattierung läuft in CUDA
+    /// (src/device/replay.zig), sonst braucht OptiX zum Übersetzen Minuten
+    /// und GB.
     module: optix.Module = null,
-    groups: [5]optix.ProgramGroup = .{ null, null, null, null, null },
+    groups: [4]optix.ProgramGroup = .{ null, null, null, null },
     pipeline: optix.Pipeline = null,
 
-    sbt_raygen: [3]cuda.CUdeviceptr = .{ 0, 0, 0 },
+    sbt_raygen: [2]cuda.CUdeviceptr = .{ 0, 0 },
+    /// Strahlplätze der Wiederholungs-Wavefront (je Streifen)
+    replay: ReplayBuffers = .{},
     sbt_miss: cuda.CUdeviceptr = 0,
     sbt_hit: cuda.CUdeviceptr = 0,
     hit_header: [optix.sbt_record_header_size]u8 align(16) = undefined,
@@ -68,11 +73,10 @@ pub const Rt = struct {
     ias_count: u32 = 0,
     ias_updates: u32 = 0,
 
-    const g_raygen_render = 0;
-    const g_raygen_trace = 1;
-    const g_raygen_gi = 2;
-    const g_miss = 3;
-    const g_hit = 4;
+    const g_raygen_trace = 0;
+    const g_raygen_slots = 1;
+    const g_miss = 2;
+    const g_hit = 3;
 
     fn check(self: *Rt, r: optix.Result, what: []const u8) Error!void {
         if (r == optix.success) return;
@@ -112,7 +116,7 @@ pub const Rt = struct {
 
         // SBT: zwei Raygen-Einträge, ein Miss-Eintrag, eine Hitgroup pro Geometrie
         var header: [optix.sbt_record_header_size]u8 align(16) = undefined;
-        for ([_]usize{ g_raygen_render, g_raygen_trace, g_raygen_gi }, 0..) |g, i| {
+        for ([_]usize{ g_raygen_trace, g_raygen_slots }, 0..) |g, i| {
             try self.check(ft.optixSbtRecordPackHeader(self.groups[g], &header), "optixSbtRecordPackHeader");
             self.sbt_raygen[i] = try c.devAlloc(header.len, "SBT");
             try c.upload(self.sbt_raygen[i], &header);
@@ -151,9 +155,14 @@ pub const Rt = struct {
         var log: [4096]u8 = undefined;
         var log_size: usize = log.len;
 
-        const mco = optix.ModuleCompileOptions{
+        var mco = optix.ModuleCompileOptions{
             .debugLevel = if (c.debug) optix.compile_debug_level_minimal else optix.compile_debug_level_none,
         };
+        // Diagnose: PYRIT_OPTIX_OPT=0..3 wählt die Optimierungsstufe
+        if (std.c.getenv("PYRIT_OPTIX_OPT")) |e| {
+            const lvl = std.fmt.parseInt(u32, std.mem.span(e), 10) catch 3;
+            mco.optLevel = @as(c_uint, 0x2340) + @min(lvl, 3);
+        }
         const pco = optix.PipelineCompileOptions{
             .traversableGraphFlags = optix.traversable_graph_flag_allow_single_level_instancing,
             .numPayloadValues = 4,
@@ -163,13 +172,18 @@ pub const Rt = struct {
             .pipelineLaunchParamsSizeInBytes = @sizeOf(types.RtParams),
             .usesPrimitiveTypeFlags = optix.primitive_type_flags_custom,
         };
+        var ts0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts0);
         const r = ft.optixModuleCreate(self.ctx, &mco, &pco, rt_ptx.ptr, rt_ptx.len, &log, &log_size, &self.module);
         if (r != optix.success) return fail(error.Compile, "OptiX-Modul: {s}\n{s}", .{ self.api.errorString(r), log[0..@min(log_size, log.len)] });
+        var ts1: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts1);
+        const secs = @as(f64, @floatFromInt(ts1.sec - ts0.sec)) + @as(f64, @floatFromInt(ts1.nsec - ts0.nsec)) / 1e9;
+        if (std.c.getenv("PYRIT_OPTIX_TIMING") != null) std.debug.print("OptiX-Modul ({d} KB PTX) übersetzt in {d:.2} s\n", .{ rt_ptx.len >> 10, secs });
 
-        const descs = [5]optix.ProgramGroupDesc{
-            .{ .kind = optix.program_group_kind_raygen, .u = .{ .raygen = .{ .module = self.module, .entryFunctionName = "__raygen__render" } } },
+        const descs = [4]optix.ProgramGroupDesc{
             .{ .kind = optix.program_group_kind_raygen, .u = .{ .raygen = .{ .module = self.module, .entryFunctionName = "__raygen__trace" } } },
-            .{ .kind = optix.program_group_kind_raygen, .u = .{ .raygen = .{ .module = self.module, .entryFunctionName = "__raygen__gi" } } },
+            .{ .kind = optix.program_group_kind_raygen, .u = .{ .raygen = .{ .module = self.module, .entryFunctionName = "__raygen__slots" } } },
             .{ .kind = optix.program_group_kind_miss, .u = .{ .miss = .{ .module = self.module, .entryFunctionName = "__miss__none" } } },
             .{ .kind = optix.program_group_kind_hitgroup, .u = .{ .hitgroup = .{
                 .moduleCH = self.module,
@@ -203,7 +217,8 @@ pub const Rt = struct {
         const ft = &self.api.ft;
         for (self.gas) |g| freeGas(c, g);
         c.gpa.free(self.gas);
-        for ([_]cuda.CUdeviceptr{ self.sbt_raygen[0], self.sbt_raygen[1], self.sbt_raygen[2], self.sbt_miss, self.sbt_hit, self.params_dev, self.gas_handles, self.ias_instances, self.ias_temp, self.ias_out }) |p| {
+        self.replay.free(c);
+        for ([_]cuda.CUdeviceptr{ self.sbt_raygen[0], self.sbt_raygen[1], self.sbt_miss, self.sbt_hit, self.params_dev, self.gas_handles, self.ias_instances, self.ias_temp, self.ias_out }) |p| {
             if (p != 0) _ = c.drv.cuMemFree_v2(p);
         }
         if (self.pipeline != null) _ = ft.optixPipelineDestroy(self.pipeline);
@@ -466,23 +481,105 @@ pub const Rt = struct {
         if (c.debug) try c.check(c.drv.cuStreamSynchronize(c.stream), "optixLaunch");
     }
 
+    /// Bild über die Wiederholungs-Wavefront (src/device/replay.zig):
+    /// Schattierung in CUDA, Strahlen in Listen über die RT-Cores.
     pub fn render(self: *Rt, c: *Context, p: *const types.RenderParams) Error!void {
-        var params = std.mem.zeroes(types.RtParams);
-        params.handle = self.ias_handle;
-        params.scene = c.scene_dev;
-        params.flags = p.flags;
-        params.render = p.*;
-        try self.launch(c, g_raygen_render, &params, p.cur.camera.width, p.cur.camera.height);
+        try self.replayRun(c, p, false, p.cur.camera.width, p.cur.camera.height);
     }
 
     /// Zweiter Durchgang: indirekte Beleuchtung in halber Auflösung
     pub fn renderGi(self: *Rt, c: *Context, p: *const types.RenderParams) Error!void {
+        try self.replayRun(c, p, true, p.gi_width, p.gi_height);
+    }
+
+    /// Höchstens so viele Durchgänge (Tiefe der Abhängigkeiten: Primärstrahl,
+    /// Schatten/GI/Spiegelung, deren Schatten, Wasserschichten ...). Pixel, die
+    /// fertig sind, überspringt der Schattierungskern.
+    /// Gemessen: das Bild braucht 4 Durchgänge (fast alle Strahlen im
+    /// ersten), die indirekte Beleuchtung 6.
+    pub const replay_passes: u32 = 5;
+    pub const replay_passes_gi: u32 = 7;
+    /// Einträge der Strahlliste je Pixel. Gemessen fragt der erste Durchgang
+    /// 5 je Pixel an; was nicht passt, kommt im nächsten Durchgang dran.
+    // Durchgang 1 fragt im Mittel 6,3 Strahlen je Pixel an (gemessen); was
+    // nicht in die Liste passt, rutscht in den nächsten Durchgang
+    const replay_list_per_pixel: u32 = 8;
+    /// Pixel je Streifen: begrenzt den Speicher der Strahlplätze (etwa 60 MB)
+    // gemessen (1080p, DLSS 2x): 65536 -> 262144 spart 3 ms, weil die fast leeren
+    // letzten Durchgänge nicht mehr achtmal hintereinander laufen
+    const replay_tile_pixels: u32 = 262144;
+
+    fn replayRun(self: *Rt, c: *Context, p: *const types.RenderParams, gi: bool, w: u32, h: u32) Error!void {
+        if (w == 0 or h == 0) return;
+        const tile: u32 = if (std.c.getenv("PYRIT_REPLAY_TILE")) |e| (std.fmt.parseInt(u32, std.mem.span(e), 10) catch replay_tile_pixels) else replay_tile_pixels;
+        const rows = @max(@min(h, tile / @max(w, 1)), 1);
+        const tile_px = w * rows;
+        try self.replay.ensure(c, tile_px);
         var params = std.mem.zeroes(types.RtParams);
         params.handle = self.ias_handle;
         params.scene = c.scene_dev;
         params.flags = p.flags;
         params.render = p.*;
-        try self.launch(c, g_raygen_gi, &params, p.gi_width, p.gi_height);
+        const fn_pass = if (gi) c.fn_replay_gi else c.fn_replay_render;
+        const stats = std.c.getenv("PYRIT_REPLAY_STATS") != null;
+        var per_pass = [_]u64{0} ** 16;
+        const primary_pre = std.c.getenv("PYRIT_REPLAY_NOPRIMARY") == null;
+        const per_pass_timing = std.c.getenv("PYRIT_GPU_TIMING_PASSES") != null;
+        const pass_names = [_][]const u8{ "Bild D0", "Bild D1", "Bild D2", "Bild D3", "Bild D4" };
+        // Durchgänge ohne Spekulation am Anfang (Diagnose PYRIT_REPLAY_NOSPEC)
+        const no_spec: u32 = if (std.c.getenv("PYRIT_REPLAY_NOSPEC")) |e| (std.fmt.parseInt(u32, std.mem.span(e), 10) catch 1) else 1;
+        var y0: u32 = 0;
+        while (y0 < h) : (y0 += rows) {
+            const rb = &self.replay;
+            var rp = types.ReplayParams{
+                .rays = rb.rays,
+                .hits = rb.hits,
+                .state = rb.state,
+                .done = rb.done,
+                .list = rb.list,
+                .count = rb.count,
+                .capacity = @min(rb.capacity, (w * @min(rows, h - y0)) * replay_list_per_pixel),
+                .y0 = y0,
+                .rows = @min(rows, h - y0),
+                .gi = @intFromBool(gi),
+                .speculate = 1,
+            };
+            const n_px = w * rp.rows;
+            try c.check(c.drv.cuMemsetD8Async(rb.state, 0, @as(u64, n_px) * types.replay_slots * 4, c.stream), "cuMemsetD8Async");
+            try c.check(c.drv.cuMemsetD8Async(rb.done, 0, @as(u64, n_px) * 4, c.stream), "cuMemsetD8Async");
+            c.mark("Replay leeren");
+            params.replay = rp;
+            const passes = if (gi) replay_passes_gi else replay_passes;
+            var pass: u32 = 0;
+            while (pass < passes) : (pass += 1) {
+                try c.check(c.drv.cuMemsetD8Async(rb.count, 0, 4, c.stream), "cuMemsetD8Async");
+                rp.speculate = @intFromBool(pass >= no_spec);
+                params.replay = rp;
+                var pr = p.*;
+                var tf = p.flags;
+                const args = [_]?*anyopaque{ @ptrCast(&pr), @ptrCast(&rp), @ptrCast(&tf) };
+                const b = types.replay_block;
+                // Bild: der erste Durchgang trägt nur die Primärstrahlen ein
+                const f = if (!gi and pass == 0 and primary_pre) c.fn_replay_primary else fn_pass;
+                try c.launch(f, .{ (n_px + b - 1) / b, 1, 1 }, .{ b, 1, 1 }, &args);
+                c.mark(if (gi) "GI schattieren" else if (per_pass_timing) pass_names[@min(pass, 4)] else "Bild schattieren");
+                // der letzte Durchgang schattiert nur noch fertig, er verfolgt nichts
+                if (pass + 1 < passes) try self.launch(c, g_raygen_slots, &params, @min(rb.capacity, n_px * replay_list_per_pixel), 1);
+                c.mark(if (gi) "GI RT" else "Bild RT");
+                // Diagnose: Anfragen je Durchgang über alle Streifen (synchronisiert)
+                if (stats) {
+                    var n: u32 = 0;
+                    try c.check(c.drv.cuStreamSynchronize(c.stream), "cuStreamSynchronize");
+                    try c.check(c.drv.cuMemcpyDtoH_v2(&n, rb.count, 4), "cuMemcpyDtoH");
+                    per_pass[pass] += n;
+                }
+            }
+        }
+        if (stats) {
+            std.debug.print("{s}: {d} Pixel, Strahlen je Pixel und Durchgang:", .{ if (gi) "GI" else "Bild", w * h });
+            for (per_pass[0..if (gi) replay_passes_gi else replay_passes]) |n| std.debug.print(" {d:.2}", .{@as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(w * h))});
+            std.debug.print("\n", .{});
+        }
     }
 
     pub fn trace(self: *Rt, c: *Context, p: *const types.TraceParams) Error!void {
@@ -500,7 +597,40 @@ pub const Rt = struct {
             const hit_size: u64 = if (p.flags & types.trace_extended != 0) @sizeOf(types.HitEx) else @sizeOf(types.Hit);
             params.trace.hits = p.hits + @as(u64, start) * hit_size;
             params.trace.count = n;
-            try self.launch(c, 1, &params, n, 1);
+            try self.launch(c, g_raygen_trace, &params, n, 1);
         }
+    }
+};
+
+/// Speicher der Wiederholungs-Wavefront, einmal je Streifengröße angelegt
+const ReplayBuffers = struct {
+    rays: cuda.CUdeviceptr = 0,
+    hits: cuda.CUdeviceptr = 0,
+    state: cuda.CUdeviceptr = 0,
+    done: cuda.CUdeviceptr = 0,
+    list: cuda.CUdeviceptr = 0,
+    count: cuda.CUdeviceptr = 0,
+    pixels: u32 = 0,
+    capacity: u32 = 0,
+
+    fn ensure(self: *ReplayBuffers, c: *Context, pixels: u32) Error!void {
+        if (self.pixels >= pixels) return;
+        self.free(c);
+        const places = @as(u64, pixels) * types.replay_slots;
+        self.rays = try c.devAlloc(places * @sizeOf(types.ReplayRay), "Wavefront-Strahlen");
+        self.hits = try c.devAlloc(places * @sizeOf(types.ReplayHit), "Wavefront-Treffer");
+        self.state = try c.devAlloc(places * 4, "Wavefront-Zustand");
+        self.done = try c.devAlloc(@as(u64, pixels) * 4, "Wavefront-Pixel");
+        self.list = try c.devAlloc(places * 4, "Wavefront-Liste");
+        self.count = try c.devAlloc(4, "Wavefront-Zähler");
+        self.pixels = pixels;
+        self.capacity = @intCast(places);
+    }
+
+    fn free(self: *ReplayBuffers, c: *Context) void {
+        for ([_]cuda.CUdeviceptr{ self.rays, self.hits, self.state, self.done, self.list, self.count }) |b| {
+            if (b != 0) _ = c.drv.cuMemFree_v2(b);
+        }
+        self.* = .{};
     }
 };

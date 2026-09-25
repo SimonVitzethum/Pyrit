@@ -55,6 +55,13 @@ pub const Generator = struct {
         return terrain.height(&self.params, @floatCast(x), @floatCast(z));
     }
 
+    /// Höhe, wie die feinste Stufe sie erzeugt (Oktaven bis Wellenlänge 2)
+    pub fn heightFinest(self: *const Generator, x: f64, z: f64) f32 {
+        const xf: f32 = @floatCast(x);
+        const zf: f32 = @floatCast(z);
+        return terrain.heightWith(&self.params, terrain.climate(&self.params, xf, zf), xf, zf, 2);
+    }
+
     /// Welt mit diesem Generator: Minecraft-Höhenbereich, 1024 Chunks Sicht
     pub fn worldInfo(self: *Generator) api.WorldInfo {
         var wi = std.mem.zeroes(api.WorldInfo);
@@ -135,7 +142,7 @@ pub fn water() types.Material {
     // Absorption: flaches Wasser zeigt den Grund, tieferes wird schnell
     // blaugrün undurchsichtig (bei 0,05 lag die Treppe des Meeresgrunds bis
     // in große Tiefe kontrastreich sichtbar)
-    m.density = 0.16;
+    m.density = 0.08;
     m.opacity = 0.03;
     // Große, ruhige Wellen: feine sprenkeln in der Ferne, weil viele davon
     // auf ein Pixel fallen und die Normale von Pixel zu Pixel springt.
@@ -145,6 +152,22 @@ pub fn water() types.Material {
     m.clearcoat = 1; // nasse, lackartige Oberfläche
     m.clearcoat_roughness = 0.03;
     return m;
+}
+
+/// Medium um die Kamera, solange sie unter Wasser ist: dieselbe Absorption
+/// wie das Wasser, dazu blaugrünes Streulicht (Tageslicht, das im Wasser
+/// gestreut wird). `top`: Höhe der Oberfläche relativ zum Render-Ursprung.
+pub fn underwater(l: *types.Lighting, on: bool, top: f32) void {
+    if (!on) {
+        l.camera_medium_density = 0;
+        return;
+    }
+    const w = water();
+    l.camera_medium_density = w.density;
+    // Farbe des Wassers (Attribut in terrain.zig), linear
+    l.camera_medium_color = .{ 0.013, 0.40, 0.64 };
+    l.camera_medium_scatter = .{ 0.004, 0.035, 0.05 };
+    l.camera_medium_top = top;
 }
 
 /// Welteinheiten je Wiederholung der Wolkenschatten
@@ -248,5 +271,12 @@ pub fn createInfo(flags: u32) api.CreateInfo {
     ci.node_pool_bytes = 512 << 20;
     ci.leaf_pool_bytes = 512 << 20;
     ci.attribute_pool_bytes = 512 << 20;
+    // PYRIT_LOG=<Stufe>: Meldungen bis zu dieser Stufe auf stderr
+    if (std.c.getenv("PYRIT_LOG") != null) ci.log = logToStderr;
     return ci;
+}
+
+fn logToStderr(_: ?*anyopaque, level: i32, msg: [*:0]const u8) callconv(.c) void {
+    const max: i32 = if (std.c.getenv("PYRIT_LOG")) |e| (std.fmt.parseInt(i32, std.mem.span(e), 10) catch 3) else 0;
+    if (level <= max) std.debug.print("[pyrit] {s}\n", .{msg});
 }
