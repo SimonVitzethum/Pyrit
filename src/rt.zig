@@ -526,6 +526,7 @@ pub const Rt = struct {
         const primary_pre = std.c.getenv("PYRIT_REPLAY_NOPRIMARY") == null;
         const per_pass_timing = std.c.getenv("PYRIT_GPU_TIMING_PASSES") != null;
         const pass_names = [_][]const u8{ "Bild D0", "Bild D1", "Bild D2", "Bild D3", "Bild D4" };
+        const rt_names = [_][]const u8{ "RT D0", "RT D1", "RT D2", "RT D3", "RT D4" };
         // Durchgänge ohne Spekulation am Anfang (Diagnose PYRIT_REPLAY_NOSPEC)
         const no_spec: u32 = if (std.c.getenv("PYRIT_REPLAY_NOSPEC")) |e| (std.fmt.parseInt(u32, std.mem.span(e), 10) catch 1) else 1;
         var y0: u32 = 0;
@@ -553,7 +554,9 @@ pub const Rt = struct {
             var pass: u32 = 0;
             while (pass < passes) : (pass += 1) {
                 try c.check(c.drv.cuMemsetD8Async(rb.count, 0, 4, c.stream), "cuMemsetD8Async");
-                rp.speculate = @intFromBool(pass >= no_spec);
+                // GI hängt an keinem Primärstrahl: seine Strahlen sind von Anfang an
+                // unabhängig und dürfen gemeinsam in einen Durchgang
+                rp.speculate = @intFromBool(gi or pass >= no_spec);
                 params.replay = rp;
                 var pr = p.*;
                 var tf = p.flags;
@@ -565,7 +568,7 @@ pub const Rt = struct {
                 c.mark(if (gi) "GI schattieren" else if (per_pass_timing) pass_names[@min(pass, 4)] else "Bild schattieren");
                 // der letzte Durchgang schattiert nur noch fertig, er verfolgt nichts
                 if (pass + 1 < passes) try self.launch(c, g_raygen_slots, &params, @min(rb.capacity, n_px * replay_list_per_pixel), 1);
-                c.mark(if (gi) "GI RT" else "Bild RT");
+                c.mark(if (gi) "GI RT" else if (per_pass_timing) rt_names[@min(pass, 4)] else "Bild RT");
                 // Diagnose: Anfragen je Durchgang über alle Streifen (synchronisiert)
                 if (stats) {
                     var n: u32 = 0;

@@ -1467,6 +1467,20 @@ pub const Context = struct {
             .gi_width = 0,
             .gi_height = 0,
         };
+        // Hülle der transparenten Ebene (siehe RenderParams.trans_lo)
+        if (targets.transparent_mask != 0) {
+            var lo = [3]f32{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) };
+            var hi = [3]f32{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) };
+            for (self.instances[0..self.instance_high]) |*inst| {
+                if (!inst.alive or inst.data.mask & targets.transparent_mask == 0) continue;
+                for (0..3) |a| {
+                    lo[a] = @min(lo[a], inst.data.bounds_min[a]);
+                    hi[a] = @max(hi[a], inst.data.bounds_max[a]);
+                }
+            }
+            params.trans_lo = lo;
+            params.trans_hi = hi;
+        }
         // Indirekte Beleuchtung in halber Auflösung: eigener Durchgang und
         // kantenbewusstes Hochskalieren (braucht color, normal, albedo, hits)
         const half_gi = self.lighting.flags & types.lighting_gi_half != 0 and params.color != 0;
@@ -2038,6 +2052,7 @@ pub const Context = struct {
             p.dst_height = h;
             p.src_half = 0;
         }
+        self.mark("Bloom");
 
         if (fx.flags & api.postfx_auto_exposure != 0) {
             p.expose_acc = v.fx_expose;
@@ -2052,6 +2067,7 @@ pub const Context = struct {
             const sh = (@as(u64, h) + step - 1) / step;
             try self.fxLaunch(self.fn_fx_expose_scan, &p, sw * sh);
             try self.fxLaunch(self.fn_fx_expose_apply, &p, 1);
+        self.mark("Belichtung");
         }
 
         if (fx.flags & api.postfx_grade != 0) {
@@ -2083,6 +2099,7 @@ pub const Context = struct {
         p.out_height = h / ss;
         const out_pixels = if (ss > 1) @as(u64, p.out_width) * p.out_height else n;
         try self.fxLaunch(self.fn_fx_resolve, &p, out_pixels);
+        self.mark("Endbild");
     }
 
     fn freeDlss(self: *Context, v: *ViewSlot) void {
@@ -2399,6 +2416,7 @@ pub const Context = struct {
         const b = types.upscale_block;
         const params_ptr = [_]?*anyopaque{@ptrCast(&u)};
         try self.launch(self.fn_present, .{ (out_w + b - 1) / b, (out_h + b - 1) / b, 1 }, .{ b, b, 1 }, &params_ptr);
+        self.mark("Present");
         if (fx) |fp| try self.runFx(v, in, info, fp, out_w, out_h, v.fx_buf[0], v.up_buf[2]);
         v.up_parity = cur ^ 1;
         v.up_frames = if (history_ok) v.up_frames + 1 else 1;

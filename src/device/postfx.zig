@@ -16,6 +16,7 @@
 //! Generation schreibt (`mvd`: mv.xy, Tiefe, 0) – in Ausgabeauflösung, also
 //! ohne zusätzliche Abtastung.
 
+const warp = @import("warp.zig");
 const types = @import("types.zig");
 const fm = @import("fmath.zig");
 const post = @import("post.zig");
@@ -273,8 +274,8 @@ pub fn exposeScan(p: *const types.PostFxParams, i: u64) void {
     const l = @max(lum(col), 1e-4);
     const v = @min(@max(fm.log2(l) + expose_offset, 0), 2 * expose_offset);
     const acc: [*]u32 = @ptrFromInt(p.expose_acc);
-    _ = @atomicRmw(u32, &acc[0], .Add, @intFromFloat(v * expose_scale), .monotonic);
-    _ = @atomicRmw(u32, &acc[1], .Add, 1, .monotonic);
+    warp.add(&acc[0], @intFromFloat(v * expose_scale));
+    warp.add(&acc[1], 1);
 }
 
 /// Aus dem Mittelwert die Belichtung bilden und zeitlich gedämpft nachführen.

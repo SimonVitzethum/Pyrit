@@ -25,12 +25,19 @@ const types = @import("types.zig");
 const vec = @import("vec.zig");
 const tr = @import("trace.zig");
 const render = @import("render.zig");
+const warp = @import("warp.zig");
 const Vec3 = vec.Vec3;
 
 pub const Tracer = struct {
     rp: *const types.ReplayParams,
     /// Platzbasis dieses Pixels (Pixel im Streifen · slots)
-    base: u64,
+    /// Pixel im Streifen und Zahl der Pixel des Streifens: Platz i eines
+    /// Pixels liegt bei pixel + i · stride ("nach Platz geordnet"). Benachbarte
+    /// Threads greifen so für denselben Platz auf benachbarte Adressen zu –
+    /// vorher lagen die 16 Plätze eines Pixels hintereinander, Nachbarn also
+    /// 640 Byte auseinander, und jeder Warp-Zugriff zerfiel in 32 Transaktionen.
+    pixel: u64,
+    stride: u64,
     flags: u32,
     next: *u32,
     pending: *bool,
@@ -46,7 +53,7 @@ pub const Tracer = struct {
         // Primärstrahl gemessen: 4 von 5 wurden im nächsten Durchgang anders
         // angefragt). Ohne Spekulation bleibt es bei der ersten Anfrage.
         if (self.pending.* and self.rp.speculate == 0) return null;
-        const k = self.base + i;
+        const k = self.pixel + @as(u64, i) * self.stride;
         const want = types.ReplayRay{
             .o = .{ o[0], o[1], o[2] },
             .tmin = tmin,
@@ -83,7 +90,7 @@ fn request(rp: *const types.ReplayParams, k: u64, want: types.ReplayRay) void {
     rays[k] = want;
     state[k] = 1;
     const counter: *u32 = @ptrFromInt(rp.count);
-    const slot = @atomicRmw(u32, counter, .Add, 1, .monotonic);
+    const slot = warp.increment(counter);
     if (slot < rp.capacity) {
         @as([*]u32, @ptrFromInt(rp.list))[slot] = @intCast(k);
     } else {
@@ -100,7 +107,7 @@ pub fn primaryPass(p: *const types.RenderParams, rp: *const types.ReplayParams, 
     const y = rp.y0 + i / w;
     if (y >= p.cur.camera.height) return;
     const pr = render.primaryRay(p, i % w, y);
-    request(rp, @as(u64, i) * types.replay_slots, .{
+    request(rp, i, .{
         .o = .{ pr.ray.o[0], pr.ray.o[1], pr.ray.o[2] },
         .tmin = pr.ray.tmin,
         .d = .{ pr.ray.d[0], pr.ray.d[1], pr.ray.d[2] },
@@ -128,7 +135,7 @@ pub fn renderPass(p: *const types.RenderParams, rp: *const types.ReplayParams, s
     if (y >= p.cur.camera.height) return;
     var next: u32 = 0;
     var pending = false;
-    const t = Tracer{ .rp = rp, .base = @as(u64, i) * types.replay_slots, .flags = trace_flags, .next = &next, .pending = &pending };
+    const t = Tracer{ .rp = rp, .pixel = i, .stride = @as(u64, w) * rp.rows, .flags = trace_flags, .next = &next, .pending = &pending };
     const r = render.renderPixelWith(t, p, s, x, y);
     render.writePixel(p, @as(u64, y) * w + x, &r);
     if (!pending) done[i] = 1;
@@ -145,7 +152,7 @@ pub fn giPass(p: *const types.RenderParams, rp: *const types.ReplayParams, s: *c
     if (y >= p.gi_height) return;
     var next: u32 = 0;
     var pending = false;
-    const t = Tracer{ .rp = rp, .base = @as(u64, i) * types.replay_slots, .flags = trace_flags, .next = &next, .pending = &pending };
+    const t = Tracer{ .rp = rp, .pixel = i, .stride = @as(u64, w) * rp.rows, .flags = trace_flags, .next = &next, .pending = &pending };
     render.giPixel(t, p, s, x, y);
     if (!pending) done[i] = 1;
 }

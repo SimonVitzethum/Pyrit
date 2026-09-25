@@ -725,10 +725,36 @@ pub noinline fn cloudShadow(s: *const types.Scene, l: *const types.Lighting, p: 
 
 /// Direktes Licht (Sonne + Punktlichter) an Punkt p mit Normale n
 fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
-    return directAt(tracer, s, l, p, n, v, sf, rng, mask, trans_mask, true);
+    return directAt(tracer, s, l, p, n, v, sf, rng, mask, trans_mask, true, true);
 }
 
-fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32, want_shadows: bool) Vec3 {
+/// Himmelslicht über die Umgebungskarte (nächstes Ereignis), nur diffus und
+/// ohne Albedo: so, wie der Durchgang in halber Auflösung es braucht. Dort
+/// liegt es neben dem indirekten Licht, mit dessen Himmelstreffern es über
+/// dieselbe Gewichtung (Potenz-Heuristik) zusammengeht. Das Himmelslicht ist
+/// weich und niederfrequent – in voller Auflösung kostete sein Schattenstrahl
+/// je Pixel einen ganzen Strahl.
+pub fn envNee(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
+    if (!(hasEnv(l) and l.env_total > 0)) return splat(0);
+    const es = envSample(l, rng.next(), rng.next());
+    const endl = vec.dot(n, es.dir);
+    if (!(endl > 0 and es.pdf > 1e-8)) return splat(0);
+    var tint = splat(@as(f32, 1));
+    if (l.flags & types.lighting_shadows != 0) {
+        if (anyTransparent(s, trans_mask)) {
+            const r = traceThrough(tracer, s, p, es.dir, 0, types.flt_max, mask | trans_mask, trans_mask);
+            if (r.hit != null) return splat(0);
+            tint = r.att;
+        } else if (occluded(tracer, s, p, es.dir, types.flt_max, mask)) return splat(0);
+    }
+    const pdf_bsdf = endl / pi;
+    const w = es.pdf * es.pdf / (es.pdf * es.pdf + pdf_bsdf * pdf_bsdf);
+    return clampContribution(l, es.radiance * splat(endl * w / (es.pdf * pi)) * tint);
+}
+
+/// `env_nee`: Himmelslicht hier abtasten (sonst übernimmt es der Durchgang
+/// in halber Auflösung, siehe envNee)
+fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32, want_shadows: bool, env_nee: bool) Vec3 {
     var c = splat(0);
     const shadows = want_shadows and l.flags & types.lighting_shadows != 0;
 
@@ -763,7 +789,7 @@ fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p:
     // Umgebungskarte: eine Richtung nach ihrer Helligkeit ziehen und gegen die
     // Cosinus-Abtastung des GI-Strahls gewichten (Potenz-Heuristik). Ohne das
     // rauscht eine kleine helle Sonne in der Karte hoffnungslos.
-    if (hasEnv(l) and l.env_total > 0) {
+    if (env_nee and hasEnv(l) and l.env_total > 0) {
         const es = envSample(l, rng.next(), rng.next());
         const endl = vec.dot(n, es.dir);
         if (endl > 0 and es.pdf > 1e-8) {
@@ -864,7 +890,11 @@ pub const Shaded = struct {
 /// Farbe des Treffers h des Strahls o + t d.
 /// `mask`: Instanzen, die Sekundärstrahlen (Schatten, GI, Reflexion) sehen –
 /// ohne transparente Ebene.
-pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32, footprint: f32) Shaded {
+/// `behind_transparent`: der Treffer liegt hinter Wasser oder Glas. Dann
+/// bleibt das Himmelslicht hier: das indirekte Licht in halber Auflösung kommt
+/// erst nach der transparenten Schicht dazu und würde an ihrer Absorption
+/// vorbeigehen (am Meeresgrund leuchtete der Himmel sonst ungedämpft durch).
+pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.TraceHit, rng: *Rng, mask: u32, trans_mask: u32, footprint: f32, behind_transparent: bool) Shaded {
     const l: *const types.Lighting = @ptrFromInt(s.lighting);
     const inst = &tr.instances(s)[h.instance];
     const n = worldNormal(inst, h.face);
@@ -878,7 +908,9 @@ pub fn shadeHit(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, h: tr.
     const ps = if (l.secondary_bias > 0) p + n * splat(l.secondary_bias * h.t) else p;
     const v = -d;
 
-    var c = sf.emission + direct(tracer, s, l, ps, ns, v, &sf, rng, mask, trans_mask);
+    // Mit indirektem Licht in halber Auflösung wandert das Himmelslicht dorthin
+    const env_here = behind_transparent or l.flags & types.lighting_gi_half == 0 or l.flags & types.lighting_gi == 0;
+    var c = sf.emission + directAt(tracer, s, l, ps, ns, v, &sf, rng, mask, trans_mask, true, env_here);
 
     // Indirekt: in halber Auflösung rechnet ein eigener Durchgang (gi_half),
     // sonst hier. Der diffuse Faktor kommt in beiden Fällen dazu.
@@ -949,7 +981,7 @@ pub fn indirect(tracer: anytype, s: *const types.Scene, l: *const types.Lighting
                 // Posten der ganzen Beleuchtung. Bis gi_shadow_depth werfen
                 // sie welche, darüber nehmen sie das Licht ungeschattet.
                 const want_sh = b < l.gi_shadow_depth;
-                acc += clampContribution(l, throughput * r.att * (gsf.emission + directAt(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask, want_sh)));
+                acc += clampContribution(l, throughput * r.att * (gsf.emission + directAt(tracer, s, l, gp, gn, -gd, &gsf, rng, mask, trans_mask, want_sh, true)));
                 if (b + 1 >= bounces) break;
                 // Weiter mit dem diffusen Anteil der getroffenen Fläche
                 throughput *= r.att * gsf.albedo * splat(1 - gsf.metallic);
@@ -1291,7 +1323,10 @@ pub noinline fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types
         if (shadows) {
             vis = 0;
             const r0 = rng.next();
-            const nv = 2;
+            // Ein Strahl je Pixel und Frame: die zeitliche Mittelung sammelt die
+            // Schächte ohnehin über viele Frames (gemessen: zwei kosteten 0,65 ms
+            // bei 960x540, ohne sichtbaren Unterschied nach der Mittelung)
+            const nv = 1;
             inline for (0..nv) |q| {
                 // Schritt nach seinem Gewicht wählen
                 const target = (@as(f32, @floatFromInt(q)) + r0) * (1.0 / @as(f32, nv)) * w_total;

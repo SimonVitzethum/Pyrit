@@ -452,6 +452,11 @@ pub const RenderParams = extern struct {
     gi: u64,
     gi_width: u32,
     gi_height: u32,
+    /// Hülle aller Instanzen der transparenten Ebene (Welt relativ zum
+    /// Ursprung); leer (lo > hi), wenn es keine gibt. Strahlen, die sie nicht
+    /// berühren, brauchen keinen Strahl für Wasser und Glas.
+    trans_lo: [3]f32 = .{ 1, 1, 1 },
+    trans_hi: [3]f32 = .{ 0, 0, 0 },
 };
 
 pub const TraceParams = extern struct {

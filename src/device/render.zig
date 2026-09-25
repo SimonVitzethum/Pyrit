@@ -102,6 +102,30 @@ pub fn renderPixel(p: *const types.RenderParams, s: *const types.Scene, x: u32, 
 
 /// Primärstrahl, Tiefe und Motion Vector eines Pixels. `tracer.trace` liefert
 /// den nächsten Treffer samt exakter Ruheposition (p_object).
+/// Berührt o + t d für t in [t0, t1] die Box [lo, hi]? Großzügig (Rand +1 %),
+/// denn ein falsches Nein ließe Wasser verschwinden.
+fn segmentTouches(o: Vec3, d: Vec3, t0: f32, t1: f32, lo: [3]f32, hi: [3]f32) bool {
+    var a = t0;
+    var b = t1;
+    inline for (0..3) |k| {
+        if (lo[k] > hi[k]) return false; // leere Hülle
+        const pad = (hi[k] - lo[k]) * 0.01 + 1e-2;
+        const l = lo[k] - pad;
+        const h = hi[k] + pad;
+        if (@abs(d[k]) < 1e-12) {
+            if (o[k] < l or o[k] > h) return false;
+        } else {
+            const inv = 1.0 / d[k];
+            const ta = (l - o[k]) * inv;
+            const tb = (h - o[k]) * inv;
+            a = @max(a, @min(ta, tb));
+            b = @min(b, @max(ta, tb));
+            if (a > b) return false;
+        }
+    }
+    return true;
+}
+
 /// Primärstrahl eines Pixels: Maske und Flags, wie renderPixelWith ihn
 /// verfolgt (die Wiederholungs-Wavefront trägt ihn damit vorab bitgleich ein)
 pub const Primary = struct { ray: CameraRay, mask: u32, flags: u32 };
@@ -110,7 +134,10 @@ pub inline fn primaryRay(p: *const types.RenderParams, x: u32, y: u32) Primary {
     const cam = &p.cur.camera;
     const px = @as(f32, @floatFromInt(x)) + 0.5 + cam.jitter[0];
     const py = @as(f32, @floatFromInt(y)) + 0.5 + cam.jitter[1];
-    return .{ .ray = cameraRay(cam, px, py), .mask = p.ray_mask & ~p.transparent_mask, .flags = p.flags | types.trace_skip_transparent };
+    // Ohne Überspringen durchsichtiger Voxel: trifft er etwas Undurchsichtiges
+    // (oder nichts), liegt davor sicher kein Wasser – dann entfallen beide
+    // Strahlen der transparenten Schicht (siehe renderPixelWith)
+    return .{ .ray = cameraRay(cam, px, py), .mask = p.ray_mask & ~p.transparent_mask, .flags = p.flags };
 }
 
 pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const types.Scene, x: u32, y: u32) PixelResult {
@@ -124,7 +151,13 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
     const secondary_mask = if (p.secondary_mask != 0) p.secondary_mask else opaque_mask;
     // durchsichtige Voxel überspringt die Traversierung selbst
     const trans_mask = p.ray_mask & p.transparent_mask;
-    const found = tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, prim.mask, prim.flags);
+    // Erst ohne Überspringen: ist der erste Treffer durchsichtig (Wasser,
+    // Glas), braucht es den Untergrund dahinter noch einmal mit Überspringen.
+    // Sonst ist er selbst der Untergrund, und davor liegt nichts Durchsichtiges.
+    const first = tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, prim.mask, prim.flags);
+    const trans_mask_early = p.ray_mask & p.transparent_mask;
+    const water_front = if (first) |f| shade.anyTransparent(s, trans_mask_early) and shade.hitTransparent(s, f, trans_mask_early) else false;
+    const found = if (water_front) tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, prim.mask, prim.flags | types.trace_skip_transparent) else first;
 
     var r = PixelResult{ .hit = tr.toHit(found), .depth = types.flt_max, .motion = .{ 0, 0 } };
     r.hit.meta |= @as(u32, 0xFF) << types.hit_fog_shift; // klar, bis der Dunst etwas anderes sagt
@@ -173,7 +206,7 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             // in *Ausgabe*pixeln: beim Hochskalieren sind sie um detail_scale kleiner
             const px_per_unit = 2 * cm.scale[1] / (@as(f32, @floatFromInt(@max(cm.height, 1))) * @max(p.detail_scale, 1));
             const footprint = if (cm.projection == types.projection_orthographic) px_per_unit else h.t * px_per_unit;
-            const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint);
+            const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint, water_front);
             var col = vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
             // Albedo wird genauso gemittelt wie die Farbe. Die Nachbearbeitung
             // filtert Farbe / Albedo; stammte die Farbe aus mehreren Flächen
@@ -250,7 +283,7 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
                         } else {
                             var rng2 = shade.Rng.init(x, y, p.frame_index, 8 + k);
                             const fp2 = if (cm.projection == types.projection_orthographic) px_per_unit else h2.t * px_per_unit;
-                            const s2 = shade.shadeHit(tracer, s, r2.o, r2.d, h2, &rng2, secondary_mask, trans_mask, fp2);
+                            const s2 = shade.shadeHit(tracer, s, r2.o, r2.d, h2, &rng2, secondary_mask, trans_mask, fp2, water_front);
                             col += vec.Vec3{ s2.color[0], s2.color[1], s2.color[2] };
                             alb += vec.Vec3{ s2.albedo[0], s2.albedo[1], s2.albedo[2] };
                         }
@@ -281,9 +314,22 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             const behind = vec.Vec3{ r.color[0], r.color[1], r.color[2] };
             const cm2 = &p.cur.camera;
             const fp_scale = 2 * cm2.scale[1] / (@as(f32, @floatFromInt(@max(cm2.height, 1))) * @max(p.detail_scale, 1));
-            var c = shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng, fp_scale);
-            // Ohne durchsichtige Schicht kommt `behind` bitgleich zurück
-            if (@reduce(.Or, c != behind)) r.hit.meta |= types.hit_through_transparent;
+            // Die transparente Schicht sucht mit zwei Strahlen nach Wasser und
+            // Glas vor dem Untergrund. Nötig nur, wenn der erste Strahl (ohne
+            // Überspringen) etwas Durchsichtiges traf – oder bei Instanzen der
+            // transparenten Ebene, die er wegen der Maske nicht sieht und deren
+            // Hülle der Sichtstrahl berührt. Sonst käme `behind` ohnehin
+            // bitgleich zurück; gespart: zwei Strahlen je Land- und Himmelspixel.
+            const need_layers = water_front or
+                (trans_mask != 0 and segmentTouches(ray.o, ray.d, ray.tmin, t_behind, p.trans_lo, p.trans_hi));
+            var c = if (need_layers)
+                shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng, fp_scale)
+            else
+                behind;
+            // Ohne durchsichtige Schicht kommt `behind` bitgleich zurück.
+            // Hinter Wasser (water_front) immer markieren: danach richtet sich
+            // auch, wo das Himmelslicht gerechnet wird (shadeHit / giPixel).
+            if (water_front or @reduce(.Or, c != behind)) r.hit.meta |= types.hit_through_transparent;
             // Nebel ganz zum Schluss: er dämpft alles dahinter, auch die
             // transparenten Schichten, und steuert die Lichtschächte bei.
             const lg: *const types.Lighting = @ptrFromInt(s.lighting);
@@ -393,7 +439,12 @@ pub fn giPixel(tracer: anytype, p: *const types.RenderParams, s: *const types.Sc
     const opaque_mask = p.ray_mask & ~p.transparent_mask;
     const mask = if (p.secondary_mask != 0) p.secondary_mask else opaque_mask;
     var rng = shade.Rng.init(c[0], c[1], p.frame_index, 2);
-    const li = shade.indirect(tracer, s, l, ps, n, &rng, mask, p.ray_mask & p.transparent_mask);
+    var li = shade.indirect(tracer, s, l, ps, n, &rng, mask, p.ray_mask & p.transparent_mask);
+    // Himmelslicht (nächstes Ereignis) ebenfalls hier, in halber Auflösung –
+    // die volle Auflösung lässt es dafür weg (shadeHit)
+    // (nicht hinter Wasser: dort rechnet es shadeHit, damit die Schicht es dämpft)
+    if (l.flags & types.lighting_gi != 0 and hit.meta & types.hit_through_transparent == 0)
+        li += shade.envNee(tracer, s, l, ps, n, &rng, mask, p.ray_mask & p.transparent_mask);
     giStore(p.gi, gi_index, .{ li[0], li[1], li[2], 1 });
 }
 
