@@ -258,6 +258,15 @@ export fn pyr_k_replay_primary(p: types.RenderParams, rp: types.ReplayParams, tr
     pyr.replay.primaryPass(&p, &rp, i, trace_flags);
 }
 
+/// Attribute als Palette + 4-Bit-Indizes (src/device/palette.zig), ein Block je Chunk
+export fn pyr_k_palette_scan(p: pyr.palette.Params) callconv(kernel) void {
+    pyr.palette.scan(&p, @workGroupId(0), @workItemId(0));
+}
+
+export fn pyr_k_palette_pack(p: pyr.palette.Params) callconv(kernel) void {
+    pyr.palette.pack(&p, @workGroupId(0), @workItemId(0));
+}
+
 /// Pfadänderung fertiger Chunks: ein Block je Auftrag (src/device/pathedit.zig)
 export fn pyr_k_path_edit(p: types.PathEditParams) callconv(kernel) void {
     pyr.pathedit.run(&p, @workGroupId(0), @workItemId(0));

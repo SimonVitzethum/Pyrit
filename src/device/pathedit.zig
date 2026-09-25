@@ -263,6 +263,18 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
     };
     const sub_level = job.rt_log2; // Teilbaum der Kante 2^rt_log2 = Knoten der Stufe rt_log2 - 1
 
+    // 0. Palette (Thread 0 hält sie in Registern): neue Werte kommen hinten
+    //    dazu; mehr als 16 -> Überlauf, der Chunk wird voll neu gebaut
+    var pal: [16]u32 = undefined;
+    var n_pal: u32 = 0;
+    if (tid == 0 and job.palette != 0) {
+        var q: u32 = 0;
+        while (q < 16) : (q += 1) pal[q] = attrs[job.pal_src + q];
+        // aufgefüllt wird mit dem ersten Wert: bis zu seiner Wiederholung
+        n_pal = 1;
+        while (n_pal < 16 and pal[n_pal] != pal[0]) n_pal += 1;
+    }
+
     // 1. Baum (Thread 0), je Brick einmal: die Änderungen eines Bricks
     //    werden zusammen in seine Maske geschrieben und der Weg darüber nur
     //    einmal neu. Der Rang jedes Voxels folgt aus dem Brick-Präfix und der
@@ -300,6 +312,23 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
                 const bm = @as(u64, 1) << @intCast(bit);
                 const rank = wk.prefix +% @as(u32, @popCount(brick & (bm - 1)));
                 const has = brick & bm != 0;
+                // Palette: Wert -> Index (neu: anhängen). Voll: diese Änderung
+                // entfällt hier, der Neubau (Überlauf) bringt sie
+                var val = q[3];
+                if (job.palette != 0 and q[3] != 0) {
+                    var idx: u32 = 0;
+                    while (idx < n_pal and pal[idx] != val) idx += 1;
+                    if (idx == n_pal) {
+                        if (n_pal == 16) {
+                            flags |= types.path_edit_overflow;
+                            edits[first + e] = .{ op_none, 0, 0, 0 };
+                            continue;
+                        }
+                        pal[n_pal] = val;
+                        n_pal += 1;
+                    }
+                    val = idx;
+                }
                 var op: u32 = op_none;
                 if (q[3] != 0 and has) op = op_set;
                 if (q[3] != 0 and !has) {
@@ -312,7 +341,8 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
                     brick &= ~bm;
                     delta -= 1;
                 }
-                edits[first + e] = .{ op, rank, q[3], 0 };
+                // die Attribute spielen die Operationen in Listenreihenfolge ab
+                edits[first + e] = .{ op, rank, val, 0 };
             }
             if (brick != wk.brick) {
                 const r = rewrite(&w, &wk, job.log2_size, sub_level, v0, brick, delta) orelse {
@@ -325,6 +355,10 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
             }
         }
         if (w.overflow) flags |= types.path_edit_overflow;
+        if (job.palette != 0) {
+            var q: u32 = 0;
+            while (q < 16) : (q += 1) attrs[job.pal_dst + q] = if (q < n_pal) pal[q] else pal[0];
+        }
         job.out_root = root;
         job.out_count = count; // Platz reicht immer: attr_cap = Voxel + Änderungen
         job.out_attr_b = 0;
@@ -337,7 +371,23 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
     const n_final = vjob.out_count;
     // (auch bei Überlauf: die bis dahin geschriebenen Änderungen sind in Baum,
     // Primitiven und Attributen dann gleichermaßen enthalten)
-    if (vjob.out_flags & types.path_edit_empty == 0 and p.reserved & 1 == 0) {
+    if (vjob.out_flags & types.path_edit_empty == 0 and p.reserved & 1 == 0 and job.palette != 0) {
+        // Palettenformat: ein Thread je Ausgabewort (8 Indizes), keine Konflikte
+        const words = (n_final + 7) / 8;
+        var wd = tid;
+        while (wd < words) : (wd += threads) {
+            var word: u32 = 0;
+            var j: u32 = 0;
+            while (j < 8) : (j += 1) {
+                const i = wd * 8 + j;
+                if (i >= n_final) break;
+                const v = sourceOf(edits, first, n_edits, i);
+                const idx = if (v.found) v.val else (attrs[job.attr_src + (v.idx >> 3)] >> @intCast((v.idx & 7) * 4)) & 15;
+                word |= idx << @intCast(j * 4);
+            }
+            attrs[job.attr_a + wd] = word;
+        }
+    } else if (vjob.out_flags & types.path_edit_empty == 0 and p.reserved & 1 == 0) {
         var i = tid;
         while (i < n_final) : (i += threads) {
             var idx = i;
@@ -421,6 +471,32 @@ pub fn run(p: *const types.PathEditParams, block: u32, tid: u32) void {
         }
         if (grew) _ = @atomicRmw(u32, &job.out_flags, .Or, types.path_edit_grew, .monotonic);
     }
+}
+
+/// Herkunft des Werts an Stelle `i` nach allen Operationen: rückwärts durch
+/// die Liste, jede Operation bildet einen Index nach ihr auf einen davor ab
+fn sourceOf(edits: [*]const [4]u32, first: u32, n_edits: u32, i: u32) struct { found: bool, val: u32, idx: u32 } {
+    var idx = i;
+    var k = n_edits;
+    while (k > 0) {
+        k -= 1;
+        const o = edits[first + k];
+        const rank = o[1];
+        switch (o[0]) {
+            op_insert => {
+                if (idx == rank) return .{ .found = true, .val = o[2], .idx = 0 };
+                if (idx > rank) idx -= 1;
+            },
+            op_remove => {
+                if (idx >= rank) idx += 1;
+            },
+            op_set => {
+                if (idx == rank) return .{ .found = true, .val = o[2], .idx = 0 };
+            },
+            else => {},
+        }
+    }
+    return .{ .found = false, .val = 0, .idx = idx };
 }
 
 /// RT-Primitive nach der Änderung eines Bricks (bei v) nachziehen (Thread 0):

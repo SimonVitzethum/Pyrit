@@ -119,6 +119,21 @@ pub fn materials(ctx: ?*anyopaque, gpa: std.mem.Allocator) !void {
             m.subsurface_color = .{ 0.5, 0.9, 0.3 };
         }
         if (e.k == .snow) m.clearcoat = 0.25;
+        // Farbschwankung je Säule (vorher im Attribut jedes Voxels): große
+        // Flecken, mittlere Wellen, feine Sprenkelung; Gras wird in den
+        // trockenen Flecken gelblicher. Holz und Laub: ein Ton je Baum,
+        // angenähert über die mittlere Schwankung in Kronengröße.
+        switch (e.k) {
+            .wood, .leaves => {
+                m.variation = .{ 0, 0.14, 0 };
+                m.variation_scale = .{ 0, 9 };
+            },
+            else => {
+                m.variation = .{ 0.16, 0.10, 0.06 };
+                m.variation_scale = .{ 150, 23 };
+                if (e.k == .grass) m.variation_warm = 0.5;
+            },
+        }
         if (e.k == .grass) {
             // Seiten des Grasblocks: Erde mit Grasrand, Farbe aus der Kachel
             blocktex.grassSide(tex);

@@ -113,8 +113,10 @@ typedef struct PyrCamera {
 
 typedef struct PyrGeometryData {
     uint32_t node_offset, leaf_offset, attribute_offset, root;
-    uint32_t log2_size, flags, default_attribute, reserved;
+    uint32_t log2_size, flags, default_attribute;
+    uint32_t palette_offset;  /* PYR_GEOMETRY_PALETTE: 16 Werte im Attributpool, Attribute als 4-Bit-Indizes */
 } PyrGeometryData;
+#define PYR_GEOMETRY_PALETTE 0x2u
 
 #define PYR_INSTANCE_ACTIVE 0x1u
 #define PYR_INSTANCE_KEEP_HISTORY 0x2u /* neue statische Instanz: Verlauf der Umgebung behalten */
@@ -217,6 +219,12 @@ typedef struct PyrMaterial {
      * eigene Farbe statt der Voxelfarbe (0,0,0 = Voxelfarbe behalten) */
     uint32_t side_texture;
     float    side_color[3];
+    /* Farbschwankung je Säule aus der Weltposition (statt im Attribut):
+     * Helligkeit x (1 + a0*grob + a1*mittel + a2*fein), Rauschen in [-1, 1];
+     * fein je Block, ausgeblendet unter einem Pixel. Alles 0 = aus. */
+    float    variation[3];
+    float    variation_scale[2];           /* Wellenlängen grob, mittel (Welteinheiten) */
+    float    variation_warm;               /* Wärme aus grob (trockenes Gras) */
 } PyrMaterial;
 
 

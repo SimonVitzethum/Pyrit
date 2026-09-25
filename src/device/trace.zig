@@ -37,10 +37,15 @@ pub fn dagOf(s: *const types.Scene, g: *const types.GeometryData) dag.Dag {
         @as([*]const u32, @ptrFromInt(s.attributes)) + g.attribute_offset
     else
         null;
+    const palette: ?[*]const u32 = if (g.flags & types.geometry_palette != 0)
+        @as([*]const u32, @ptrFromInt(s.attributes)) + g.palette_offset
+    else
+        null;
     return .{
         .nodes = nodes + g.node_offset,
         .leaves = leaves + g.leaf_offset,
         .attributes = attributes,
+        .palette = palette,
         .root = g.root,
         .log2_size = g.log2_size,
         .default_attribute = g.default_attribute,

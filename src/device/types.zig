@@ -90,6 +90,10 @@ pub const Camera = extern struct {
 // ---------------------------------------------------------------------------
 
 pub const geometry_has_attributes: u32 = 0x1;
+/// Attribute als Palette (16 Werte bei palette_offset) und 4-Bit-Indizes
+/// (8 je Wort ab attribute_offset). Welt-Chunks haben höchstens 12
+/// verschiedene Attribute (gemessen); ein Achtel des Speichers.
+pub const geometry_palette: u32 = 0x2;
 
 pub const GeometryData = extern struct {
     /// in 32-Bit-Worten im Knotenpool
@@ -105,7 +109,8 @@ pub const GeometryData = extern struct {
     flags: u32,
     /// Attribut, wenn keine Attribute gespeichert sind
     default_attribute: u32,
-    reserved: u32,
+    /// geometry_palette: Beginn der Palette (16 Werte) im Attributpool
+    palette_offset: u32,
 };
 
 pub const instance_active: u32 = 0x1;
@@ -235,6 +240,18 @@ pub const Material = extern struct {
     /// Farbe (linear) der Seitenflächen statt der Voxelfarbe; {0,0,0} = die
     /// Voxelfarbe behalten. Mit {1,1,1} trägt die Seitentextur die Farbe selbst.
     side_color: [3]f32,
+    /// Farbschwankung je Säule (x, z), aus der Weltposition statt im Voxel
+    /// gespeichert: Helligkeit × (1 + a0·grob + a1·mittel + a2·fein), jeweils
+    /// Rauschen in [-1, 1]; fein ist je Block und wird ausgeblendet, sobald
+    /// ein Block kleiner als ein Pixel erscheint. Alles 0 = aus.
+    /// (Vorher trug jede Säule ihren Ton im Attribut – dann ist fast jedes
+    /// Attribut einzigartig, und Attribute sind 94 % des Weltspeichers.)
+    variation: [3]f32 = .{ 0, 0, 0 },
+    /// Wellenlängen der groben und mittleren Schwankung (Welteinheiten)
+    variation_scale: [2]f32 = .{ 0, 0 },
+    /// Wärme aus der groben Schwankung (trockenes Gras): w = max(grob − 0,2, 0)
+    /// · variation_warm; Rot +0,3 w, Grün +0,1 w, Blau −0,2 w
+    variation_warm: f32 = 0,
 };
 
 /// Eine Textur: dicht gepackte RGBA8-Zeilen. Gefiltert wird von Hand
@@ -516,7 +533,8 @@ pub const RtGeometry = extern struct {
     prims: u64,
     rt_log2: u32,
     default_attribute: u32,
-    reserved: [2]u32,
+    /// Palette (geometry_palette): dann sind `attributes` 4-Bit-Indizes; 0 = keine
+    palette: u64,
 };
 
 pub const rt_sbt_header_size = 32;
@@ -605,6 +623,11 @@ pub const PathEditJob = extern struct {
     attr_a: u32,
     attr_b: u32,
     attr_cap: u32,
+    /// geometry_palette: Palette alt/neu (je 16 Werte); Attribute sind dann
+    /// 4-Bit-Indizes (attr_src/attr_a zeigen auf die Indexwörter)
+    palette: u32,
+    pal_src: u32,
+    pal_dst: u32,
     /// Arena-Anteil dieses Auftrags (absolute Wort-/Brick-Indizes)
     node_arena: u32,
     node_cap: u32,

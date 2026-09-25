@@ -26,6 +26,10 @@ pub const Dag = struct {
     leaves: [*]const u64,
     /// null: default_attribute für alle Voxel
     attributes: ?[*]const u32,
+    /// gesetzt: `attributes` sind 4-Bit-Indizes (8 je Wort) in diese Palette
+    palette: ?[*]const u32 = null,
+    /// Rang des ersten Voxels dieser (Teil-)DAG im Attributfeld (RT-Teilbäume)
+    attr_base: u32 = 0,
     root: u32,
     log2_size: u32,
     default_attribute: u32,
@@ -56,6 +60,13 @@ inline fn bitOf(v: u32, s: u32) u32 {
 
 /// Rang eines Voxels in der Attributreihenfolge. stk[s] ist der Knoten auf dem
 /// Pfad, dessen Kinder Kantenlänge 2^s haben.
+/// Attribut des Voxels mit Rang `rank`
+pub inline fn attributeAt(g: *const Dag, attrs: [*]const u32, rank: u32) u32 {
+    const r = g.attr_base +% rank;
+    if (g.palette) |pal| return pal[(attrs[r >> 3] >> @intCast((r & 7) * 4)) & 15];
+    return attrs[r];
+}
+
 fn attributeRank(g: *const Dag, stk: *const [max_log2 + 1]u32, v: [3]u32, brick: u64) u32 {
     var rank: u32 = 0;
     var s: u32 = g.log2_size - 1;
@@ -231,7 +242,7 @@ fn walk(comptime exit_mode: bool, g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tm
                 }
                 var attribute = g.default_attribute;
                 if (want_attribute or skip != null or cut.cut != null) {
-                    if (g.attributes) |attrs| attribute = attrs[attributeRank(g, &stk, v, brick)];
+                    if (g.attributes) |attrs| attribute = attributeAt(g, attrs, attributeRank(g, &stk, v, brick));
                 }
                 // durchsichtiges Material oder Loch im Laub: weiterlaufen
                 // statt treffen. Startet der Strahl in einem Laubvoxel (er

@@ -212,10 +212,49 @@ fn valueNoise2(x: f32, y: f32) f32 {
 
 /// Oberfläche am Treffer: wie `surface`, zusätzlich mit Textur und
 /// Detailnormale. `p` ist der Weltpunkt, `n` die geometrische Normale.
+/// Farbschwankung je Säule (siehe Material.variation). `p` relativ zum
+/// Render-Ursprung; gerechnet wird mit der absoluten Säule, damit sich beim
+/// Verschieben des Ursprungs nichts ändert.
+fn columnVariation(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Vec3 {
+    // Säule des Voxels (die Fläche liegt auf seinem Rand: halben Schritt hinein)
+    const ax = @floor(@as(f64, p[0] - n[0] * 0.5) + s.origin[0]);
+    const az = @floor(@as(f64, p[2] - n[2] * 0.5) + s.origin[2]);
+    const cx: f32 = @floatCast(ax + 0.5);
+    const cz: f32 = @floatCast(az + 0.5);
+    var f: f32 = 1;
+    var coarse: f32 = 0;
+    if (m.variation[0] != 0 and m.variation_scale[0] > 0) {
+        coarse = valueNoise2(cx / m.variation_scale[0] + 3.1, cz / m.variation_scale[0] - 7.4) * 2 - 1;
+        f += coarse * m.variation[0];
+    }
+    if (m.variation[1] != 0 and m.variation_scale[1] > 0)
+        f += (valueNoise2(cx / m.variation_scale[1] - 1.7, cz / m.variation_scale[1] + 9.2) * 2 - 1) * m.variation[1];
+    if (m.variation[2] != 0) {
+        // je Block; ausgeblendet, bevor er flimmern kann (footprint = Welt-
+        // einheiten je Pixel)
+        const fade = @min(@max(1.5 - footprint, 0), 1);
+        const ix: i32 = @truncate(@as(i64, @intFromFloat(ax)));
+        const iz: i32 = @truncate(@as(i64, @intFromFloat(az)));
+        f += (hash2(ix, iz) * 2 - 1) * m.variation[2] * fade;
+    }
+    const warm = @max(coarse - 0.2, 0) * m.variation_warm;
+    // wie zuvor im 8-Bit-sRGB-Attribut: der Faktor wirkt dort, linear also
+    // mit der Gammakurve (≈ f^2,2)
+    const g = Vec3{ f + warm * 0.30, f + warm * 0.10, f - warm * 0.20 };
+    var r: Vec3 = undefined;
+    inline for (0..3) |k| {
+        const v = @max(g[k], 1e-4);
+        r[k] = fm.exp2(2.2 * fm.log2(v));
+    }
+    return r;
+}
+
 pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3, footprint: f32) Surface {
     var sf = surface(s, attribute);
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     const m = &mats[attribute & 0xFF];
+    if (m.variation[0] != 0 or m.variation[1] != 0 or m.variation[2] != 0)
+        sf.albedo = @max(sf.albedo * columnVariation(s, m, p, n, footprint), splat(0));
     if (m.texture == 0 and m.side_texture == 0 and m.normal_texture == 0 and m.normal_strength == 0) return sf;
 
     const scale = if (m.texture_scale > 0) m.texture_scale else 1;

@@ -76,7 +76,7 @@ pub fn buildSceneDag(gpa: std.mem.Allocator, log2: u32) !HostDag {
             .log2_size = dag.log2_size,
             .flags = types.geometry_has_attributes,
             .default_attribute = 1,
-            .reserved = 0,
+            .palette_offset = 0,
         },
     };
 }

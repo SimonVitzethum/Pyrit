@@ -30,7 +30,11 @@ pub fn traceSubtree(g: *const types.RtGeometry, prim: types.RtPrim, o: Vec3, d: 
     const sub = dag.Dag{
         .nodes = @ptrFromInt(g.nodes),
         .leaves = @ptrFromInt(g.leaves),
-        .attributes = if (g.attributes != 0) @as([*]const u32, @ptrFromInt(g.attributes)) + prim.attr_base else null,
+        // Rang über attr_base: mit Palette sind es 4-Bit-Indizes, ein Zeiger
+        // ließe sich nicht auf die Hälfte eines Bytes versetzen
+        .attributes = if (g.attributes != 0) @as([*]const u32, @ptrFromInt(g.attributes)) else null,
+        .palette = if (g.palette != 0) @as([*]const u32, @ptrFromInt(g.palette)) else null,
+        .attr_base = prim.attr_base,
         .root = prim.node,
         .log2_size = g.rt_log2,
         .default_attribute = g.default_attribute,

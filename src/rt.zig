@@ -322,7 +322,7 @@ pub const Rt = struct {
                 .prims = slot.prims,
                 .rt_log2 = rt_log2,
                 .default_attribute = data.default_attribute,
-                .reserved = .{ 0, 0 },
+                .palette = if (data.flags & types.geometry_palette != 0) c.attr_pool + @as(u64, data.palette_offset) * 4 else 0,
             },
         };
         try c.uploadValue(self.sbt_hit + @as(u64, index) * hit_record_size, &record);
@@ -343,7 +343,7 @@ pub const Rt = struct {
                 .prims = self.gas[index].sbt_prims,
                 .rt_log2 = rt_log2,
                 .default_attribute = data.default_attribute,
-                .reserved = .{ 0, 0 },
+                .palette = if (data.flags & types.geometry_palette != 0) c.attr_pool + @as(u64, data.palette_offset) * 4 else 0,
             },
         };
         try c.uploadValue(self.sbt_hit + @as(u64, index) * hit_record_size, &record);
@@ -417,7 +417,7 @@ pub const Rt = struct {
                     .prims = j.prims,
                     .rt_log2 = rt_log2,
                     .default_attribute = j.data.default_attribute,
-                    .reserved = .{ 0, 0 },
+                    .palette = if (j.data.flags & types.geometry_palette != 0) c.attr_pool + @as(u64, j.data.palette_offset) * 4 else 0,
                 },
             };
             try c.uploadValue(self.sbt_hit + @as(u64, j.index) * hit_record_size, &record);

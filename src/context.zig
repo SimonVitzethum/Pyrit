@@ -6,6 +6,7 @@
 //! aus dem Upload. Damit unterscheiden sich beide Hälften immer nur in den
 //! Einträgen des letzten Frames.
 
+const palette_dev = @import("pyrit_device").palette;
 const std = @import("std");
 const types = @import("pyrit_device").types;
 const api = @import("api.zig");
@@ -292,6 +293,8 @@ pub const Context = struct {
     leaf_arena_end: u64 = 0,
     arena_users: u32 = 0,
     fn_path_edit: cuda.CUfunction = null,
+    fn_palette_scan: cuda.CUfunction = null,
+    fn_palette_pack: cuda.CUfunction = null,
     leaf_alloc: RangeAlloc = .{ .capacity = 0 },
     attr_alloc: RangeAlloc = .{ .capacity = 0 },
 
@@ -518,6 +521,8 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_gi, self.module, "pyr_k_replay_gi"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_primary, self.module, "pyr_k_replay_primary"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_path_edit, self.module, "pyr_k_path_edit"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_palette_scan, self.module, "pyr_k_palette_scan"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_palette_pack, self.module, "pyr_k_palette_pack"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gi_combine, self.module, "pyr_k_gi_combine"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_dlss_prepare, self.module, "pyr_k_dlss_prepare"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_dlssg_prepare, self.module, "pyr_k_dlssg_prepare"), "cuModuleGetFunction");
@@ -836,7 +841,7 @@ pub const Context = struct {
             .log2_size = log2_size,
             .flags = if (has_attributes) types.geometry_has_attributes else 0,
             .default_attribute = 1,
-            .reserved = 0,
+            .palette_offset = 0,
         };
     }
 
@@ -1082,6 +1087,9 @@ pub const Context = struct {
     /// `voxels` die neue Voxelzahl. Wurde ein Auftrag nicht übernommen
     /// (Chunk leer, Arena voll), bleibt die Geometrie unverändert – der
     /// Aufrufer baut sie dann wie bisher neu.
+    /// Pfadänderungen kennen das Palettenformat (siehe pathedit.zig)
+    const palette_edits = true;
+
     pub fn pathEdit(self: *Context, reqs: []const PathEditRequest, edits: []const [4]u32, flags: []u32, voxels: []u32) Error!void {
         if (reqs.len == 0) return;
         const n: u32 = @intCast(reqs.len);
@@ -1117,9 +1125,12 @@ pub const Context = struct {
             // sehr viele Änderungen in einem Chunk: Neubau ist dann ohnehin günstiger
             if (r.count > types.path_edit_max_edits) continue;
             const d = slot.data;
+            if (d.flags & types.geometry_palette != 0 and !palette_edits) continue;
             const levels = d.log2_size -| 2;
             const node_cap: u64 = @as(u64, r.count) * (levels * 10 + 4) + 8;
-            const cap: u64 = @as(u64, r.voxels) + r.count;
+            const pal_fmt = d.flags & types.geometry_palette != 0;
+            // Palettenformat: 16 Werte + 4-Bit-Indizes (8 je Wort)
+            const cap: u64 = if (pal_fmt) palette_dev.max_entries + (@as(u64, r.voxels) + r.count + 7) / 8 else @as(u64, r.voxels) + r.count;
             const idx = decodeHandle(r.geometry).index;
             const g: struct { prims: u64, prim_count: u32, aabbs: u64 } = if (self.rt) |rt| .{ .prims = rt.gas[idx].sbt_prims, .prim_count = rt.gas[idx].prim_count, .aabbs = rt.gas[idx].sbt_aabbs } else .{ .prims = 0, .prim_count = 0, .aabbs = 0 };
             if (self.node_arena_next + node_cap > self.node_arena_end or self.leaf_arena_next + r.count > self.leaf_arena_end) continue;
@@ -1136,9 +1147,12 @@ pub const Context = struct {
                 .log2_size = d.log2_size,
                 .attr_src = d.attribute_offset,
                 .attr_count = r.voxels,
-                .attr_a = @intCast(a),
+                .attr_a = @intCast(if (pal_fmt) a + palette_dev.max_entries else a),
                 .attr_b = @intCast(b),
-                .attr_cap = @intCast(cap),
+                .attr_cap = @intCast(if (pal_fmt) (cap - palette_dev.max_entries) * 8 else cap),
+                .palette = @intFromBool(pal_fmt),
+                .pal_src = d.palette_offset,
+                .pal_dst = @intCast(a),
                 .node_arena = @intCast(self.node_arena_next),
                 .node_cap = @intCast(node_cap),
                 .leaf_arena = @intCast(self.leaf_arena_next),
@@ -1240,7 +1254,10 @@ pub const Context = struct {
                 self.arena_users += 1;
             }
             slot.data.root = job.out_root;
-            slot.data.attribute_offset = @intCast(keep);
+            if (slot.data.flags & types.geometry_palette != 0) {
+                slot.data.palette_offset = @intCast(keep);
+                slot.data.attribute_offset = @intCast(keep + palette_dev.max_entries);
+            } else slot.data.attribute_offset = @intCast(keep);
             voxels[i] = job.out_count;
             const idx = decodeHandle(r.geometry).index;
             try self.uploadValue(self.geometry_table + @as(u64, idx) * @sizeOf(types.GeometryData), &slot.data);
@@ -1291,12 +1308,69 @@ pub const Context = struct {
         };
         errdefer self.batch_free.append(self.gpa, bi) catch {};
 
-        const r = try self.allocRanges(b.node_words, b.leaf_count, b.voxel_count);
-        errdefer self.releaseRanges(r) catch {};
+        // Attribute kompakt: je Chunk Palette (16 Werte) + 4-Bit-Indizes,
+        // wo höchstens 16 verschiedene vorkommen (src/device/palette.zig)
         const e = self.gpuExecAux();
+        const lo = try oom(self.gpa.alloc(u32, nonempty + 1));
+        defer self.gpa.free(lo);
+        {
+            var j: u32 = 0;
+            for (0..count) |ci| {
+                if (out.roots[ci] == 0xFFFF_FFFF) continue;
+                lo[j] = out.first_voxel[ci];
+                j += 1;
+            }
+            lo[nonempty] = b.voxel_count;
+        }
+        const pal_counts = try oom(self.gpa.alloc(u32, nonempty));
+        defer self.gpa.free(pal_counts);
+        const use_palette = std.c.getenv("PYRIT_NO_PALETTE") == null;
+        var pp = std.mem.zeroes(palette_dev.Params);
+        if (use_palette) {
+            pp.attrs = b.attrs;
+            pp.first = try e.alloc(e.ctx, (@as(u64, nonempty) + 1) * 4);
+            pp.palettes = try e.alloc(e.ctx, @as(u64, nonempty) * palette_dev.max_entries * 4);
+            pp.counts = try e.alloc(e.ctx, @as(u64, nonempty) * 4);
+            pp.count = nonempty;
+            try self.check(self.drv.cuMemcpyHtoDAsync_v2(pp.first, lo.ptr, (@as(u64, nonempty) + 1) * 4, self.aux_stream), "cuMemcpyHtoDAsync");
+            const args = [_]?*anyopaque{@ptrCast(&pp)};
+            try self.check(self.drv.cuLaunchKernel(self.fn_palette_scan, nonempty, 1, 1, palette_dev.block, 1, 1, 0, self.aux_stream, @constCast(&args), null), "cuLaunchKernel(Palette)");
+            try e.read(e.ctx, std.mem.sliceAsBytes(pal_counts), pp.counts);
+        } else @memset(pal_counts, palette_dev.overflow);
+        defer if (use_palette) {
+            e.free(e.ctx, pp.first);
+            e.free(e.ctx, pp.palettes);
+            e.free(e.ctx, pp.counts);
+        };
+        // Platz je Chunk: Palette + Indizes oder 32 Bit je Voxel
+        const attr_off = try oom(self.gpa.alloc(u32, nonempty));
+        defer self.gpa.free(attr_off);
+        var attr_words: u64 = 0;
+        for (0..nonempty) |j| {
+            attr_off[j] = @intCast(attr_words);
+            const n: u64 = lo[j + 1] - lo[j];
+            attr_words += if (pal_counts[j] != palette_dev.overflow) palette_dev.max_entries + (n + 7) / 8 else n;
+        }
+
+        const r = try self.allocRanges(b.node_words, b.leaf_count, attr_words);
+        errdefer self.releaseRanges(r) catch {};
         try e.copy(e.ctx, self.node_pool + r.node_off * 4, b.nodes, @as(u64, b.node_words) * 4);
         try e.copy(e.ctx, self.leaf_pool + r.leaf_off * 8, b.leaves, @as(u64, b.leaf_count) * 8);
-        try e.copy(e.ctx, self.attr_pool + r.attr_off * 4, b.attrs, @as(u64, b.voxel_count) * 4);
+        if (use_palette) {
+            const dst = try oom(self.gpa.alloc(u32, nonempty));
+            defer self.gpa.free(dst);
+            for (dst, attr_off) |*d, o| d.* = @intCast(r.attr_off + o);
+            pp.dst = try e.alloc(e.ctx, @as(u64, nonempty) * 4);
+            defer e.free(e.ctx, pp.dst);
+            pp.pool = self.attr_pool;
+            try self.check(self.drv.cuMemcpyHtoDAsync_v2(pp.dst, dst.ptr, @as(u64, nonempty) * 4, self.aux_stream), "cuMemcpyHtoDAsync");
+            const args = [_]?*anyopaque{@ptrCast(&pp)};
+            try self.check(self.drv.cuLaunchKernel(self.fn_palette_pack, nonempty, 1, 1, palette_dev.block, 1, 1, 0, self.aux_stream, @constCast(&args), null), "cuLaunchKernel(Palette)");
+            // die Host-Puffer (dst, lo) gehören dem Aufruf: vor dem Verlassen fertig
+            try self.check(self.drv.cuStreamSynchronize(self.aux_stream), "cuStreamSynchronize");
+        } else {
+            try e.copy(e.ctx, self.attr_pool + r.attr_off * 4, b.attrs, @as(u64, b.voxel_count) * 4);
+        }
 
         const datas = try oom(self.gpa.alloc(types.GeometryData, nonempty));
         defer self.gpa.free(datas);
@@ -1307,7 +1381,12 @@ pub const Context = struct {
         while (c < count) : (c += 1) {
             if (out.roots[c] == 0xFFFF_FFFF) continue;
             var d = geometryData(r, out.roots[c], b.log2_size, true);
-            d.attribute_offset += out.first_voxel[c];
+            d.attribute_offset = @intCast(r.attr_off + attr_off[k]);
+            if (pal_counts[k] != palette_dev.overflow) {
+                d.flags |= types.geometry_palette;
+                d.palette_offset = d.attribute_offset;
+                d.attribute_offset += palette_dev.max_entries;
+            }
             datas[k] = d;
             // Primitive liegen nach Chunks sortiert: bis zum nächsten nicht leeren Chunk
             var end: u32 = b.prim_count;
@@ -2866,6 +2945,55 @@ pub const Context = struct {
             return fail(error.InvalidArgument, "DLSS Frame Generation: Zwischenbild {d} vor Zwischenbild 1 dieses Frames", .{index});
         }
         try g.evaluate(self, &in);
+    }
+
+    /// Diagnose: Knoten- und Blattpool (bis zum höchsten belegten Eintrag)
+    /// und je lebender Geometrie (node_offset, leaf_offset, root, log2_size)
+    /// als Dateien <prefix>.nodes / .leaves / .geos schreiben
+    pub fn debugDumpPools(self: *Context, prefix: []const u8) void {
+        _ = self.drv.cuCtxSynchronize();
+        var node_hi: u64 = 0;
+        var leaf_hi: u64 = 0;
+        var geos: std.ArrayList([4]u32) = .empty;
+        defer geos.deinit(self.gpa);
+        for (self.geometries[0..self.geometry_high]) |g| {
+            if (!g.alive) continue;
+            geos.append(self.gpa, .{ g.data.node_offset, g.data.leaf_offset, g.data.root, g.data.attribute_offset }) catch return;
+        }
+        for (self.batches.items) |b| {
+            if (b.refs == 0) continue;
+            node_hi = @max(node_hi, b.node_off + b.node_words);
+            leaf_hi = @max(leaf_hi, b.leaf_off + b.leaf_count);
+        }
+        node_hi = @max(node_hi, self.node_arena_next);
+        leaf_hi = @max(leaf_hi, self.leaf_arena_next);
+        const nodes = self.gpa.alloc(u32, node_hi) catch return;
+        defer self.gpa.free(nodes);
+        const leaves = self.gpa.alloc(u64, leaf_hi) catch return;
+        defer self.gpa.free(leaves);
+        _ = self.drv.cuMemcpyDtoH_v2(nodes.ptr, self.node_pool, node_hi * 4);
+        _ = self.drv.cuMemcpyDtoH_v2(leaves.ptr, self.leaf_pool, leaf_hi * 8);
+        var buf: [512]u8 = undefined;
+        var attr_hi: u64 = 0;
+        for (self.batches.items) |b| {
+            if (b.refs != 0) attr_hi = @max(attr_hi, b.attr_off + b.attr_count);
+        }
+        const attrs = self.gpa.alloc(u32, attr_hi) catch return;
+        defer self.gpa.free(attrs);
+        _ = self.drv.cuMemcpyDtoH_v2(attrs.ptr, self.attr_pool, attr_hi * 4);
+        inline for (.{ .{ ".nodes", std.mem.sliceAsBytes(nodes) }, .{ ".leaves", std.mem.sliceAsBytes(leaves) }, .{ ".attrs", std.mem.sliceAsBytes(attrs) } }) |f| {
+            const path = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ prefix, f[0] }) catch return;
+            if (std.c.fopen(path, "wb")) |fp| {
+                _ = std.c.fwrite(f[1].ptr, 1, f[1].len, fp);
+                _ = std.c.fclose(fp);
+            }
+        }
+        const path = std.fmt.bufPrintZ(&buf, "{s}.geos", .{prefix}) catch return;
+        if (std.c.fopen(path, "wb")) |fp| {
+            const bytes = std.mem.sliceAsBytes(geos.items);
+            _ = std.c.fwrite(bytes.ptr, 1, bytes.len, fp);
+            _ = std.c.fclose(fp);
+        }
     }
 
     pub fn stats(self: *const Context) api.Stats {

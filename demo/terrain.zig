@@ -491,13 +491,14 @@ pub fn column(g: *const types.WorldGenParams, p: *const Params, i: u32) void {
     if (has_ground and bot <= top) {
         // Sprenkelung nur auf feinen Stufen: auf groben stünde sie für ganze
         // Blockgruppen und flimmerte beim Stufenwechsel
-        const gt = groundTint(p, wx, wz, step_i == 1);
+        // Farbschwankung je Säule: rechnet der Shader aus der Weltposition
+        // (Material.variation) – im Attribut machte sie fast jedes Voxel
+        // einzigartig, und Attribute sind der größte Posten im Weltspeicher
         var y = top;
         while (y >= bot) : (y -= 1) {
             const depth = @as(f32, @floatFromInt(surf_y - y)) * step; // Blöcke unter der Oberfläche
             const blk: Block = if (depth < 1) sb[0] else if (depth < 4) sb[1] else .stone;
-            const warm: f32 = if (blk == .grass or blk == .dry_grass) gt[1] else 0;
-            emit(g, c, lx, y, lz, tint(blk.attribute(), gt[0], warm));
+            emit(g, c, lx, y, lz, blk.attribute());
         }
     }
 
@@ -564,9 +565,8 @@ pub fn column(g: *const types.WorldGenParams, p: *const Params, i: u32) void {
                     }
                 }
                 if (found) |fb| {
-                    // jeder Baum mit eigenem Grünton
-                    const f = 0.86 + rnd(t.x, t.z, p.seed ^ 0x1eaf) * 0.28;
-                    emit(g, c, lx, ly, lz, tint(fb.attribute(), f, 0));
+                    // Grünton je Baum: Material.variation (mittlere Schwankung)
+                    emit(g, c, lx, ly, lz, fb.attribute());
                 }
             }
         }

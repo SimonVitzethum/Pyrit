@@ -343,7 +343,7 @@ fn rtEquivalence(log2: u32, rt_log2: u32, rays: usize) !void {
         .prims = @intFromPtr(prims.prims.ptr),
         .rt_log2 = prims.rt_log2,
         .default_attribute = 1,
-        .reserved = .{ 0, 0 },
+        .palette = 0,
     };
     const nf: f32 = @floatFromInt(@as(u32, 1) << @intCast(log2));
 
@@ -437,7 +437,7 @@ const LightFixture = struct {
 
     fn init(self: *LightFixture) !void {
         self.dag = try pyrit.dag_builder.buildFn(gpa, 6, lightScene, null, null, true);
-        self.geo = .{ .node_offset = 0, .leaf_offset = 0, .attribute_offset = 0, .root = self.dag.root, .log2_size = 6, .flags = types.geometry_has_attributes, .default_attribute = 1, .reserved = 0 };
+        self.geo = .{ .node_offset = 0, .leaf_offset = 0, .attribute_offset = 0, .root = self.dag.root, .log2_size = 6, .flags = types.geometry_has_attributes, .default_attribute = 1, .palette_offset = 0 };
         self.inst = common.makeInstance(0, 64, common.makeTransform(.{ 0, 1, 0 }, 0, 1, .{ 0, 0, 0 }), 1);
         for (&self.mats) |*m| pyrit.pyr_material_default(m);
         self.mats[1].emission = .{ 5, 4, 3 };

@@ -698,6 +698,16 @@ pub export fn pyr_world_stats(world: ?*PyrWorld, out: ?*api.WorldStats) Result {
     const w = worldOf(world) orelse return code(diag.fail(error.InvalidArgument, "world ist NULL", .{}));
     const o = out orelse return code(diag.fail(error.InvalidArgument, "out ist NULL", .{}));
     o.* = w.stats;
+    // Diagnose PYRIT_DUMP_POOLS=<präfix>: einmal die Pools schreiben
+    if (std.c.getenv("PYRIT_DUMP_POOLS")) |pre| {
+        const S = struct {
+            var done = false;
+        };
+        if (!S.done and w.stats.pending_chunks == 0 and w.stats.resident_chunks > 1000) {
+            S.done = true;
+            w.ctx.debugDumpPools(std.mem.span(pre));
+        }
+    }
     return api.ok;
 }
 
