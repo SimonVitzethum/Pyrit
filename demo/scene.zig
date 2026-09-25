@@ -123,7 +123,7 @@ pub fn materials(ctx: ?*anyopaque, gpa: std.mem.Allocator) !void {
         // Flecken, mittlere Wellen, feine Sprenkelung; Gras wird in den
         // trockenen Flecken gelblicher. Holz und Laub: ein Ton je Baum,
         // angenähert über die mittlere Schwankung in Kronengröße.
-        switch (e.k) {
+        if (std.c.getenv("PYRIT_NO_VARIATION") == null) switch (e.k) {
             .wood, .leaves => {
                 m.variation = .{ 0, 0.14, 0 };
                 m.variation_scale = .{ 0, 9 };
@@ -133,7 +133,7 @@ pub fn materials(ctx: ?*anyopaque, gpa: std.mem.Allocator) !void {
                 m.variation_scale = .{ 150, 23 };
                 if (e.k == .grass) m.variation_warm = 0.5;
             },
-        }
+        };
         if (e.k == .grass) {
             // Seiten des Grasblocks: Erde mit Grasrand, Farbe aus der Kachel
             blocktex.grassSide(tex);

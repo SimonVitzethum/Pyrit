@@ -2954,19 +2954,19 @@ pub const Context = struct {
         _ = self.drv.cuCtxSynchronize();
         var node_hi: u64 = 0;
         var leaf_hi: u64 = 0;
-        var geos: std.ArrayList([4]u32) = .empty;
+        var geos: std.ArrayList([8]u32) = .empty;
         defer geos.deinit(self.gpa);
         for (self.geometries[0..self.geometry_high]) |g| {
             if (!g.alive) continue;
-            geos.append(self.gpa, .{ g.data.node_offset, g.data.leaf_offset, g.data.root, g.data.attribute_offset }) catch return;
+            geos.append(self.gpa, .{ g.data.node_offset, g.data.leaf_offset, g.data.root, g.data.attribute_offset, g.data.palette_offset, g.data.flags, g.data.log2_size, 0 }) catch return;
         }
         for (self.batches.items) |b| {
             if (b.refs == 0) continue;
             node_hi = @max(node_hi, b.node_off + b.node_words);
             leaf_hi = @max(leaf_hi, b.leaf_off + b.leaf_count);
         }
-        node_hi = @max(node_hi, self.node_arena_next);
-        leaf_hi = @max(leaf_hi, self.leaf_arena_next);
+        node_hi = @max(node_hi, @min(self.node_arena_next, self.node_arena_start));
+        leaf_hi = @max(leaf_hi, @min(self.leaf_arena_next, self.leaf_arena_start));
         const nodes = self.gpa.alloc(u32, node_hi) catch return;
         defer self.gpa.free(nodes);
         const leaves = self.gpa.alloc(u64, leaf_hi) catch return;
