@@ -54,6 +54,10 @@ const GeometrySlot = struct {
     vox_count: u32 = 0,
     /// Chunk einer Weltbatch: Pool-Bereiche gehören der Batch (siehe ChunkBatch)
     batch: ?u32 = null,
+    /// Pfadänderungen (pathEdit): eigenes Attributfeld und Knoten in der Arena
+    edit_attr_off: u64 = 0,
+    edit_attr_cap: u64 = 0,
+    uses_arena: bool = false,
 };
 
 /// Gemeinsame Pool-Bereiche eines Chunk-Batches (Welt-Streaming). Alle Chunks
@@ -68,6 +72,8 @@ const ChunkBatch = struct {
     attr_off: u64 = 0,
     attr_count: u64 = 0,
     prims: cuda.CUdeviceptr = 0,
+    /// Hüllen der Primitive: bleiben für Pfadänderungen (nur wachsen → neuer GAS)
+    aabbs: cuda.CUdeviceptr = 0,
 };
 
 const InstanceSlot = struct {
@@ -274,6 +280,18 @@ pub const Context = struct {
     scene_dev: cuda.CUdeviceptr = 0,
 
     node_alloc: RangeAlloc = .{ .capacity = 0 },
+    /// Arena für Pfadänderungen am oberen Ende von Knoten- und Blattpool:
+    /// liegt über jeder Batch, also mit relativen Verweisen erreichbar
+    /// (src/device/pathedit.zig). Wird nur als Ganzes geleert, wenn keine
+    /// Geometrie sie mehr verwendet.
+    node_arena_start: u64 = 0,
+    node_arena_next: u64 = 0,
+    node_arena_end: u64 = 0,
+    leaf_arena_start: u64 = 0,
+    leaf_arena_next: u64 = 0,
+    leaf_arena_end: u64 = 0,
+    arena_users: u32 = 0,
+    fn_path_edit: cuda.CUfunction = null,
     leaf_alloc: RangeAlloc = .{ .capacity = 0 },
     attr_alloc: RangeAlloc = .{ .capacity = 0 },
 
@@ -407,8 +425,19 @@ pub const Context = struct {
             return fail(error.InvalidArgument, "Pools dürfen höchstens 2^32 Einträge haben", .{});
         if (staging_bytes < 1 << 20) return fail(error.InvalidArgument, "staging_bytes muss mindestens 1 MiB sein", .{});
 
-        self.node_alloc = try oom(RangeAlloc.init(self.gpa, node_bytes / 4));
-        self.leaf_alloc = try oom(RangeAlloc.init(self.gpa, leaf_bytes / 8));
+        // oberes Achtel von Knoten- und Blattpool: Arena der Pfadänderungen
+        const node_total = node_bytes / 4;
+        const leaf_total = leaf_bytes / 8;
+        // Diagnose PYRIT_ARENA_TINY: winzige Arena, um die Müllabfuhr zu prüfen
+        const arena_div: u64 = if (std.c.getenv("PYRIT_ARENA_TINY") != null) 16384 else 8;
+        self.node_arena_start = node_total - node_total / arena_div;
+        self.node_arena_next = self.node_arena_start;
+        self.node_arena_end = node_total;
+        self.leaf_arena_start = leaf_total - leaf_total / arena_div;
+        self.leaf_arena_next = self.leaf_arena_start;
+        self.leaf_arena_end = leaf_total;
+        self.node_alloc = try oom(RangeAlloc.init(self.gpa, self.node_arena_start));
+        self.leaf_alloc = try oom(RangeAlloc.init(self.gpa, self.leaf_arena_start));
         self.attr_alloc = try oom(RangeAlloc.init(self.gpa, attr_bytes / 4));
 
         self.node_pool = try self.devAlloc(node_bytes, "Knotenpool");
@@ -488,6 +517,7 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_render, self.module, "pyr_k_replay_render"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_gi, self.module, "pyr_k_replay_gi"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_replay_primary, self.module, "pyr_k_replay_primary"), "cuModuleGetFunction");
+        try self.check(self.drv.cuModuleGetFunction(&self.fn_path_edit, self.module, "pyr_k_path_edit"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_gi_combine, self.module, "pyr_k_gi_combine"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_dlss_prepare, self.module, "pyr_k_dlss_prepare"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_dlssg_prepare, self.module, "pyr_k_dlssg_prepare"), "cuModuleGetFunction");
@@ -550,6 +580,7 @@ pub const Context = struct {
         self.deferred.deinit(self.gpa);
         for (self.batches.items) |b| {
             if (b.prims != 0) _ = drv.cuMemFree_v2(b.prims);
+            if (b.aabbs != 0) _ = drv.cuMemFree_v2(b.aabbs);
         }
         self.batches.deinit(self.gpa);
         self.batch_free.deinit(self.gpa);
@@ -1016,6 +1047,226 @@ pub const Context = struct {
     /// ist 0 für leere Chunks. Die GAS aller Chunks entstehen in einem Zug.
     /// Läuft auf dem Hintergrund-Stream (b muss dort gebaut sein); der
     /// Render-Stream wartet per Event, bevor er die neuen Chunks sieht.
+    fn nowNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+
+    /// Arena zu drei Vierteln voll: alte Wege sind Müll, den nur ein Neubau
+    /// der pfadgeänderten Chunks freigibt (danach wird sie ganz geleert)
+    pub fn arenaPressure(self: *const Context) bool {
+        const nc = self.node_arena_end - self.node_arena_start;
+        const lc = self.leaf_arena_end - self.leaf_arena_start;
+        return (self.node_arena_next - self.node_arena_start) * 4 > nc * 3 or
+            (self.leaf_arena_next - self.leaf_arena_start) * 4 > lc * 3;
+    }
+
+    pub fn geometryUsesArena(self: *Context, h: usize) bool {
+        const s = self.geometrySlot(h) catch return false;
+        return s.uses_arena;
+    }
+
+    pub const PathEditRequest = struct {
+        geometry: usize,
+        /// Voxel vor der Änderung (= Attribute)
+        voxels: u32,
+        rt_log2: u32,
+        /// Änderungen [first, first + count) in `edits`
+        first: u32,
+        count: u32,
+    };
+
+    /// Voxel fertiger Geometrien ändern, ohne sie neu zu bauen (siehe
+    /// src/device/pathedit.zig). `flags` bekommt je Auftrag path_edit_*;
+    /// `voxels` die neue Voxelzahl. Wurde ein Auftrag nicht übernommen
+    /// (Chunk leer, Arena voll), bleibt die Geometrie unverändert – der
+    /// Aufrufer baut sie dann wie bisher neu.
+    pub fn pathEdit(self: *Context, reqs: []const PathEditRequest, edits: []const [4]u32, flags: []u32, voxels: []u32) Error!void {
+        if (reqs.len == 0) return;
+        const n: u32 = @intCast(reqs.len);
+        const timing = std.c.getenv("PYRIT_PATH_EDIT_TIME") != null;
+        const t_start = if (timing) nowNs() else 0;
+        var t_kernel: u64 = 0;
+        // Arena leeren, wenn sie niemand mehr braucht (nach allem, was noch läuft)
+        if (self.arena_users == 0 and (self.node_arena_next != self.node_arena_start or self.leaf_arena_next != self.leaf_arena_start)) {
+            try self.check(self.drv.cuCtxSynchronize(), "cuCtxSynchronize");
+            self.node_arena_next = self.node_arena_start;
+            self.leaf_arena_next = self.leaf_arena_start;
+        }
+        const jobs = try oom(self.gpa.alloc(types.PathEditJob, n));
+        defer self.gpa.free(jobs);
+        const attr_a = try oom(self.gpa.alloc(u64, n));
+        defer self.gpa.free(attr_a);
+        const attr_b = try oom(self.gpa.alloc(u64, n));
+        defer self.gpa.free(attr_b);
+        const caps = try oom(self.gpa.alloc(u64, n));
+        defer self.gpa.free(caps);
+        var ok_jobs: u32 = 0;
+        for (reqs, 0..) |r, i| {
+            flags[i] = types.path_edit_overflow;
+            voxels[i] = r.voxels;
+            attr_a[i] = 0;
+            attr_b[i] = 0;
+            caps[i] = 0;
+            const slot = try self.geometrySlot(r.geometry);
+            // nur Welt-Chunks: ihre Pool-Bereiche gehören der Batch, das
+            // eigene Attributfeld kommt allein hinzu (einzelne Geometrien
+            // verlören beim Tausch sonst ihren ursprünglichen Bereich)
+            if (slot.batch == null) continue;
+            // sehr viele Änderungen in einem Chunk: Neubau ist dann ohnehin günstiger
+            if (r.count > types.path_edit_max_edits) continue;
+            const d = slot.data;
+            const levels = d.log2_size -| 2;
+            const node_cap: u64 = @as(u64, r.count) * (levels * 10 + 4) + 8;
+            const cap: u64 = @as(u64, r.voxels) + r.count;
+            const idx = decodeHandle(r.geometry).index;
+            const g: struct { prims: u64, prim_count: u32, aabbs: u64 } = if (self.rt) |rt| .{ .prims = rt.gas[idx].sbt_prims, .prim_count = rt.gas[idx].prim_count, .aabbs = rt.gas[idx].sbt_aabbs } else .{ .prims = 0, .prim_count = 0, .aabbs = 0 };
+            if (self.node_arena_next + node_cap > self.node_arena_end or self.leaf_arena_next + r.count > self.leaf_arena_end) continue;
+            const a = self.attr_alloc.alloc(cap) orelse continue;
+            const b = a; // ein Zielpuffer genügt (ein Durchgang, siehe pathedit.zig)
+            attr_a[i] = a;
+            attr_b[i] = b;
+            caps[i] = cap;
+            jobs[ok_jobs] = std.mem.zeroes(types.PathEditJob);
+            jobs[ok_jobs] = .{
+                .node_offset = d.node_offset,
+                .leaf_offset = d.leaf_offset,
+                .root = d.root,
+                .log2_size = d.log2_size,
+                .attr_src = d.attribute_offset,
+                .attr_count = r.voxels,
+                .attr_a = @intCast(a),
+                .attr_b = @intCast(b),
+                .attr_cap = @intCast(cap),
+                .node_arena = @intCast(self.node_arena_next),
+                .node_cap = @intCast(node_cap),
+                .leaf_arena = @intCast(self.leaf_arena_next),
+                .leaf_cap = r.count,
+                .edit_first = r.first,
+                .edit_count = r.count,
+                .rt_log2 = r.rt_log2,
+                .prims = g.prims,
+                .prim_count = g.prim_count,
+                .aabbs = g.aabbs,
+                .aabbs_keep = @intFromBool(g.aabbs != 0),
+                .out_root = 0,
+                .out_count = 0,
+                .out_attr_b = 0,
+                .out_flags = 0,
+                .op = 0,
+                .op_rank = 0,
+                .op_attr = 0,
+            };
+            self.node_arena_next += node_cap;
+            self.leaf_arena_next += r.count;
+            ok_jobs += 1;
+        }
+        if (ok_jobs == 0) return;
+
+        // Hüllen der Primitive (für die neuen GAS), ein Puffer für alle Aufträge
+        var box_total: u64 = 0;
+        for (jobs[0..ok_jobs]) |jb| box_total += jb.prim_count;
+        const boxes_dev = if (self.rt != null and box_total > 0) try self.devAlloc(box_total * 24, "Pfadänderung") else 0;
+        defer if (boxes_dev != 0) {
+            _ = self.drv.cuMemFree_v2(boxes_dev);
+        };
+        {
+            var off: u64 = 0;
+            for (jobs[0..ok_jobs]) |*jb| {
+                if (jb.aabbs_keep == 0 and boxes_dev != 0 and jb.prim_count > 0 and jb.prims != 0) jb.aabbs = boxes_dev + off * 24;
+                off += jb.prim_count;
+            }
+        }
+        const jobs_dev = try self.devAlloc(@as(u64, ok_jobs) * @sizeOf(types.PathEditJob), "Pfadänderung");
+        defer _ = self.drv.cuMemFree_v2(jobs_dev);
+        const edits_dev = try self.devAlloc(@max(edits.len, 1) * 16, "Pfadänderung");
+        defer _ = self.drv.cuMemFree_v2(edits_dev);
+        try self.check(self.drv.cuMemcpyHtoD_v2(jobs_dev, jobs.ptr, @as(u64, ok_jobs) * @sizeOf(types.PathEditJob)), "cuMemcpyHtoD");
+        // je Auftrag stabil nach Brick sortieren: ein Brick wird im Kernel eine
+        // zusammenhängende Folge (ein neuer Weg je Brick statt je Voxel);
+        // verschiedene Voxel dürfen die Plätze tauschen, gleiche nicht
+        const sorted = try oom(self.gpa.dupe([4]u32, edits));
+        defer self.gpa.free(sorted);
+        for (reqs) |r| {
+            const Less = struct {
+                fn less(_: void, a: [4]u32, b: [4]u32) bool {
+                    const ka = (@as(u64, a[2] >> 2) << 42) | (@as(u64, a[1] >> 2) << 21) | (a[0] >> 2);
+                    const kb = (@as(u64, b[2] >> 2) << 42) | (@as(u64, b[1] >> 2) << 21) | (b[0] >> 2);
+                    return ka < kb;
+                }
+            };
+            std.sort.block([4]u32, sorted[r.first..][0..r.count], {}, Less.less);
+        }
+        try self.check(self.drv.cuMemcpyHtoD_v2(edits_dev, sorted.ptr, edits.len * 16), "cuMemcpyHtoD");
+        var params = types.PathEditParams{ .nodes = self.node_pool, .leaves = self.leaf_pool, .attributes = self.attr_pool, .jobs = jobs_dev, .edits = edits_dev, .count = ok_jobs };
+        // Diagnose PYRIT_PATH_EDIT_SKIP: 1 = Attribute, 2 = Hüllen auslassen (nur Zeitmessung!)
+        if (std.c.getenv("PYRIT_PATH_EDIT_SKIP")) |e| params.reserved = std.fmt.parseInt(u32, std.mem.span(e), 10) catch 0;
+        const args = [_]?*anyopaque{@ptrCast(&params)};
+        // auf dem Render-Stream: die Primitive ändern sich an Ort und Stelle,
+        // hinter dem zuletzt eingereihten Frame
+        const t_launch = if (timing) nowNs() else 0;
+        try self.launch(self.fn_path_edit, .{ ok_jobs, 1, 1 }, .{ types.path_edit_block, 1, 1 }, &args);
+        try self.check(self.drv.cuStreamSynchronize(self.activeStream()), "cuStreamSynchronize");
+        if (timing) t_kernel = nowNs() - t_launch;
+        try self.check(self.drv.cuMemcpyDtoH_v2(jobs.ptr, jobs_dev, @as(u64, ok_jobs) * @sizeOf(types.PathEditJob)), "cuMemcpyDtoH");
+
+        const t_after_kernel = if (timing) nowNs() else 0;
+        // übernehmen
+        var gas_jobs: std.ArrayList(Rt.GasJob) = .empty;
+        defer gas_jobs.deinit(self.gpa);
+        var j: u32 = 0;
+        for (reqs, 0..) |r, i| {
+            if (caps[i] == 0) continue;
+            const job = jobs[j];
+            j += 1;
+            flags[i] = job.out_flags;
+            const slot = try self.geometrySlot(r.geometry);
+            if (job.out_flags & types.path_edit_empty != 0) {
+                // Wurzel verschwunden: alte Geometrie bleibt bis zum Neubau.
+                // (Bei Arena-Überlauf dagegen übernehmen: Baum, Primitive und
+                // Attribute enthalten dieselben schon geschriebenen Änderungen,
+                // den Rest bringt der Neubau.)
+                try oom(self.attr_alloc.release(self.gpa, attr_a[i], caps[i]));
+                continue;
+            }
+            const keep = attr_a[i];
+            // voriges eigenes Attributfeld (aus einer früheren Änderung) freigeben
+            if (slot.edit_attr_cap > 0) try oom(self.attr_alloc.release(self.gpa, slot.edit_attr_off, slot.edit_attr_cap));
+            slot.edit_attr_off = keep;
+            slot.edit_attr_cap = caps[i];
+            if (!slot.uses_arena) {
+                slot.uses_arena = true;
+                self.arena_users += 1;
+            }
+            slot.data.root = job.out_root;
+            slot.data.attribute_offset = @intCast(keep);
+            voxels[i] = job.out_count;
+            const idx = decodeHandle(r.geometry).index;
+            try self.uploadValue(self.geometry_table + @as(u64, idx) * @sizeOf(types.GeometryData), &slot.data);
+            if (self.rt) |rt| {
+                try rt.updateRecord(self, idx, slot.data, r.rt_log2);
+                if (job.aabbs != 0 and job.out_flags & types.path_edit_grew != 0) try oom(gas_jobs.append(self.gpa, .{ .index = idx, .prims = job.prims, .aabbs = job.aabbs, .count = job.prim_count, .data = slot.data }));
+            }
+        }
+        // GAS der geänderten Chunks mit den neuen Hüllen neu bauen (klein:
+        // höchstens (2^chunk / 2^rt)^3 Primitive je Chunk)
+        const t_before_gas = if (timing) nowNs() else 0;
+        if (self.rt) |rt| if (gas_jobs.items.len > 0) {
+            try rt.buildGasMany(self, gas_jobs.items, reqs[0].rt_log2, self.stream);
+            try self.check(self.drv.cuStreamSynchronize(self.stream), "cuStreamSynchronize");
+        };
+        if (timing) {
+            const t_end = nowNs();
+            const ms = struct {
+                fn f(a: u64, b: u64) f64 {
+                    return @as(f64, @floatFromInt(b -% a)) / 1e6;
+                }
+            }.f;
+            std.debug.print("[pyrit] Pfadänderung: {d} Chunks, {d} Änderungen: gesamt {d:.3} ms (vorbereiten {d:.3}, Kernel {d:.3}, übernehmen {d:.3}, GAS {d:.3})\n", .{ ok_jobs, edits.len, ms(t_start, t_end), ms(t_start, t_after_kernel) - @as(f64, @floatFromInt(t_kernel)) / 1e6, @as(f64, @floatFromInt(t_kernel)) / 1e6, ms(t_after_kernel, t_before_gas), ms(t_before_gas, t_end) });
+        }
+    }
+
     pub fn installChunkBatch(self: *Context, b: *gpu_build.Built, out: gpu_build.ChunkOut, count: u32, handles: []usize) Error!void {
         @memset(handles[0..count], 0);
         var nonempty: u32 = 0;
@@ -1094,8 +1345,12 @@ pub const Context = struct {
             .attr_off = r.attr_off,
             .attr_count = r.attr_count,
             .prims = if (self.rt != null) b.prims else 0,
+            .aabbs = if (self.rt != null) b.aabbs else 0,
         };
-        if (self.rt != null) b.prims = 0; // gehört jetzt der Batch
+        if (self.rt != null) {
+            b.prims = 0; // gehört jetzt der Batch
+            b.aabbs = 0;
+        }
         k = 0;
         c = 0;
         while (c < count) : (c += 1) {
@@ -1132,6 +1387,12 @@ pub const Context = struct {
             d.leaf_count = 0;
             d.attr_count = 0;
         }
+        // Pfadänderungen: eigenes Attributfeld freigeben, Arena-Nutzer abmelden
+        if (s.edit_attr_cap > 0) {
+            d.attr_off = s.edit_attr_off;
+            d.attr_count = s.edit_attr_cap;
+        }
+        if (s.uses_arena) self.arena_users -= 1;
         if (self.rt) |r| {
             try r.forgetGeometry(self, idx);
             const g = r.takeGas(idx);
@@ -1171,6 +1432,7 @@ pub const Context = struct {
         if (b.refs != 0) return;
         try self.releaseRanges(.{ .node_off = b.node_off, .node_words = b.node_words, .leaf_off = b.leaf_off, .leaf_count = b.leaf_count, .attr_off = b.attr_off, .attr_count = b.attr_count });
         if (b.prims != 0) _ = self.drv.cuMemFreeAsync(b.prims, self.stream);
+        if (b.aabbs != 0) _ = self.drv.cuMemFreeAsync(b.aabbs, self.stream);
         b.* = .{};
         try oom(self.batch_free.append(self.gpa, bi));
     }

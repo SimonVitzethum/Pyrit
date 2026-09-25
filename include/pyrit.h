@@ -862,7 +862,7 @@ typedef struct PyrWorldStats {
     float    voxel_pixels;                 /* aktuelles Ziel (mit Budget angepasst) */
     uint32_t top_lod;                      /* gröbste benutzte Stufe */
     float    secondary_bias;               /* empfohlener PyrLighting.secondary_bias */
-    uint32_t reserved1;
+    uint32_t path_edited;                  /* per Pfadänderung (ohne Neubau) geänderte Chunks */
     uint64_t bytes;                        /* GPU-Bytes der Chunk-DAGs */
 } PyrWorldStats;
 

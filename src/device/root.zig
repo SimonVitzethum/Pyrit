@@ -26,6 +26,7 @@ pub const replay = @import("replay.zig");
 pub const postfx = @import("postfx.zig");
 pub const fmath = @import("fmath.zig");
 pub const warp = @import("warp.zig");
+pub const pathedit = @import("pathedit.zig");
 /// RT-Pfad: Teil-DAG-Verfolgung (Host und GPU)
 pub const rt = @import("rt.zig");
 /// OptiX-Intrinsics (nur nvptx64, nur in OptiX-Programmen verwendbar)

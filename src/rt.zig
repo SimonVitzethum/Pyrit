@@ -31,9 +31,14 @@ comptime {
     std.debug.assert(@sizeOf(rt_prims.Aabb) == @sizeOf(optix.Aabb));
 }
 
-const GasSlot = struct {
+pub const GasSlot = struct {
     buffer: cuda.CUdeviceptr = 0,
+    /// eigene Primitive (werden mit dem Slot freigegeben; 0 bei Batch-Chunks)
     prims: cuda.CUdeviceptr = 0,
+    /// Primitive, auf die der SBT-Eintrag zeigt (auch die einer Batch)
+    sbt_prims: cuda.CUdeviceptr = 0,
+    /// dauerhafte Hüllen der Primitive (Batch), 0 = nicht aufbewahrt
+    sbt_aabbs: cuda.CUdeviceptr = 0,
     handle: optix.TraversableHandle = 0,
     prim_count: u32 = 0,
 };
@@ -264,7 +269,7 @@ pub const Rt = struct {
     /// (Kompaktierung), daher nur beim Anlegen/Ändern, nie pro Frame.
     pub fn buildGas(self: *Rt, c: *Context, index: u32, prims: cuda.CUdeviceptr, aabbs: cuda.CUdeviceptr, count: u32, rt_log2: u32, data: types.GeometryData) Error!void {
         const ft = &self.api.ft;
-        var slot = GasSlot{ .prim_count = count, .prims = prims };
+        var slot = GasSlot{ .prim_count = count, .prims = prims, .sbt_prims = prims };
         errdefer freeGas(c, slot);
         if (count > 0) {
             const aabb_ptrs = [_]cuda.CUdeviceptr{aabbs};
@@ -326,6 +331,24 @@ pub const Rt = struct {
         self.markInstancesDirty(true);
     }
 
+    /// SBT-Eintrag einer Geometrie neu schreiben (Attribute verschoben,
+    /// Pfadänderung); GAS und Primitive bleiben
+    pub fn updateRecord(self: *Rt, c: *Context, index: u32, data: types.GeometryData, rt_log2: u32) Error!void {
+        const record = types.RtHitRecord{
+            .header = self.hit_header,
+            .data = .{
+                .nodes = c.node_pool + @as(u64, data.node_offset) * 4,
+                .leaves = c.leaf_pool + @as(u64, data.leaf_offset) * 8,
+                .attributes = if (data.flags & types.geometry_has_attributes != 0) c.attr_pool + @as(u64, data.attribute_offset) * 4 else 0,
+                .prims = self.gas[index].sbt_prims,
+                .rt_log2 = rt_log2,
+                .default_attribute = data.default_attribute,
+                .reserved = .{ 0, 0 },
+            },
+        };
+        try c.uploadValue(self.sbt_hit + @as(u64, index) * hit_record_size, &record);
+    }
+
     pub const GasJob = struct {
         index: u32,
         /// Primitive und AABBs (gehören weiter dem Aufrufer; prims muss leben,
@@ -379,7 +402,7 @@ pub const Rt = struct {
             errdefer _ = c.drv.cuMemFreeAsync(out, stream);
             var h: optix.TraversableHandle = 0;
             try self.check(ft.optixAccelBuild(self.ctx, stream, &bo, @ptrCast(&input), 1, temp, temp_max, out, bs.outputSizeInBytes, &h, null, 0), "optixAccelBuild(GAS)");
-            self.gas[j.index] = .{ .buffer = out, .prims = 0, .handle = h, .prim_count = j.count };
+            self.gas[j.index] = .{ .buffer = out, .prims = 0, .sbt_prims = j.prims, .sbt_aabbs = j.aabbs, .handle = h, .prim_count = j.count };
             done = i + 1;
             total += bs.outputSizeInBytes;
         }

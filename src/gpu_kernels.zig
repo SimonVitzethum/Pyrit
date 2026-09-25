@@ -258,6 +258,11 @@ export fn pyr_k_replay_primary(p: types.RenderParams, rp: types.ReplayParams, tr
     pyr.replay.primaryPass(&p, &rp, i, trace_flags);
 }
 
+/// Pfadänderung fertiger Chunks: ein Block je Auftrag (src/device/pathedit.zig)
+export fn pyr_k_path_edit(p: types.PathEditParams) callconv(kernel) void {
+    pyr.pathedit.run(&p, @workGroupId(0), @workItemId(0));
+}
+
 export fn pyr_k_replay_gi(p: types.RenderParams, rp: types.ReplayParams, trace_flags: u32) callconv(kernel) void {
     const i = @workGroupId(0) * types.replay_block + @workItemId(0);
     pyr.replay.giPass(&p, &rp, @ptrFromInt(p.scene), i, trace_flags);

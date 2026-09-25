@@ -26,6 +26,8 @@ fn oom(v: anytype) Error!@typeInfo(@TypeOf(v)).error_union.payload {
     return v catch return fail(error.OutOfMemory, "Host-Speicher", .{});
 }
 
+const PathQ = struct { key: Key, cell: [3]u32, attr: u32 };
+
 const Chunk = struct {
     key: Key,
     geometry: usize,
@@ -154,6 +156,8 @@ pub const World = struct {
     /// Chunks, die wegen einer Änderung neu gebaut werden müssen
     dirty: std.ArrayList(Key) = .empty,
     dirty_set: std.AutoHashMapUnmanaged(Key, void) = .empty,
+    /// Pfadänderungen für das nächste update (queueEdit)
+    path_queue: std.ArrayList(PathQ) = .empty,
     /// vom Hauptthread für den laufenden Auftrag vorbereitet (der Arbeiter
     /// fasst die Überlagerung nicht an: sie gehört dem Hauptthread)
     job_edits: std.ArrayList([4]u32) = .empty,
@@ -312,6 +316,7 @@ pub const World = struct {
         self.rm_counts.deinit(self.ctx.gpa);
         self.dirty.deinit(self.ctx.gpa);
         self.dirty_set.deinit(self.ctx.gpa);
+        self.path_queue.deinit(self.ctx.gpa);
         self.job_edits.deinit(self.ctx.gpa);
         self.job_edit_off.deinit(self.ctx.gpa);
         self.ctx.gpa.destroy(self);
@@ -379,7 +384,83 @@ pub const World = struct {
                     if (lod > rm_track_max) continue;
                     if ((self.rm_counts.get(cellOf(pos, lod)) orelse 0) < cellVoxels(lod)) continue;
                 }
-                try self.markDirty(key);
+                try self.queueEdit(key, localCell(self.chunk_log2, pos, lod), ed.attribute);
+            }
+        }
+    }
+
+    /// Änderung an einem Chunk: liegt er fertig vor, als Pfadänderung (im
+    /// nächsten update, ohne Neubau); sonst wie bisher zum Neubau vormerken.
+    fn queueEdit(self: *World, key: Key, cell: [3]u32, attr: u32) Error!void {
+        const node = self.plan.nodes.get(key) orelse return; // noch nicht gebaut: der Generator trägt die Überlagerung auf
+        const only0 = std.c.getenv("PYRIT_PATH_EDIT_LOD0") != null and key.lod > 0;
+        if (only0 or node.state != .ready or node.user == 0 or self.dirty_set.contains(key) or std.c.getenv("PYRIT_NO_PATH_EDIT") != null)
+            return self.markDirty(key);
+        try oom(self.path_queue.append(self.ctx.gpa, .{ .key = key, .cell = cell, .attr = attr }));
+    }
+
+    /// Gesammelte Pfadänderungen ausführen (je Chunk ein GPU-Block)
+    fn runPathEdits(self: *World) Error!void {
+        if (self.path_queue.items.len == 0) return;
+        const ctx = self.ctx;
+        defer self.path_queue.clearRetainingCapacity();
+        // je Chunk gruppieren, Reihenfolge innerhalb eines Chunks bleibt
+        var order: std.AutoHashMapUnmanaged(Key, u32) = .empty;
+        defer order.deinit(ctx.gpa);
+        var reqs: std.ArrayList(Context.PathEditRequest) = .empty;
+        defer reqs.deinit(ctx.gpa);
+        var keys: std.ArrayList(Key) = .empty;
+        defer keys.deinit(ctx.gpa);
+        for (self.path_queue.items) |q| {
+            const gop = try oom(order.getOrPut(ctx.gpa, q.key));
+            if (!gop.found_existing) {
+                const node = self.plan.nodes.get(q.key) orelse {
+                    _ = order.remove(q.key);
+                    continue;
+                };
+                if (node.state != .ready or node.user == 0) {
+                    _ = order.remove(q.key);
+                    try self.markDirty(q.key);
+                    continue;
+                }
+                const c = &self.chunks.items[node.user - 1];
+                gop.value_ptr.* = @intCast(reqs.items.len);
+                try oom(reqs.append(ctx.gpa, .{ .geometry = c.geometry, .voxels = c.voxels, .rt_log2 = self.rt_log2, .first = 0, .count = 0 }));
+                try oom(keys.append(ctx.gpa, q.key));
+            }
+            reqs.items[gop.value_ptr.*].count += 1;
+        }
+        if (reqs.items.len == 0) return;
+        var first: u32 = 0;
+        for (reqs.items) |*r| {
+            r.first = first;
+            first += r.count;
+            r.count = 0;
+        }
+        const edits = try oom(ctx.gpa.alloc([4]u32, first));
+        defer ctx.gpa.free(edits);
+        for (self.path_queue.items) |q| {
+            const i = order.get(q.key) orelse continue;
+            const r = &reqs.items[i];
+            edits[r.first + r.count] = .{ q.cell[0], q.cell[1], q.cell[2], q.attr };
+            r.count += 1;
+        }
+        const flags = try oom(ctx.gpa.alloc(u32, reqs.items.len));
+        defer ctx.gpa.free(flags);
+        const counts = try oom(ctx.gpa.alloc(u32, reqs.items.len));
+        defer ctx.gpa.free(counts);
+        try ctx.pathEdit(reqs.items, edits, flags, counts);
+        for (keys.items, 0..) |key, i| {
+            const node = self.plan.nodes.get(key) orelse continue;
+            if (node.user != 0) self.chunks.items[node.user - 1].voxels = counts[i];
+            if (flags[i] & types.path_edit_failed != 0) try self.markDirty(key) else self.stats.path_edited += 1;
+        }
+        // Müllabfuhr der Arena: alle pfadgeänderten Chunks neu bauen; sind sie
+        // ersetzt, verwendet niemand mehr die Arena, und sie wird geleert
+        if (ctx.arenaPressure()) {
+            ctx.logf(3, "Welt: Arena der Pfadänderungen zu 3/4 voll, geänderte Chunks werden neu gebaut", .{});
+            for (self.chunks.items) |c| {
+                if (c.geometry != 0 and ctx.geometryUsesArena(c.geometry)) try self.markDirty(c.key);
             }
         }
     }
@@ -553,6 +634,7 @@ pub const World = struct {
             !self.replan and
             self.job_idle and
             self.dirty.items.len == 0 and
+            self.path_queue.items.len == 0 and
             self.stats.pending_chunks == 0;
         if (quiet) {
             self.quiet_frames += 1;
@@ -596,7 +678,8 @@ pub const World = struct {
         self.built_new = 0;
 
         if (self.pollJob()) try self.finishJob();
-        self.lap(2, &t0); // Ergebnis übernehmen (Pools, GAS, Instanzen)
+        try self.runPathEdits();
+        self.lap(2, &t0); // Ergebnis übernehmen (Pools, GAS, Instanzen, Pfadänderungen)
         if (self.job_idle) {
             // Geänderte Chunks zuerst, aber nur bis zur Hälfte des Auftrags:
             // sonst hungert ein Strom von Änderungen das Nachladen aus (die

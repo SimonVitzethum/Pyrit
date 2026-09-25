@@ -572,6 +572,80 @@ pub const ReplayParams = extern struct {
 
 pub const replay_block: u32 = 128;
 
+// ---------------------------------------------------------------------------
+// Pfadänderung (HashDAG-Zweig): Voxel eines fertigen Chunks ändern, ohne den
+// Chunk neu zu bauen. Neue Knoten und Bricks liegen in einer Arena am oberen
+// Ende der Pools – oberhalb jeder Batch, also mit den relativen Verweisen des
+// Formats von jedem Chunk aus erreichbar. Siehe src/device/pathedit.zig.
+// ---------------------------------------------------------------------------
+
+pub const path_edit_block: u32 = 256;
+/// höchstens so viele Änderungen je Auftrag (der Host teilt größere)
+pub const path_edit_max_edits: u32 = 4096;
+
+/// Ergebnis-Flags eines Auftrags
+pub const path_edit_rebuild: u32 = 0x1; // neuer RT-Teilbaum nötig: voll neu bauen
+pub const path_edit_empty: u32 = 0x2; // Chunk wurde leer
+pub const path_edit_overflow: u32 = 0x4; // Arena-Anteil des Auftrags zu klein
+pub const path_edit_grew: u32 = 0x8; // eine Hülle wuchs: GAS neu bauen (kein Fehler)
+/// Flags, bei denen der Chunk voll neu gebaut werden muss
+pub const path_edit_failed: u32 = path_edit_rebuild | path_edit_empty | path_edit_overflow;
+
+/// Ein Chunk, dessen Voxel geändert werden (ein GPU-Block je Auftrag)
+pub const PathEditJob = extern struct {
+    /// Basis der relativen Verweise (wie GeometryData)
+    node_offset: u32,
+    leaf_offset: u32,
+    root: u32,
+    log2_size: u32,
+    /// Attribute: alt (absolut im Pool, `attr_count` Werte) und zwei Ziele
+    /// mit je `attr_cap` Plätzen im Wechsel
+    attr_src: u32,
+    attr_count: u32,
+    attr_a: u32,
+    attr_b: u32,
+    attr_cap: u32,
+    /// Arena-Anteil dieses Auftrags (absolute Wort-/Brick-Indizes)
+    node_arena: u32,
+    node_cap: u32,
+    leaf_arena: u32,
+    leaf_cap: u32,
+    /// Änderungen [edit_first, edit_first + edit_count) in PathEditParams.edits
+    edit_first: u32,
+    edit_count: u32,
+    rt_log2: u32,
+    /// RT-Primitive des Chunks (in place geändert: Knoten, Attributrang)
+    prims: u64,
+    prim_count: u32,
+    /// AABB je Primitiv ([6]f32). Mit aabbs_keep die dauerhaften Hüllen der
+    /// Batch: sie wachsen nur (auf die volle Zelle), und nur dann braucht der
+    /// Chunk einen neuen GAS. Sonst ein Zwischenpuffer, stets neu gebaut.
+    aabbs: u64,
+    aabbs_keep: u32,
+    // Ergebnis
+    out_root: u32,
+    out_count: u32,
+    /// 0: Attribute liegen in attr_a, 1: in attr_b
+    out_attr_b: u32,
+    out_flags: u32,
+    // Absprache zwischen den Threads des Blocks
+    op: u32,
+    op_rank: u32,
+    op_attr: u32,
+};
+
+/// op: 0 nichts, 1 setzen, 2 einfügen, 3 entfernen
+pub const PathEditParams = extern struct {
+    nodes: u64,
+    leaves: u64,
+    attributes: u64,
+    jobs: u64,
+    /// [4]u32: x, y, z im Chunk (in seiner LOD-Auflösung), Attribut (0 = entfernen)
+    edits: u64,
+    count: u32,
+    reserved: u32 = 0,
+};
+
 pub const RtParams = extern struct {
     /// IAS aller Instanzen; 0 = leere Szene
     handle: u64,

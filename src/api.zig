@@ -385,7 +385,8 @@ pub const WorldStats = extern struct {
     top_lod: u32,
     /// empfohlener PyrLighting.secondary_bias für secondary_mask
     secondary_bias: f32,
-    reserved1: u32,
+    /// Chunks, die seit dem Anlegen per Pfadänderung (ohne Neubau) geändert wurden
+    path_edited: u32,
     /// GPU-Bytes der Welt (Knoten, Blätter, Attribute)
     bytes: u64,
 };

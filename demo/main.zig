@@ -1175,6 +1175,7 @@ fn record(init: std.process.Init, o: Options, dir: []const u8) !void {
     if (o.edit_bench > 0) {
         editBench(init, &app, &sp, &cam, &tgs, &post, o.edit_bench, false);
         editBench(init, &app, &sp, &cam, &tgs, &post, o.edit_bench, true);
+        digBench(init, &app, &sp, &cam, &tgs);
     }
 }
 
@@ -1227,6 +1228,81 @@ fn mvTest(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Camera,
         }
     }
     _ = pyrit.pyr_instance_destroy(@ptrCast(app.ctx), @ptrCast(inst));
+}
+
+/// Entfernen prüfen: den Haufen wieder weg und darunter ein 5x5-Loch zwei
+/// Blöcke tief; danach Höhe und Attribut eines 64x64-Rasters als Prüfsumme
+/// (mit PYRIT_NO_PATH_EDIT=1 vergleichen: der volle Neubau muss gleich sein)
+fn digBench(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Camera, tgs: *Targets) void {
+    const d = sp.dir();
+    const cx = sp.pos[0] + d[0] * 80;
+    const cz = sp.pos[2] + d[2] * 80;
+    var edits: [125]api.WorldEdit = undefined;
+    var n: usize = 0;
+    var i: u32 = 0;
+    while (i < 25) : (i += 1) {
+        const x = cx + @as(f64, @floatFromInt(i % 5)) - 2;
+        const z = cz + @as(f64, @floatFromInt(i / 5)) - 2;
+        const g = @floor(app.gen.height(x, z));
+        var dy: i32 = -1;
+        while (dy <= 2) : (dy += 1) {
+            edits[n] = .{ .x = @intFromFloat(@floor(x)), .y = @as(i64, @intFromFloat(g)) + dy, .z = @intFromFloat(@floor(z)), .attribute = 0 };
+            n += 1;
+        }
+    }
+    req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+    const t0 = nowSeconds(init);
+    req(pyrit.pyr_world_edit(@ptrCast(app.ctx), @ptrCast(app.world), &edits, @intCast(n)));
+    var rounds: u32 = 0;
+    while (rounds < 1000) : (rounds += 1) {
+        app.updateWorld(sp, cam, tgs);
+        var ws: api.WorldStats = undefined;
+        req(pyrit.pyr_world_stats(@ptrCast(app.world), &ws));
+        if (ws.pending_chunks == 0 and rounds > 0 and ws.built_chunks == 0) break;
+        req(pyrit.pyr_world_wait(@ptrCast(app.ctx), @ptrCast(app.world), &sp.pos));
+    }
+    const t1 = nowSeconds(init);
+    // Diagnose PYRIT_DIG_SETTLE: danach noch Runden, damit auch vorgemerkte
+    // Neubauten fertig sind (Vergleich mit PYRIT_NO_PATH_EDIT)
+    if (std.c.getenv("PYRIT_DIG_SETTLE") != null) {
+        var k: u32 = 0;
+        while (k < 20) : (k += 1) {
+            app.updateWorld(sp, cam, tgs);
+            req(pyrit.pyr_world_wait(@ptrCast(app.ctx), @ptrCast(app.world), &sp.pos));
+        }
+    }
+    const org = sp.origin();
+    const nr = 64 * 64;
+    var grid: [nr]types.Ray = undefined;
+    for (&grid, 0..) |*r, gi| {
+        const gx = cx + @as(f64, @floatFromInt(gi % 64)) - 32;
+        const gz = cz + @as(f64, @floatFromInt(gi / 64)) - 32;
+        r.* = .{ .origin = .{ @floatCast(@floor(gx) + 0.5 - org[0]), 400, @floatCast(@floor(gz) + 0.5 - org[2]) }, .tmin = 0, .direction = .{ 0, -1, 0 }, .tmax = 1000 };
+    }
+    const grd = devAlloc(@sizeOf(@TypeOf(grid)));
+    const ghd = devAlloc(nr * @sizeOf(types.Hit));
+    defer _ = drv.cuMemFree_v2(grd);
+    defer _ = drv.cuMemFree_v2(ghd);
+    cu(drv.cuMemcpyHtoD_v2(grd, &grid, @sizeOf(@TypeOf(grid))));
+    req(pyrit.pyr_trace(@ptrCast(app.ctx), grd, ghd, nr, 0x1, 0));
+    req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+    var gh: [nr]types.Hit = undefined;
+    cu(drv.cuMemcpyDtoH_v2(&gh, ghd, @sizeOf(@TypeOf(gh))));
+    var sum: u64 = 0;
+    var deep: u32 = 0;
+    for (gh, 0..) |h, gi| {
+        sum +%= @as(u64, @as(u32, @bitCast(h.t))) *% 31 +% h.attribute;
+        const gx = cx + @as(f64, @floatFromInt(gi % 64)) - 32;
+        const gz = cz + @as(f64, @floatFromInt(gi / 64)) - 32;
+        if (400 - h.t < @floor(app.gen.height(gx, gz)) - 1.5) deep += 1;
+    }
+    if (std.c.getenv("PYRIT_DIG_DUMP")) |path| {
+        if (std.c.fopen(path, "wb")) |f| {
+            _ = std.c.fwrite(@ptrCast(&gh), 1, @sizeOf(@TypeOf(gh)), f);
+            _ = std.c.fclose(f);
+        }
+    }
+    std.debug.print("Loch: {d} Blöcke entfernt in {d:.1} ms, {d} Säulen tiefer als der Boden, Prüfsumme {x}\n", .{ n, (t1 - t0) * 1000, deep, sum });
 }
 
 /// Messung: n Blöcke setzen und die Zeit, bis alle betroffenen Chunks neu
@@ -1283,6 +1359,64 @@ fn editBench(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Came
     req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
     const t3 = nowSeconds(init);
     if (shot != null and !spread) editShot(init, app, &top, cam, tgs, post, "nachher");
+    // Diagnose PYRIT_EDIT_COLUMNS: Höhe jeder Säule des Haufens per senkrechtem Strahl
+    if (!spread and std.c.getenv("PYRIT_EDIT_COLUMNS") != null) {
+        var rays: [25]types.Ray = undefined;
+        const org = sp.origin();
+        for (&rays, 0..) |*r, i| {
+            const x = cx + @as(f64, @floatFromInt(i % 5)) - 2;
+            const z = cz + @as(f64, @floatFromInt(i / 5)) - 2;
+            r.* = .{ .origin = .{ @floatCast(@floor(x) + 0.5 - org[0]), 400, @floatCast(@floor(z) + 0.5 - org[2]) }, .tmin = 0, .direction = .{ 0, -1, 0 }, .tmax = 1000 };
+        }
+        const rd = devAlloc(@sizeOf(@TypeOf(rays)));
+        const hd = devAlloc(25 * @sizeOf(types.Hit));
+        defer _ = drv.cuMemFree_v2(rd);
+        defer _ = drv.cuMemFree_v2(hd);
+        cu(drv.cuMemcpyHtoD_v2(rd, &rays, @sizeOf(@TypeOf(rays))));
+        req(pyrit.pyr_trace(@ptrCast(app.ctx), rd, hd, 25, 0x1, 0));
+        req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+        var hits: [25]types.Hit = undefined;
+        cu(drv.cuMemcpyDtoH_v2(&hits, hd, @sizeOf(@TypeOf(hits))));
+        // Raster 64x64 um den Haufen: Treffer und Attribut als Prüfsumme
+        {
+            const nr = 64 * 64;
+            var grid: [nr]types.Ray = undefined;
+            for (&grid, 0..) |*r, gi| {
+                const gx = cx + @as(f64, @floatFromInt(gi % 64)) - 32;
+                const gz = cz + @as(f64, @floatFromInt(gi / 64)) - 32;
+                r.* = .{ .origin = .{ @floatCast(@floor(gx) + 0.5 - org[0]), 400, @floatCast(@floor(gz) + 0.5 - org[2]) }, .tmin = 0, .direction = .{ 0, -1, 0 }, .tmax = 1000 };
+            }
+            const grd = devAlloc(@sizeOf(@TypeOf(grid)));
+            const ghd = devAlloc(nr * @sizeOf(types.Hit));
+            defer _ = drv.cuMemFree_v2(grd);
+            defer _ = drv.cuMemFree_v2(ghd);
+            cu(drv.cuMemcpyHtoD_v2(grd, &grid, @sizeOf(@TypeOf(grid))));
+            req(pyrit.pyr_trace(@ptrCast(app.ctx), grd, ghd, nr, 0x1, 0));
+            req(pyrit.pyr_synchronize(@ptrCast(app.ctx)));
+            var gh: [nr]types.Hit = undefined;
+            cu(drv.cuMemcpyDtoH_v2(&gh, ghd, @sizeOf(@TypeOf(gh))));
+            var n_hit: u32 = 0;
+            var sum: u64 = 0;
+            for (gh) |h| {
+                if (h.instance != types.no_hit) n_hit += 1;
+                sum +%= @as(u64, @as(u32, @bitCast(h.t))) *% 31 +% h.attribute;
+            }
+            std.debug.print("Raster: {d} Treffer von {d}, Prüfsumme {x}\n", .{ n_hit, nr, sum });
+            if (std.c.getenv("PYRIT_EDIT_GRID_DUMP")) |path| {
+                if (std.c.fopen(path, "wb")) |f| {
+                    _ = std.c.fwrite(@ptrCast(&gh), 1, @sizeOf(@TypeOf(gh)), f);
+                    _ = std.c.fclose(f);
+                }
+            }
+        }
+        std.debug.print("Säulen (Oberkante, Boden):", .{});
+        for (hits, 0..) |h, i| {
+            const x = cx + @as(f64, @floatFromInt(i % 5)) - 2;
+            const z = cz + @as(f64, @floatFromInt(i / 5)) - 2;
+            std.debug.print(" {d:.0}/{d:.0}", .{ 400 - h.t, @floor(app.gen.height(x, z)) });
+        }
+        std.debug.print("\n", .{});
+    }
     std.debug.print("Änderung ({s}): {d} Blöcke, Aufruf {d:.2} ms, Neubau {d:.1} ms ({d} Chunks in {d} Runden), sichtbar nach {d:.1} ms\n", .{
         if (spread) "verstreut" else "Haufen", count, (t1 - t0) * 1000, (t2 - t1) * 1000, built, rounds, (t3 - t0) * 1000,
     });
@@ -1291,6 +1425,10 @@ fn editBench(init: std.process.Init, app: *App, sp: *Spectator, cam: *types.Came
 /// Einige Frames aus `view` rendern (Welt nachführen, Verlauf einschwingen)
 /// und das letzte als <PYRIT_EDIT_SHOT>_<name>.ppm speichern
 fn editShot(init: std.process.Init, app: *App, view: *const Spectator, cam: *types.Camera, tgs: *Targets, post: *api.PostInfo, name: []const u8) void {
+    // Beweisbilder auch mit --no-images
+    const saved = no_images;
+    no_images = false;
+    defer no_images = saved;
     var k: u32 = 0;
     while (k < 30) : (k += 1) {
         view.camera(cam, tgs.w, tgs.h, k);
