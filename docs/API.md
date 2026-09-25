@@ -152,6 +152,7 @@ Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über diesel
 
 - **Texturen** (`pyr_texture_create`, RGBA8): Index 1-basiert in `material.texture` bzw. `normal_texture`, Kachelgröße über `texture_scale` in Welteinheiten. Voxelflächen sind achsenparallel, deshalb wird genau eine Ebene projiziert – Triplanar-Mischen wäre hier Verschwendung. Gefiltert wird von Hand (bilinear), ohne Texturhardware, damit derselbe Code später auf AMD läuft.
 - **Detailnormale** ohne Textur: `normal_strength` und `normal_scale` erzeugen sie aus Wertrauschen. Beleuchtet wird mit der gestörten, weiterverfolgt mit der geometrischen Normale; im Ziel `normal` steht die geometrische, damit Denoiser und Reprojektion stabil bleiben.
+- **Seitenflächen** (`side_texture`, `side_color`): Flächen mit waagerechter Normale nehmen eine eigene Textur, und mit gesetzter `side_color` auch eine eigene Farbe statt der Voxelfarbe – der Grasblock mit Erdseiten und Grasrand ist *ein* Voxel. Mit `side_color = {1,1,1}` trägt die Seitentextur ihre Farbe selbst (als lineares Albedo).
 - **Klarlack** (`clearcoat`, `clearcoat_roughness`): eine zweite, glatte Schicht. Was sie reflektiert, fehlt darunter.
 - **Unterflächenstreuung** (`subsurface`, `subsurface_color`): Licht von hinten kommt getönt durch (Laub, Haut, Wachs). Getrennt vom BRDF gerechnet, sonst zählt es doppelt.
 
@@ -160,7 +161,10 @@ Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über diesel
 - `PyrLight.kind`: `PYR_LIGHT_SPHERE` (Punkt mit Radius), `PYR_LIGHT_RECT` (Flächenlicht, `normal` und halbe Kanten in `size`) und `PYR_LIGHT_SPOT` (Kegel, `size` = cos innen/außen). Bis zu 64 Stück.
 - **Umgebungskarte** (`pyr_environment_set`, equirektangulär, 4 Floats je Texel): Pyrit baut daraus eine Verteilung (Summenfunktion je Zeile plus eine über die Zeilen, mit sin θ gewichtet) und tastet sie nach Helligkeit ab. Der GI-Strahl tastet dieselbe Karte über den Cosinus-Lappen ab; beide Anteile werden nach der Potenz-Heuristik gewichtet (MIS), sonst zählt die Karte doppelt. Gemessen an einer Karte mit 0,03 rad großer, 4000× heller Sonne: **ohne** Importance-Sampling liegt der Boden bei Helligkeit 46 statt 114 – der Cosinus-Strahl trifft die Scheibe praktisch nie, das Licht fehlt schlicht.
 - **Mehrere Reflexionen** (`gi_bounces`): ab der zweiten entscheidet russisches Roulette, der Erwartungswert bleibt richtig. Gemessen (1 → 3): dunkle Bereiche 43,1 → 46,6, Renderzeit 11,6 → 14,1 ms.
-- **Teilnehmendes Medium** (`fog_density`, `fog_color`, `fog_height`, `fog_falloff`, `fog_anisotropy`, `fog_steps`): Strahlmarschierung entlang des Sichtstrahls mit Sonnenabtastung je Schritt – das ergibt die Lichtschächte. Die Schrittlage wird je Pixel verschoben, das Rauschen daraus nimmt der zeitliche Filter weg.
+- **Einheiten:** Sonne und Lampen werden durch π geteilt geführt (Lambert = Albedo · E · cos), die Umgebungskarte dagegen als echte Strahldichte – so sieht man sie auch direkt (Himmel, Spiegelungen) und so liest sie der GI-Strahl. Die Lichtabtastung der Karte teilt entsprechend durch π. (Vorher zählte der Himmel über diesen Weg π-mal zu stark, über den GI-Strahl richtig, und die MIS-Mischung beider war inkonsistent.)
+- **Sonne als eigenes Licht neben einer Karte:** Steckt die Sonne in der Umgebungskarte, zieht die Lichtabtastung zufällig mal die Sonne, mal den Himmel – dann rauscht auch voll besonnter Boden. Besser: Karte ohne Sonne, dazu `sun_color` / `sun_direction` / `sun_angular_radius`. Die Scheibe zeichnet Pyrit auch vor einer Karte selbst.
+- **Wolkenschatten** (`sun_shadow_texture`, `sun_shadow_height`, `sun_shadow_scale`, `sun_shadow_strength`, `sun_shadow_offset`): eine Textur, entlang der Sonne auf eine Ebene projiziert, dämpft das Sonnenlicht. `sun_shadow_offset` = Render-Ursprung modulo `scale`, dann haftet das Muster an der Welt.
+- **Teilnehmendes Medium** (`fog_density`, `fog_color`, `fog_height`, `fog_falloff`, `fog_anisotropy`, `fog_steps`): in der Nähe Strahlmarschierung mit Schattenstrahlen für die Lichtschächte – zwei je Pixel, nach dem Gewicht der Schritte gezogen –, dahinter bis zum Horizont ohne Strahlen integriert (Luftperspektive auch für ferne Berge). Dichte und Durchlässigkeit werden fest in der Schrittmitte ausgewertet; zufällig verschobene Schritte ließen das Integral selbst flimmern. Eingestreut wird die Sonne nach der Phasenfunktion und der mittlere Himmel. Der verschleierte Anteil eines Pixels zählt für die Nachbearbeitung wie der Himmel mit Albedo 1 – sonst ergab bläulicher Dunst durch grünes Laub-Albedo geteilt Magenta.
 
 ### Kamera- und Bildeffekte
 
@@ -169,19 +173,20 @@ Das Shading nutzt Lambert und GGX. Schatten- und GI-Strahlen laufen über diesel
 ## Nachbearbeitung, Hochskalieren, DLSS, Frame Generation
 
 `pyr_postprocess(ctx, view, targets, post)` läuft vollständig auf der GPU:
-1. **Temporal:** Die Beleuchtung wird mit den Motion Vectors reprojiziert und über Normale und Tiefe auf Gültigkeit geprüft (Rauschreduktion für GI). `clamp_sigma` (typisch 1,5) begrenzt Geisterbilder.
+1. **Temporal:** Die Beleuchtung wird mit den Motion Vectors reprojiziert und über Normale und Tiefe auf Gültigkeit geprüft (Rauschreduktion für GI). Auf einer Fläche wird der Verlauf bei Bewegung bikubisch (Catmull-Rom) nachgeschlagen, bilinear verwischt er Frame für Frame. `clamp_sigma` (typisch 1,5) begrenzt Geisterbilder – nur bei Bewegung: steht das Bild, ist die Reprojektion exakt, und die Grenze zog den Verlauf nur zum Rauschen des Einzelframes zurück (gemessen 0,48 % unruhige Pixel mit, 0,015 % ohne). Stehend darf der Verlauf gut dreimal so lang werden, bei schneller Bewegung halbiert er sich. Hinter Wasser und Glas bleibt er kurz (5 Frames): Spiegelung und Brechung bewegen sich nicht mit dem Untergrund, nach dessen Motion Vector reprojiziert wird.
 2. **À-trous-Denoiser, varianzgeführt:** `denoise_iterations` Schritte (typisch 3–5), kantenerhaltend über Normale, Tiefe und Helligkeit. Die Helligkeitstoleranz kommt aus der *gemessenen* Varianz: die Akkumulation führt die Momente der Helligkeit mit (zeitlich, in den ersten Frames räumlich geschätzt), der Filter glättet sie 3x3 und filtert sie mit quadrierten Gewichten mit. Dadurch wird verrauschtes Gebiet geglättet, statt sein Rauschen für Kanten zu halten – vor allem auf dunklen, indirekt beleuchteten Flächen und bei bewegter Kamera, wo nur wenige Frames akkumuliert sind. `denoise_phi` steuert die Stärke (0 = 4; kleiner = glatter, größer = mehr Details und mehr Rauschen). Gefiltert wird die Beleuchtung ohne Albedo, damit Voxelfarben scharf bleiben.
    Gemessen (CPU-Test, 5 akkumulierte Frames, dunkle Fläche mit Einzelsample-Rauschen): Restrauschen 0,0026 → 0,0013 bei zugleich besser erhaltener Kante (Sprunghöhe 0,60 → 0,90 der echten Kante).
 3. **Upscaler** (`post.upscaler`), Ausgabe in `output_width × output_height` (0 = Renderauflösung):
 
 | Upscaler | Verfahren |
 | --- | --- |
-| `PYR_UPSCALER_AUTO` / `_TAAU` | eigenes TAAU: gejitterte Samples an ihrer echten Subpixelposition rekonstruiert, Verlauf per Catmull-Rom, Varianzbegrenzung in YCoCg, MV des vordersten Nachbarn. Bei Faktor 1 gewöhnliches TAA. Bis 4× |
+| `PYR_UPSCALER_AUTO` | TAAU, wenn hochskaliert wird; bei gleicher Auflösung wie `NONE`. Ohne Jitter hätte TAA dort nichts zu rekonstruieren, es mittelte nur das fertige Bild samt Texturen ein zweites Mal (gemessen: 40 % weniger Schärfe nach zehn Frames Flug) |
+| `PYR_UPSCALER_TAAU` | eigenes TAAU: gejitterte Samples an ihrer echten Subpixelposition rekonstruiert, Verlauf per Catmull-Rom, Varianzbegrenzung in YCoCg, MV des vordersten Nachbarn. Bis 4× |
 | `PYR_UPSCALER_DLSS` | NVIDIA DLSS Super Resolution hinter dem eigenen Denoiser |
 | `PYR_UPSCALER_DLSS_RR` | NVIDIA DLSS Ray Reconstruction: ersetzt Denoiser und TAA; bekommt verrauschte Farbe, Albedo, Normalen, Tiefe, MVs sowie Rauheit und spiegelnde Albedo (dafür das Ziel `material` setzen) |
 | `PYR_UPSCALER_NONE` | nur Renderauflösung, ohne TAAU |
 
-4. **Tonemapping:** ACES, Reinhard oder keines. Ausgabe als HDR (`output_hdr`) und/oder RGBA8 sRGB (`output_ldr`).
+4. **Tonemapping:** `PYR_TONEMAP_ACES` (kanalweise), `_ACES_FITTED` (RRT+ODT nach Hill, entsättigt Lichter), `_NEUTRAL` (Khronos PBR Neutral: bis 0,76 linear, kein Fuß – ACES drückt einen Schatten mit einem Fünftel des Lichts auf dem Schirm auf ein Achtundzwanzigstel), `_REINHARD` oder keines. Ausgabe als HDR (`output_hdr`) und/oder RGBA8 sRGB (`output_ldr`).
 
 ### Überlappung mit dem nächsten Frame
 
@@ -216,7 +221,11 @@ Für TAAU und DLSS gehört pro Frame ein Jitter in die Kamera (`pyr_jitter_halto
 Eine Welt streamt Chunks um die Kamera: nah fein, fern grob (Octree über LOD-Stufen). Jeder Chunk hat 2^`chunk_log2` Voxel pro Kante; auf Stufe l ist ein Voxel 2^l Grundvoxel groß.
 
 ```zig
-var wi = std.mem.zeroes(api.WorldInfo);   // Standard: 32³-Chunks, 8 Stufen, eingebautes Gelände
+var wi = std.mem.zeroes(api.WorldInfo);   // Standard: 32³-Chunks
+wi.generate = meinGenerator;              // Pflicht: startet den eigenen Kernel
+wi.user = &meinZustand;
+wi.y_min = -64;                           // Pflicht: senkrechter Bereich
+wi.y_max = 320;
 var world: ?*anyopaque = null;
 _ = pyrit.pyr_world_create(ctx, &wi, &world);
 // pro Frame
@@ -224,9 +233,9 @@ _ = pyrit.pyr_world_update(ctx, world, &kamera_welt, &origin);   // wartet nie a
 _ = pyrit.pyr_commit(ctx, &.{ .time = t, .origin = origin });
 ```
 
-- **Erzeugung auf der GPU:** Ein Generator-Kernel schreibt die Voxel eines Chunks direkt in der Auflösung seiner Stufe und nur die sichtbare Haut, nie ein volles Volumen. Eingebaut ist ein Höhenfeld-Gelände (`PyrTerrainInfo`, Höhe abfragbar mit `pyr_terrain_height`) mit Wasser bis `sea_level` (`attr_water`, Material mit `PYR_MATERIAL_TRANSPARENT`) und Bäumen (`attr_leaves`, `attr_wood`, `tree_density`). Eigene Generatoren setzen `info.generate`: Pyrit übergibt je Batch die Chunk-Schlüssel und Ausgabepuffer (`PyrWorldGenParams`) und den Stream.
+- **Erzeugung auf der GPU:** Pyrit bringt kein Gelände mit – was in der Welt steht, entscheidet allein die Anwendung. Sie setzt `info.generate`; Pyrit übergibt je Batch die Chunk-Schlüssel und Ausgabepuffer (`PyrWorldGenParams`) und den Stream, und die Anwendung startet darauf ihren eigenen Kernel. Er schreibt die Voxel eines Chunks direkt in der Auflösung seiner Stufe und nur die sichtbare Haut, nie ein volles Volumen. Ein vollständiges Beispiel ist die Demo (`demo/terrain.zig`, `demo/kernels.zig`, `demo/scene.zig`): Minecraft-artiges Gelände mit Biomen, Bäumen und Wasser, als Zig-Kernel nach PTX übersetzt und über `cuModuleLoadDataEx` geladen.
 - **Bau:** Bis zu `chunks_per_update` Chunks entstehen in einem GPU-DAG-Bau (Teilbäume batchweit dedupliziert), alle GAS ohne Synchronisation. Erzeugen und Bauen laufen auf einem eigenen Thread und CUDA-Stream.
-- **Übergänge:** Grobe Chunks bleiben sichtbar, bis alle feineren fertig sind; es entstehen keine Löcher. Neue Chunks übernehmen den Verlauf von TAA und Denoiser (`PYR_INSTANCE_KEEP_HISTORY`).
+- **Übergänge:** Grobe Chunks bleiben sichtbar, bis alle feineren fertig sind; es entstehen keine Löcher. Der Planer läuft nach jedem fertigen Auftrag noch einmal, auch wenn die Kamera steht: erst mit den neuen Chunks kennt er die nächstfeinere Stufe (vorher blieb eine ruhende Welt auf einer groben Stufe stehen und wurde erst bei der ersten Bewegung schlagartig fein). Neue Chunks übernehmen den Verlauf von TAA und Denoiser (`PYR_INSTANCE_KEEP_HISTORY`).
 - **Speicher:** Nicht mehr gebrauchte Chunks werden nach `keep_frames` freigegeben. Leere Bereiche kosten nichts. Das Standardgelände mit etwa 20 000 Voxeln Sichtweite belegt rund 11 MiB.
 - **Genauigkeit:** Die Welt rechnet in f64 und legt Instanzen relativ zum Render-Ursprung ab. Diesen Ursprung in großen Schritten mitführen, zum Beispiel alle 1024 Voxel.
 - **Überlauf gibt es nicht:** Passt ein Chunk nicht in `chunk_capacity`, wird die Kapazität erhöht und der Auftrag wiederholt, statt Voxel abzuschneiden. Der Generatorpuffer wächst dabei mit, solange Grafikspeicher frei ist (ein Achtel des Gesamtspeichers, mindestens 128 MiB, bleiben unangetastet); erst wenn es eng wird, sinkt stattdessen die Zahl der Chunks je Auftrag, im Grenzfall auf einen. Abgebrochen wird nie. Nachgemessen mit `chunk_capacity = 256`: die Kapazität wächst in vier Schritten auf 6672, die Chunkzahl je Auftrag bleibt bei 64, und das fertig geladene Bild ist **pixelgleich** zu dem mit der Vorgabe. Ohne mitwachsenden Puffer bräuchte derselbe Aufbau 1867 statt 61 Updates (9,9 s statt 0,6 s). `PyrWorldStats.overflow_chunks` zählt die Vergrößerungen.

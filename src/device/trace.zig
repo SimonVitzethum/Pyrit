@@ -72,6 +72,7 @@ pub fn traceScene(s: *const types.Scene, o: Vec3, d: Vec3, tmin: f32, tmax: f32,
     var best = tmax;
     var result: ?TraceHit = null;
 
+    const cut: ?*const [4]u64 = if (anyCutout(s)) &s.cutout_materials else null;
     var i: u32 = 0;
     while (i < s.instance_count) : (i += 1) {
         const in = &inst[i];
@@ -82,9 +83,11 @@ pub fn traceScene(s: *const types.Scene, o: Vec3, d: Vec3, tmin: f32, tmax: f32,
         const g = dagOf(s, &geo[in.geometry]);
         const oo = vec.xformPoint(&in.world_to_object, o);
         const dd = vec.xformVector(&in.world_to_object, d);
-        // durchsichtige Materialien überspringt schon die Traversierung
-        const hit = if (flags & types.trace_skip_transparent != 0)
-            dag.traceSkipping(&g, oo, dd, tmin, best, want_attribute, &s.transparent_materials)
+        // durchsichtige Materialien und Löcher im Laub überspringt schon die
+        // Traversierung (die Löcher für jeden Strahl, auch den durch Wasser)
+        const skip: ?*const [4]u64 = if (flags & types.trace_skip_transparent != 0) &s.transparent_materials else null;
+        const hit = if (skip != null or cut != null)
+            dag.traceSkipping(&g, oo, dd, tmin, best, want_attribute, skip, cut, .{ 0, 0, 0 })
         else
             dag.trace(&g, oo, dd, tmin, best, want_attribute);
         if (hit) |h| {
@@ -145,4 +148,10 @@ pub fn hitNormal(s: *const types.Scene, h: types.Hit) Vec3 {
         if (axis == 2) sign else 0,
     };
     return vec.normalize(vec.xformNormal(&instances(s)[h.instance].world_to_object, n));
+}
+
+/// Gibt es überhaupt Material mit Lochmuster? Sonst bleibt die Traversierung
+/// ohne jede Zusatzprüfung.
+pub inline fn anyCutout(s: *const types.Scene) bool {
+    return (s.cutout_materials[0] | s.cutout_materials[1] | s.cutout_materials[2] | s.cutout_materials[3]) != 0;
 }

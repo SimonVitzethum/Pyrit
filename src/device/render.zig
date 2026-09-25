@@ -115,6 +115,7 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
     const found = tracer.trace(s, ray.o, ray.d, ray.tmin, ray.tmax, opaque_mask, p.flags | types.trace_skip_transparent);
 
     var r = PixelResult{ .hit = tr.toHit(found), .depth = types.flt_max, .motion = .{ 0, 0 } };
+    r.hit.meta |= @as(u32, 0xFF) << types.hit_fog_shift; // klar, bis der Dunst etwas anderes sagt
     const history = p.history_valid != 0;
 
     if (found) |h| {
@@ -161,6 +162,14 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             const footprint = if (cm.projection == types.projection_orthographic) px_per_unit else h.t * px_per_unit;
             const sh = shade.shadeHit(tracer, s, ray.o, ray.d, h, &rng, secondary_mask, trans_mask, footprint);
             var col = vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
+            // Albedo wird genauso gemittelt wie die Farbe. Die Nachbearbeitung
+            // filtert Farbe / Albedo; stammte die Farbe aus mehreren Flächen
+            // (oder zur Hälfte aus dem Himmel), das Albedo aber nur aus der
+            // Mitte, entstanden an Silhouetten Werte weit außerhalb jeder
+            // echten Beleuchtung – Himmelblau durch dunkles Laubgrün ist
+            // Violett. Der Filter verschmierte sie, und wieder mit dem Albedo
+            // der Nachbarn multipliziert zeigten sie sich als violette Säume.
+            var alb = vec.Vec3{ sh.albedo[0], sh.albedo[1], sh.albedo[2] };
 
             var cov = @min(@max(p.coverage, 1), 4);
             // Die zusätzlichen Strahlen lohnen nur an einer Voxelkante. Wo
@@ -209,6 +218,7 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
                             @abs(h2.t - h.t) < 0.002 * h.t + 1e-3;
                         if (same_face and h2.attribute == h.attribute) {
                             col += vec.Vec3{ sh.color[0], sh.color[1], sh.color[2] };
+                            alb += vec.Vec3{ sh.albedo[0], sh.albedo[1], sh.albedo[2] };
                         } else if (same_face) {
                             const hp2 = r2.o + r2.d * vec.splat(h2.t);
                             const nn = vec.Vec3{ sh.normal[0], sh.normal[1], sh.normal[2] };
@@ -218,24 +228,29 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
                                 scaled[q] = sh.color[q] * (s2.albedo[q] / @max(sh.albedo[q], 1e-4));
                             }
                             col += scaled;
+                            alb += s2.albedo;
                         } else {
                             var rng2 = shade.Rng.init(x, y, p.frame_index, 8 + k);
                             const fp2 = if (cm.projection == types.projection_orthographic) px_per_unit else h2.t * px_per_unit;
                             const s2 = shade.shadeHit(tracer, s, r2.o, r2.d, h2, &rng2, secondary_mask, trans_mask, fp2);
                             col += vec.Vec3{ s2.color[0], s2.color[1], s2.color[2] };
+                            alb += vec.Vec3{ s2.albedo[0], s2.albedo[1], s2.albedo[2] };
                         }
                     } else {
+                        // Himmel wird nicht demoduliert: er zählt mit Albedo 1
                         col += shade.sky(@ptrFromInt(s.lighting), r2.d, true);
+                        alb += vec.splat(1);
                     }
                     wsum += 1;
                 }
                 col *= vec.splat(1.0 / wsum);
+                alb *= vec.splat(1.0 / wsum);
             }
 
             r.color = .{ col[0], col[1], col[2], 1 };
             r.normal = .{ sh.normal[0], sh.normal[1], sh.normal[2], r.depth };
             // w trägt den diffusen Anteil für den indirekten Durchgang
-            r.albedo = .{ sh.albedo[0], sh.albedo[1], sh.albedo[2], sh.diffuse };
+            r.albedo = .{ alb[0], alb[1], alb[2], sh.diffuse };
             r.material = .{ sh.roughness, 1 - sh.diffuse };
         } else {
             const c = shade.sky(@ptrFromInt(s.lighting), ray.d, true);
@@ -249,6 +264,8 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
             const cm2 = &p.cur.camera;
             const fp_scale = 2 * cm2.scale[1] / @as(f32, @floatFromInt(@max(cm2.height, 1)));
             var c = shade.transparentLayers(tracer, s, ray.o, ray.d, ray.tmin, t_behind, behind, p.ray_mask, trans_mask, opaque_mask, secondary_mask, &rng, fp_scale);
+            // Ohne durchsichtige Schicht kommt `behind` bitgleich zurück
+            if (@reduce(.Or, c != behind)) r.hit.meta |= types.hit_through_transparent;
             // Nebel ganz zum Schluss: er dämpft alles dahinter, auch die
             // transparenten Schichten, und steuert die Lichtschächte bei.
             const lg: *const types.Lighting = @ptrFromInt(s.lighting);
@@ -256,7 +273,24 @@ pub fn renderPixelWith(tracer: anytype, p: *const types.RenderParams, s: *const 
                 var frng = shade.Rng.init(x, y, p.frame_index, 3);
                 const cv = vec.Vec3{ c[0], c[1], c[2] };
                 const fogged = shade.applyFog(tracer, s, lg, ray.o, ray.d, t_behind, cv, &frng, secondary_mask);
-                c = fogged;
+                c = fogged.color;
+                // Der Dunst liegt vor der Fläche und hat mit ihrem Albedo
+                // nichts zu tun. Die Nachbearbeitung filtert aber Farbe /
+                // Albedo: bläulicher Dunst durch das Grün von Laub geteilt
+                // ergab Magenta, das der Filter verschmierte und auf die
+                // Nachbarn (Stämme) übertrug. Der verschleierte Anteil zählt
+                // deshalb wie der Himmel mit Albedo 1.
+                if (r.color[3] > 0.5) {
+                    const tf = @min(@max(fogged.transmittance, 0), 1);
+                    if (lg.flags & types.lighting_gi_half != 0) {
+                        // Das indirekte Licht kommt erst im Kombinieren dazu:
+                        // dort wird es gedämpft und das Albedo angeglichen.
+                        r.hit.meta = (r.hit.meta & ~(@as(u32, 0xFF) << types.hit_fog_shift)) |
+                            (@as(u32, @intFromFloat(tf * 255 + 0.5)) << types.hit_fog_shift);
+                    } else {
+                        inline for (0..3) |k| r.albedo[k] = r.albedo[k] * tf + (1 - tf);
+                    }
+                }
             }
             r.color = .{ c[0], c[1], c[2], r.color[3] };
         }
@@ -373,8 +407,15 @@ pub fn combinePixel(p: *const types.RenderParams, x: u32, y: u32) void {
     }
     if (best_w < 0) return; // kein gültiger Nachbar
     const li = if (wsum > 1e-4) sum * vec.splat(1.0 / wsum) else best;
-    const alb = @as([*]const [4]f32, @ptrFromInt(p.albedo))[i];
-    const add = Vec3{ alb[0], alb[1], alb[2] } * vec.splat(alb[3]) * li;
+    const albp = @as([*][4]f32, @ptrFromInt(p.albedo));
+    const alb = albp[i];
+    // Dunst vor der Fläche: dämpft auch das indirekte Licht, und der
+    // verschleierte Anteil zählt für die Nachbearbeitung mit Albedo 1
+    // (siehe renderPixelWith)
+    const meta = @as([*]const types.Hit, @ptrFromInt(p.hits))[i].meta;
+    const tf = @as(f32, @floatFromInt((meta >> types.hit_fog_shift) & 0xFF)) / 255.0;
+    const add = Vec3{ alb[0], alb[1], alb[2] } * vec.splat(alb[3] * tf) * li;
     const col = @as([*][4]f32, @ptrFromInt(p.color));
     col[i] = .{ col[i][0] + add[0], col[i][1] + add[1], col[i][2] + add[2], col[i][3] };
+    if (tf < 1) albp[i] = .{ alb[0] * tf + (1 - tf), alb[1] * tf + (1 - tf), alb[2] * tf + (1 - tf), alb[3] };
 }

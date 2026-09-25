@@ -438,7 +438,8 @@ pub fn resolveFx(p: *const types.PostFxParams, i: u64) void {
     if (p.grade != 0) col = gradeLinear(p, col);
 
     var disp: [3]f32 = undefined;
-    inline for (0..3) |k| disp[k] = post.linearToSrgb(post.tonemapChannel(@max(col[k], 0), p.tonemap));
+    const tm = post.tonemap(.{ @max(col[0], 0), @max(col[1], 0), @max(col[2], 0) }, p.tonemap);
+    inline for (0..3) |k| disp[k] = post.linearToSrgb(tm[k]);
     disp = applyLut(p, disp);
 
     if (p.out_hdr != 0) st4(p.out_hdr, i, .{ col[0], col[1], col[2], 1 });

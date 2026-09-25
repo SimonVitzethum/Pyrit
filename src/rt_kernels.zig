@@ -97,7 +97,8 @@ export fn __intersection__dag() callconv(.nvptx_kernel) void {
     const want_attribute = params().flags & types.trace_no_attribute == 0;
     const s: *const types.Scene = @ptrFromInt(params().scene);
     const skip: ?*const [4]u64 = if (ox.getPayload(3) != 0) &s.transparent_materials else null;
-    const h = pyr.rt.traceSubtree(g, prim, ox.objectRayOrigin(), ox.objectRayDirection(), ox.rayTmin(), ox.rayTmax(), want_attribute, skip) orelse return;
+    const cut: ?*const [4]u64 = if (pyr.scene.anyCutout(s)) &s.cutout_materials else null;
+    const h = pyr.rt.traceSubtree(g, prim, ox.objectRayOrigin(), ox.objectRayDirection(), ox.rayTmin(), ox.rayTmax(), want_attribute, skip, cut) orelse return;
     const kind = h.face | (if (h.inside) types.hit_inside else 0);
     _ = ox.reportIntersection1(h.t, kind, h.attribute);
 }

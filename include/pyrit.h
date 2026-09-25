@@ -151,6 +151,7 @@ typedef struct PyrScene {
     uint64_t materials;                               /* const PyrMaterial[PYR_MAX_MATERIALS] */
     uint64_t lighting;                                /* const PyrLighting* */
     uint64_t transparent_materials[4];                /* Bit je Material: PYR_MATERIAL_TRANSPARENT */
+    uint64_t cutout_materials[4];                     /* Bit je Material: PYR_MATERIAL_CUTOUT */
     uint64_t textures;                                /* const PyrTextureData[texture_count], 1-basiert */
     uint32_t texture_count;
     uint32_t reserved_tex;
@@ -177,6 +178,9 @@ typedef struct PyrScene {
 /* Wellen: zeitabhängig gestörte Normale (Wasser). Die Geometrie bleibt stehen,
  * Treffer, Tiefe und Motion Vectors bleiben exakt. */
 #define PYR_MATERIAL_WAVES 0x8u
+/* Durchbrochen (Laub): festes 4x4-Lochmuster je Voxelfläche, ~30 % Löcher;
+ * Strahlen (auch Schatten) laufen durch die Löcher hindurch */
+#define PYR_MATERIAL_CUTOUT 0x10u
 #define PYR_MAX_TRANSPARENT_LAYERS 4u
 #define PYR_VOXEL(material, r, g, b) \
     ((((uint32_t)(r) & 0xFFu) << 24) | (((uint32_t)(g) & 0xFFu) << 16) | (((uint32_t)(b) & 0xFFu) << 8) | ((uint32_t)(material) & 0xFFu))
@@ -209,7 +213,10 @@ typedef struct PyrMaterial {
     /* Ohne Normalentextur: Stärke und Wellenlänge einer erzeugten Detailnormale */
     float    normal_strength;
     float    normal_scale;
-    uint32_t reserved;
+    /* Seitenflächen (Normale waagerecht): eigene Textur (0 = wie oben) und
+     * eigene Farbe statt der Voxelfarbe (0,0,0 = Voxelfarbe behalten) */
+    uint32_t side_texture;
+    float    side_color[3];
 } PyrMaterial;
 
 
@@ -277,6 +284,15 @@ typedef struct PyrLighting {
     float    fog_anisotropy;    /* Henyey-Greenstein g, >0 streut nach vorn */
     uint32_t fog_steps;         /* 0 = 12 */
     float    firefly_clamp;     /* Obergrenze je Abtastung, 0 = aus */
+    /* Wolkenschatten: Textur (Rotanteil = Deckung), entlang der Sonne auf die
+     * Ebene in Höhe sun_shadow_height projiziert; dämpft das Sonnenlicht um
+     * bis zu sun_shadow_strength. scale = Welteinheiten je Wiederholung,
+     * offset = Render-Ursprung modulo scale (haftet so an der Welt). 0 = aus */
+    uint32_t sun_shadow_texture;
+    float    sun_shadow_height;
+    float    sun_shadow_scale;
+    float    sun_shadow_strength;
+    float    sun_shadow_offset[2];
     uint32_t reserved[1];
 
     PyrLight lights[PYR_MAX_LIGHTS];
@@ -287,7 +303,7 @@ extern "C" {
 #endif
 
 #define PYR_VERSION_MAJOR 0
-#define PYR_VERSION_MINOR 1
+#define PYR_VERSION_MINOR 2
 #define PYR_VERSION ((uint32_t)((PYR_VERSION_MAJOR << 16) | PYR_VERSION_MINOR))
 
 #if defined(_WIN32)
@@ -552,7 +568,7 @@ PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g,
 /* Hochskalieren: gerendert wird in der Auflösung der Kamera, ausgegeben in
  * output_width x output_height. Jitter (pyr_jitter_halton) ist für TAAU und
  * DLSS nötig. */
-#define PYR_UPSCALER_AUTO     0u  /* TAAU (bei Faktor 1: TAA) */
+#define PYR_UPSCALER_AUTO     0u  /* TAAU beim Hochskalieren, sonst wie NONE */
 #define PYR_UPSCALER_NONE     1u  /* nur Renderauflösung, ohne TAAU */
 #define PYR_UPSCALER_TAAU     2u
 #define PYR_UPSCALER_DLSS     3u  /* DLSS Super Resolution (falls verfügbar) */
@@ -561,6 +577,8 @@ PYR_API uint32_t  pyr_voxel_attribute(uint32_t material, uint32_t r, uint32_t g,
 #define PYR_TONEMAP_ACES     0u
 #define PYR_TONEMAP_REINHARD 1u
 #define PYR_TONEMAP_NONE     2u
+#define PYR_TONEMAP_ACES_FITTED 3u /* ACES RRT+ODT (Hill), entsättigt Lichter */
+#define PYR_TONEMAP_NEUTRAL  4u  /* Khronos PBR Neutral: linear bis 0,76, kein Fuß */
 
 /* Kamera- und Bildeffekte (PyrPostFx.flags) */
 #define PYR_POSTFX_BLOOM          0x1u
@@ -795,21 +813,6 @@ typedef struct PyrWorldGenParams {
 /* Startet eigene Kernel auf stream (CUstream); nicht synchronisieren. */
 typedef void (*PyrWorldGenFn)(void* user, const PyrWorldGenParams* params, void* stream);
 
-/* Eingebautes Gelände (Höhenfeld, fBm). Attribute 0 = eingebaute Farben. */
-typedef struct PyrTerrainInfo {
-    uint32_t seed, octaves;
-    float    base_height, amplitude;   /* Grundvoxel */
-    float    wavelength;               /* gröbste Oktave, Grundvoxel */
-    float    sea_level, snow_height;
-    float    rock_slope;               /* Steigung, ab der Fels entsteht */
-    uint32_t attr_grass, attr_dirt, attr_rock, attr_snow, attr_sand;
-    uint32_t attr_water;        /* Wasser bis sea_level; 0 = keines. Material mit
-                                   PYR_MATERIAL_TRANSPARENT anlegen. */
-    uint32_t attr_leaves;       /* Bäume; 0 = keine Vegetation */
-    uint32_t attr_wood;
-    float    tree_density;      /* Anteil der Spalten mit Baum, z. B. 0,004 */
-} PyrTerrainInfo;
-
 /* Erzeugen und Bauen im Aufruf von pyr_world_update statt auf dem
  * Hintergrund-Thread (deterministisch; für Tests und Werkzeuge) */
 #define PYR_WORLD_SYNC 0x1u
@@ -822,7 +825,7 @@ typedef struct PyrWorldInfo {
     float    view_distance;      /* Grundvoxel, 0 = 16384 */
     uint32_t reserved0;
     uint64_t memory_budget;      /* Bytes für Chunks; darüber wird die Welt gröber. 0 = 256 MiB */
-    int32_t  y_min, y_max;       /* Grundvoxel; beide 0 = aus dem Gelände */
+    int32_t  y_min, y_max;       /* senkrechter Bereich in Grundvoxeln (Pflicht) */
     uint32_t chunks_per_update;  /* 0 = 256; bestimmt, wie schnell eine frisch
                                     betretene Welt volle Schaerfe erreicht */
     uint32_t mask;               /* Instanzmaske, 0 = 0x1 */
@@ -835,10 +838,9 @@ typedef struct PyrWorldInfo {
     uint32_t rt_leaf_log2;       /* Kantenlänge der RT-AABBs, 0 = chunk_log2 - 2 (min 3) */
     uint32_t keep_frames;        /* ungenutzte Chunks so lange behalten, 0 = 8 */
     uint32_t flags;              /* PYR_WORLD_* */
-    PyrWorldGenFn generate;      /* NULL = eingebautes Gelände; läuft auf dem
-                                    Hintergrund-Thread (Kontext ist aktuell) */
+    PyrWorldGenFn generate;      /* Pflicht: Pyrit bringt kein Gelände mit. Läuft
+                                    auf dem Hintergrund-Thread (Kontext ist aktuell) */
     void*    user;
-    const PyrTerrainInfo* terrain; /* NULL = Standard */
 } PyrWorldInfo;
 
 typedef struct PyrWorldStats {
@@ -886,9 +888,6 @@ PYR_API PyrResult pyr_world_edits_save(PyrWorld* world, void* dst, uint64_t size
 PYR_API PyrResult pyr_world_edits_load(PyrContext* ctx, PyrWorld* world, const void* src, uint64_t size);
 
 PYR_API PyrResult pyr_world_stats(PyrWorld* world, PyrWorldStats* out);
-/* Standardgelände und seine Höhe an (x, z), z. B. für die Kamera */
-PYR_API void      pyr_terrain_default(PyrTerrainInfo* out);
-PYR_API float     pyr_terrain_height(const PyrTerrainInfo* terrain, double x, double z);
 
 /* ---------------------------------------------------------------------------
  * Kamera-Helfer (reine Host-Funktionen)

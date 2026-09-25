@@ -6,6 +6,7 @@
 const std = @import("std");
 const pyr = @import("pyrit_device");
 const pyrit = @import("pyrit");
+const demo = @import("demo");
 const common = @import("common.zig");
 const types = pyr.types;
 const api = pyrit.api;
@@ -99,7 +100,7 @@ const Targets = struct {
         _ = drv.cuMemFree_v2(t.motion);
     }
     fn api_(t: Targets) api.Targets {
-        return .{ .hits = t.hits, .depth = t.depth, .motion = t.motion, .color = 0, .normal = 0, .albedo = 0, .material = 0, .ray_mask = 0, .flags = 0, .transparent_mask = 0, .secondary_mask = 0 };
+        return .{ .hits = t.hits, .depth = t.depth, .motion = t.motion, .color = 0, .normal = 0, .albedo = 0, .material = 0, .ray_mask = 0, .flags = 0, .transparent_mask = 0, .secondary_mask = 0, .coverage = 0 };
     }
 };
 
@@ -442,7 +443,10 @@ fn benchImpl(init: std.process.Init, flags: u32, rt_log2: u32, count: u32, full:
         var l: types.Lighting = undefined;
         pyrit.pyr_lighting_default(&l);
         l.light_count = 1;
-        l.lights[0] = .{ .position = .{ 0, 200, 0 }, .radius = 5, .color = .{ 20000, 18000, 15000 }, .range = 0 };
+        l.lights[0] = std.mem.zeroes(types.Light);
+        l.lights[0].position = .{ 0, 200, 0 };
+        l.lights[0].radius = 5;
+        l.lights[0].color = .{ 20000, 18000, 15000 };
         req(pyrit.pyr_set_lighting(@ptrCast(ctx), &l));
     }
     var cam = std.mem.zeroes(types.Camera);
@@ -507,7 +511,10 @@ fn shadingCheck(gpa: std.mem.Allocator, ctx: ?*anyopaque, info: api.DagInfo, vie
     var l: types.Lighting = undefined;
     pyrit.pyr_lighting_default(&l);
     l.light_count = 1;
-    l.lights[0] = .{ .position = .{ 40, 90, 40 }, .radius = 3, .color = .{ 3000, 2500, 2000 }, .range = 0 };
+    l.lights[0] = std.mem.zeroes(types.Light);
+    l.lights[0].position = .{ 40, 90, 40 };
+    l.lights[0].radius = 3;
+    l.lights[0].color = .{ 3000, 2500, 2000 };
     req(pyrit.pyr_set_lighting(@ptrCast(ctx), &l));
 
     req(pyrit.pyr_commit(@ptrCast(ctx), null));
@@ -806,10 +813,11 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
     req(pyrit.pyr_create(&ci, @ptrCast(&ctx)));
     defer pyrit.pyr_destroy(@ptrCast(ctx));
 
-    var terrain: api.TerrainInfo = undefined;
-    pyrit.pyr_terrain_default(&terrain);
-    var wi = std.mem.zeroes(api.WorldInfo);
-    wi.terrain = &terrain;
+    // Generator der Demo, ohne Wasser und Bäume: dann ist die Oberfläche
+    // genau das Höhenfeld
+    var gen = try demo.Generator.init(&drv, .{ .water = 0, .tree_density = 0 });
+    defer gen.deinit();
+    var wi = gen.worldInfo();
     wi.view_distance = 3000;
     wi.voxel_pixels = 8;
     wi.keep_frames = 2;
@@ -819,7 +827,7 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
     defer _ = pyrit.pyr_world_destroy(@ptrCast(ctx), @ptrCast(world));
 
     for ([_][2]f64{ .{ 5000, 5000 }, .{ -123_456, 98_765 } }) |xz| {
-        const ground = pyrit.pyr_terrain_height(&terrain, xz[0], xz[1]);
+        const ground = gen.height(xz[0], xz[1]);
         const cam = [3]f64{ xz[0], ground + 20, xz[1] };
         const origin = [3]f64{ @floor(xz[0] / 1024) * 1024, 0, @floor(xz[1] / 1024) * 1024 };
         var st: api.WorldStats = undefined;
@@ -867,7 +875,7 @@ fn worldCheck(init: std.process.Init, flags: u32, label: []const u8) !void {
                 continue;
             }
             const y = 2000 - @as(f64, h.t);
-            const ref = pyrit.pyr_terrain_height(&terrain, c[0], c[1]);
+            const ref = gen.height(c[0], c[1]);
             // Stufe 0 nutzt Oktaven bis zur Wellenlänge 2; die volle Höhe weicht davon kaum ab
             worst = @max(worst, @abs(y - ref));
         }

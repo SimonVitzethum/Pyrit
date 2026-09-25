@@ -22,7 +22,7 @@ pub inline fn unpackCell(c: u64) [3]u32 {
 }
 
 /// Treffer im Objektraum der Geometrie (Voxelkoordinaten global).
-pub fn traceSubtree(g: *const types.RtGeometry, prim: types.RtPrim, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: ?*const [4]u64) ?dag.DagHit {
+pub fn traceSubtree(g: *const types.RtGeometry, prim: types.RtPrim, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: ?*const [4]u64, cut: ?*const [4]u64) ?dag.DagHit {
     const cell = unpackCell(prim.cell);
     const shift: u5 = @intCast(g.rt_log2);
     const base = [3]u32{ cell[0] << shift, cell[1] << shift, cell[2] << shift };
@@ -35,8 +35,8 @@ pub fn traceSubtree(g: *const types.RtGeometry, prim: types.RtPrim, o: Vec3, d: 
         .log2_size = g.rt_log2,
         .default_attribute = g.default_attribute,
     };
-    const hit = if (skip) |m|
-        dag.traceSkipping(&sub, o - origin, d, tmin, tmax, want_attribute, m)
+    const hit = if (skip != null or cut != null)
+        dag.traceSkipping(&sub, o - origin, d, tmin, tmax, want_attribute, skip, cut, .{ @intCast(base[0]), @intCast(base[1]), @intCast(base[2]) })
     else
         dag.trace(&sub, o - origin, d, tmin, tmax, want_attribute);
     var h = hit orelse return null;

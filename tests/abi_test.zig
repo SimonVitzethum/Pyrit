@@ -45,7 +45,6 @@ test "Strukturlayouts" {
     try expectSameLayout(api.Stats, c.PyrStats);
     try expectSameLayout(types.ChunkKey, c.PyrChunkKey);
     try expectSameLayout(types.WorldGenParams, c.PyrWorldGenParams);
-    try expectSameLayout(types.TerrainParams, c.PyrTerrainInfo);
     try expectSameLayout(api.WorldInfo, c.PyrWorldInfo);
     try expectSameLayout(api.WorldStats, c.PyrWorldStats);
     try expectSameLayout(types.FrameGenParams, c.PyrFrameGenParams);
@@ -107,6 +106,8 @@ test "Konstanten" {
         .{ types.tonemap_aces, c.PYR_TONEMAP_ACES },
         .{ types.tonemap_reinhard, c.PYR_TONEMAP_REINHARD },
         .{ types.tonemap_none, c.PYR_TONEMAP_NONE },
+        .{ types.tonemap_aces_fitted, c.PYR_TONEMAP_ACES_FITTED },
+        .{ types.tonemap_neutral, c.PYR_TONEMAP_NEUTRAL },
     };
     inline for (pairs) |p| try testing.expectEqual(@as(i64, p[0]), @as(i64, p[1]));
     try testing.expectEqual(types.flt_max, c.PYR_FLT_MAX);
@@ -130,5 +131,5 @@ test "Funktionssignaturen" {
         try testing.expectEqual(@sizeOf(cf.return_type.?), @sizeOf(zf.return_type.?));
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 71), count);
+    try testing.expectEqual(@as(usize, 69), count);
 }

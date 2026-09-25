@@ -8,6 +8,7 @@ const std = @import("std");
 //   zig build test            Unit-, CPU- und ABI-Tests, AMD-Übersetzung (ohne GPU)
 //   zig build kernel-check    PTX mit ptxas für sm_120 prüfen (braucht CUDA, keine GPU)
 //   zig build gpu-test        GPU gegen CPU-Referenz (braucht eine freie NVIDIA-GPU)
+//   zig build demo            Demo: Minecraft-artige Welt im Zuschauermodus
 //   zig build --release=fast  optimiert
 
 pub fn build(b: *std.Build) void {
@@ -51,6 +52,18 @@ pub fn build(b: *std.Build) void {
     rt_to_ptx.addArg("-o");
     const rt_ptx = rt_to_ptx.addOutputFileArg("pyrit_rt.ptx");
     b.getInstallStep().dependOn(&b.addInstallFile(rt_ptx, "share/pyrit/pyrit_rt.ptx").step);
+    // Kernel der Demo (Geländegenerator): derselbe Weg, eigenes Modul. Pyrit
+    // kennt ihn nicht – die Demo lädt ihn selbst und hängt ihn über
+    // PyrWorldInfo.generate ein.
+    const demo_nv = b.addObject(.{ .name = "demo_kernels", .root_module = kernelModuleFrom(b, nvptx, "demo/kernels.zig") });
+    const run_demo_fixup = b.addRunArtifact(fixup);
+    run_demo_fixup.addFileArg(demo_nv.getEmittedLlvmIr());
+    const demo_ir = run_demo_fixup.addOutputFileArg("demo_kernels.ll");
+    const demo_to_ptx = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", "nvptx64-cuda", b.fmt("-mcpu={s}", .{ptx_arch}), "-O3", "-S", "-Wno-unused-command-line-argument" });
+    demo_to_ptx.addFileArg(demo_ir);
+    demo_to_ptx.addArg("-o");
+    const demo_ptx = demo_to_ptx.addOutputFileArg("demo_kernels.ptx");
+
     // ------------------------------------------------------------------
     // Optional: NVIDIA DLSS (Super Resolution, Ray Reconstruction) über NGX-CUDA.
     // Das SDK (github.com/NVIDIA/DLSS) wird nicht mitgeliefert: Header werden
@@ -107,7 +120,7 @@ pub fn build(b: *std.Build) void {
     const unit = b.addTest(.{ .root_module = hostModule(b, target, optimize, ptx_files) });
     test_step.dependOn(&b.addRunArtifact(unit).step);
 
-    const cpu = b.addTest(.{ .root_module = testModule(b, "tests/cpu_test.zig", target, optimize, ptx_files) });
+    const cpu = b.addTest(.{ .root_module = demoUserModule(b, "tests/cpu_test.zig", target, optimize, ptx_files, demo_ptx) });
     test_step.dependOn(&b.addRunArtifact(cpu).step);
 
     const tc = b.addTranslateC(.{ .root_source_file = b.path("include/pyrit.h"), .target = target, .optimize = optimize });
@@ -146,21 +159,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(fixup_test).step);
 
     // Render-Werkzeug: zig build render -- [--vox datei.vox] [--out bild.ppm] ...
-    const render_exe = b.addExecutable(.{ .name = "pyrit-render", .root_module = testModule(b, "tools/pyrit_render.zig", target, optimize, ptx_files) });
+    // Der Weltmodus rendert die Welt der Demo.
+    const render_exe = b.addExecutable(.{ .name = "pyrit-render", .root_module = demoUserModule(b, "tools/pyrit_render.zig", target, optimize, ptx_files, demo_ptx) });
     b.installArtifact(render_exe);
     const run_render = b.addRunArtifact(render_exe);
     if (b.args) |a| run_render.addArgs(a);
     b.step("render", "Bild rendern (GPU): zig build render -- --out bild.ppm").dependOn(&run_render.step);
 
-    // Interaktiver Betrachter (Wayland-Fenster, dynamisch geladen)
-    const view_exe = b.addExecutable(.{ .name = "pyrit-view", .root_module = testModule(b, "tools/pyrit_view.zig", target, optimize, ptx_files) });
-    b.installArtifact(view_exe);
-    const run_view = b.addRunArtifact(view_exe);
-    if (b.args) |a| run_view.addArgs(a);
-    b.step("view", "Welt interaktiv ansehen: zig build view -- --size 1280x720").dependOn(&run_view.step);
+    // Demo: Minecraft-artige Welt, Zuschauermodus (Wayland-Fenster, dynamisch
+    // geladen) oder Aufnahme ohne Fenster (--record)
+    const demo_mod = testModule(b, "demo/main.zig", target, optimize, ptx_files);
+    demo_mod.addAnonymousImport("demo_ptx", .{ .root_source_file = demo_ptx });
+    const demo_exe = b.addExecutable(.{ .name = "pyrit-demo", .root_module = demo_mod });
+    b.installArtifact(demo_exe);
+    const run_demo = b.addRunArtifact(demo_exe);
+    if (b.args) |a| run_demo.addArgs(a);
+    b.step("demo", "Demo starten: zig build demo -- --size 1280x720").dependOn(&run_demo.step);
 
     // GPU-Test: nur auf ausdrücklichen Aufruf
-    const gpu_test = b.addExecutable(.{ .name = "pyrit-gpu-test", .root_module = testModule(b, "tests/gpu_test.zig", target, optimize, ptx_files) });
+    const gpu_test = b.addExecutable(.{ .name = "pyrit-gpu-test", .root_module = demoUserModule(b, "tests/gpu_test.zig", target, optimize, ptx_files, demo_ptx) });
     const gpu_step = b.step("gpu-test", "GPU gegen CPU-Referenz und Durchsatz (braucht eine freie NVIDIA-GPU)");
     gpu_step.dependOn(&b.addRunArtifact(gpu_test).step);
     const gpu_build = b.step("gpu-test-build", "GPU-Test nur bauen");
@@ -229,5 +246,21 @@ fn testModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget,
     const device = deviceModule(b, target, optimize);
     m.addImport("pyrit_device", device);
     m.addImport("pyrit", hostModuleWith(b, target, optimize, ptx, device));
+    return m;
+}
+
+/// Wie testModule, dazu die Szene der Demo als Modul "demo" – mit denselben
+/// Instanzen von pyrit und pyrit_device, sonst wären die Typen verschieden.
+fn demoUserModule(b: *std.Build, path: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, ptx: PtxFiles, demo_ptx: std.Build.LazyPath) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize, .link_libc = true });
+    const device = deviceModule(b, target, optimize);
+    const host = hostModuleWith(b, target, optimize, ptx, device);
+    m.addImport("pyrit_device", device);
+    m.addImport("pyrit", host);
+    const demo = b.createModule(.{ .root_source_file = b.path("demo/scene.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    demo.addImport("pyrit_device", device);
+    demo.addImport("pyrit", host);
+    demo.addAnonymousImport("demo_ptx", .{ .root_source_file = demo_ptx });
+    m.addImport("demo", demo);
     return m;
 }

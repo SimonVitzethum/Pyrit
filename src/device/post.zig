@@ -79,6 +79,45 @@ fn demodulate(color: V4, albedo: V4) V4 {
     return r;
 }
 
+/// Verlauf bikubisch (Catmull-Rom) an (px, py) in Pixelmitten-Koordinaten
+/// lesen. Bilineares Nachschlagen glättet bei jeder Bewegung ein wenig, und
+/// weil der Verlauf Frame für Frame neu nachgeschlagen wird, summiert sich das
+/// zu deutlicher Unschärfe (gemessen: rund 40 % weniger Schärfe nach zehn
+/// Frames Flug). Catmull-Rom erhält die Details. Randpixel werden geklemmt.
+fn historyCubic(p: *const types.PostParams, px: f32, py: f32) [3]f32 {
+    const fx0 = @floor(px);
+    const fy0 = @floor(py);
+    const tx = px - fx0;
+    const ty = py - fy0;
+    const wx = [4]f32{
+        tx * (-0.5 + tx * (1 - 0.5 * tx)),
+        1 + tx * tx * (-2.5 + 1.5 * tx),
+        tx * (0.5 + tx * (2 - 1.5 * tx)),
+        tx * tx * (-0.5 + 0.5 * tx),
+    };
+    const wy = [4]f32{
+        ty * (-0.5 + ty * (1 - 0.5 * ty)),
+        1 + ty * ty * (-2.5 + 1.5 * ty),
+        ty * (0.5 + ty * (2 - 1.5 * ty)),
+        ty * ty * (-0.5 + 0.5 * ty),
+    };
+    const ix: i32 = @intFromFloat(fx0);
+    const iy: i32 = @intFromFloat(fy0);
+    const wm: i32 = @intCast(p.width - 1);
+    const hm: i32 = @intCast(p.height - 1);
+    var out: [3]f32 = .{ 0, 0, 0 };
+    inline for (0..4) |b| {
+        const sy: u64 = @intCast(@min(@max(iy + @as(i32, b) - 1, 0), hm));
+        inline for (0..4) |a| {
+            const sx: u64 = @intCast(@min(@max(ix + @as(i32, a) - 1, 0), wm));
+            const c = ldh(p.hist_color, sy * p.width + sx);
+            const w = wx[a] * wy[b];
+            inline for (0..3) |k| out[k] += c[k] * w;
+        }
+    }
+    return out;
+}
+
 pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
     const w = p.width;
     const h = p.height;
@@ -105,6 +144,13 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
         const fy = py - fy0;
         const hit = isHit(n);
         var wsum: f32 = 0;
+        // Alle vier Nachbarn gültig und auf derselben Fläche? Dann darf
+        // bikubisch nachgeschlagen werden (siehe historyCubic). Auch über
+        // Flächenkanten hinweg wurde gemessen: schlechter (Fehler gegen die
+        // Referenz 3,8 -> 4,3 %).
+        var all_same: u32 = 0;
+        var lo: [3]f32 = .{ 65504, 65504, 65504 };
+        var hi: [3]f32 = .{ -65504, -65504, -65504 };
         inline for (0..4) |k| {
             const tx = fx0 + @as(f32, @floatFromInt(k & 1));
             const ty = fy0 + @as(f32, @floatFromInt(k >> 1));
@@ -135,8 +181,13 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
                     same_face = true;
                 }
                 if (vw > 0 and !same_face) edge_w += bw;
+                if (vw >= 0.999 and same_face) all_same += 1;
                 if (vw > 0) {
                     const c = ldh(p.hist_color, j);
+                    inline for (0..3) |q| {
+                        lo[q] = @min(lo[q], c[q]);
+                        hi[q] = @max(hi[q], c[q]);
+                    }
                     const bwv = bw * vw;
                     inline for (0..4) |q| hist[q] += c[q] * bwv;
                     if (p.hist_moments != 0) {
@@ -154,6 +205,14 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
             inline for (0..4) |q| hist[q] /= wsum;
             hmom[0] /= wsum;
             hmom[1] /= wsum;
+            // Nur wenn sich wirklich etwas bewegt: bei stehendem Bild trifft
+            // die Reprojektion die Pixelmitte, dann ist bilinear exakt.
+            const moving = @abs(fx - @round(fx)) > 0.01 or @abs(fy - @round(fy)) > 0.01;
+            if (all_same == 4 and moving and hit) {
+                const cr = historyCubic(p, px, py);
+                // Überschwinger auf den Bereich der vier Nachbarn begrenzen
+                inline for (0..3) |q| hist[q] = @min(@max(cr[q], lo[q]), hi[q]);
+            }
         }
     }
 
@@ -203,9 +262,24 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
         out = .{ cur[0], cur[1], cur[2], 1 };
     } else {
         if (p.clamp_sigma > 0) {
-            // Varianzbegrenzung gegen Nachziehen (TAA)
-            inline for (0..3) |k| {
-                hist[k] = @min(@max(hist[k], mean[k] - p.clamp_sigma * sd[k]), mean[k] + p.clamp_sigma * sd[k]);
+            // Varianzbegrenzung gegen Nachziehen (TAA) – nur bei Bewegung.
+            //
+            // Steht das Bild, ist die Reprojektion exakt und der Verlauf kann
+            // gar nicht nachziehen. Die Grenze misst sich dann aber an der
+            // 3x3-Umgebung *eines* verrauschten Frames: sie reißt den gut
+            // gemittelten Verlauf jeden Frame ein Stück zum Rauschen zurück.
+            // Gemessen war das bei stehender Kamera die Hauptquelle der
+            // Unruhe (0,48 % unruhige Pixel mit Grenze, 0,015 % ohne). Deshalb
+            // öffnet sie sich unter 1/10 Pixel Bewegung ganz und greift erst ab
+            // einem Pixel je Frame voll.
+            const mv = @as([*]const [2]f32, @ptrFromInt(p.motion))[i];
+            const speed = @sqrt(mv[0] * mv[0] + mv[1] * mv[1]);
+            const t = @min(@max((speed - 0.1) / 0.9, 0), 1);
+            if (t > 0) {
+                const sigma = p.clamp_sigma / t;
+                inline for (0..3) |k| {
+                    hist[k] = @min(@max(hist[k], mean[k] - sigma * sd[k]), mean[k] + sigma * sd[k]);
+                }
             }
         }
         // Stammt der Verlauf von einer anderen Fläche, liegt das Pixel auf
@@ -218,9 +292,29 @@ pub fn temporal(p: *const types.PostParams, x: u32, y: u32) void {
         // genau den Deckungsgrad der beiden Flächen, also saubere
         // Kantenglättung. Erst bei Bewegung muss sie kurz werden.
         var limit = 1.0 / @max(p.alpha_min, 1e-4);
+        const mv = @as([*]const [2]f32, @ptrFromInt(p.motion))[i];
+        const speed = @sqrt(mv[0] * mv[0] + mv[1] * mv[1]);
+        // Steht das Bild, ist die Reprojektion exakt: dann darf der Verlauf
+        // länger werden (bis gut dreimal so lang). Das Restrauschen der
+        // indirekten Beleuchtung sinkt damit um fast die Hälfte, ohne dass
+        // bei Bewegung irgendetwas nachzieht – dort gilt wieder die Vorgabe.
+        const still = 1 - @min(@max((speed - 0.02) / 0.1, 0), 1);
+        limit *= 1 + 2.2 * still;
+        // Schnelle Bewegung: jedes Nachschlagen im Verlauf glättet ein wenig,
+        // lange Verläufe summieren das zu Unschärfe. Ab 2 Pixeln je Frame
+        // bleibt deshalb kaum Verlauf, dort trägt der räumliche Filter.
+        // Gemessen gegen die eingeschwungene Referenz (Flug, 10 Frames):
+        // halbiert 9,1 % Abweichung und 19 % Schärfeverlust, auf 5 % gekürzt
+        // 6,6 % und 6 % – das Rauschen im Einzelframe ist kleiner als der
+        // Fehler, den ein langer, verwischter Verlauf mitbringt.
+        const fast = @min(@max((speed - 0.5) / 1.5, 0), 1);
+        limit = @max(limit * (1 - 0.95 * fast), 1);
+        // Hinter Wasser und Glas: Spiegelung und Brechung bewegen sich nicht
+        // mit dem Untergrund, nach dessen Motion Vector reprojiziert wird, und
+        // Wellen ändern sich mit der Zeit. Lange gemittelt verschmierten die
+        // Spiegelungen; die Spiegelung selbst rauscht kaum, fünf Frames genügen.
+        if (meta & types.hit_through_transparent != 0) limit = @min(limit, 5);
         if (edge_w > 0.25) {
-            const mv = @as([*]const [2]f32, @ptrFromInt(p.motion))[i];
-            const speed = @sqrt(mv[0] * mv[0] + mv[1] * mv[1]);
             // unter 1/10 Pixel Bewegung: volle Mittelung, darüber gleitend
             // hinunter auf edge_frames
             const t = @min(@max((speed - 0.1) / 0.9, 0), 1);
@@ -328,6 +422,48 @@ pub fn atrous(p: *const types.PostParams, x: u32, y: u32) void {
     }
 }
 
+/// Tonemapping der ganzen Farbe. Die kanalweisen Kurven übersättigen helle
+/// Farben (ein grelles Grün bleibt grell, bis ein Kanal abschneidet); die
+/// angepasste ACES-Kurve mischt über ihre Eingangs- und Ausgangsmatrix zum
+/// Weiß hin, wie Film es tut.
+pub fn tonemap(c: [3]f32, mode: u32) [3]f32 {
+    if (mode == types.tonemap_neutral) return tonemapNeutral(c);
+    if (mode != types.tonemap_aces_fitted) {
+        return .{ tonemapChannel(c[0], mode), tonemapChannel(c[1], mode), tonemapChannel(c[2], mode) };
+    }
+    const in_m = [3][3]f32{ .{ 0.59719, 0.35458, 0.04823 }, .{ 0.07600, 0.90834, 0.01566 }, .{ 0.02840, 0.13383, 0.83777 } };
+    const out_m = [3][3]f32{ .{ 1.60475, -0.53108, -0.07367 }, .{ -0.10208, 1.10813, -0.00605 }, .{ -0.00327, -0.07276, 1.07602 } };
+    var v: [3]f32 = undefined;
+    inline for (0..3) |r| v[r] = in_m[r][0] * c[0] + in_m[r][1] * c[1] + in_m[r][2] * c[2];
+    inline for (0..3) |k| {
+        const x = @max(v[k], 0);
+        v[k] = (x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081);
+    }
+    var o: [3]f32 = undefined;
+    inline for (0..3) |r| o[r] = @min(@max(out_m[r][0] * v[0] + out_m[r][1] * v[1] + out_m[r][2] * v[2], 0), 1);
+    return o;
+}
+
+/// Khronos PBR Neutral. ACES hat einen starken Fuß: ein Schatten, der im
+/// Licht ein Fünftel der besonnten Fläche hat, landete auf dem Schirm bei
+/// einem Achtundzwanzigstel – fast schwarz. Diese Kurve lässt alles unter
+/// 0,76 unverändert und rollt nur die Lichter ab.
+fn tonemapNeutral(c: [3]f32) [3]f32 {
+    const start = 0.8 - 0.04;
+    const desat = 0.15;
+    const x = @min(@min(c[0], c[1]), c[2]);
+    const offset = if (x < 0.08) x - 6.25 * x * x else 0.04;
+    var v = [3]f32{ c[0] - offset, c[1] - offset, c[2] - offset };
+    const peak = @max(@max(v[0], v[1]), v[2]);
+    if (peak < start) return .{ @max(v[0], 0), @max(v[1], 0), @max(v[2], 0) };
+    const d = 1 - start;
+    const new_peak = 1 - d * d / (peak + d - start);
+    inline for (0..3) |k| v[k] *= new_peak / peak;
+    const g = 1 - 1 / (desat * (peak - new_peak) + 1);
+    inline for (0..3) |k| v[k] = @min(@max(v[k] + (new_peak - v[k]) * g, 0), 1);
+    return v;
+}
+
 pub fn tonemapChannel(x: f32, mode: u32) f32 {
     return switch (mode) {
         types.tonemap_aces => @min(@max((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0), 1),
@@ -354,8 +490,9 @@ pub fn resolve(p: *const types.PostParams, x: u32, y: u32) void {
     }
     if (p.out_ldr != 0) {
         var px: [4]u8 = undefined;
+        const tm = tonemap(.{ @max(hdr[0] * p.exposure, 0), @max(hdr[1] * p.exposure, 0), @max(hdr[2] * p.exposure, 0) }, p.tonemap);
         inline for (0..3) |k| {
-            const v = linearToSrgb(tonemapChannel(@max(hdr[k] * p.exposure, 0), p.tonemap));
+            const v = linearToSrgb(tm[k]);
             px[if (p.bgra != 0) 2 - k else k] = @intFromFloat(@min(@max(v * 255.0 + 0.5, 0), 255));
         }
         px[3] = 255;

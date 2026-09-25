@@ -52,23 +52,37 @@ git clone --depth 1 https://github.com/NVIDIA/DLSS.git
 zig build -Ddlss-sdk=$PWD/DLSS
 ```
 
-## Tools
+## Demo and tools
 
 ```sh
+zig build demo   -- --size 1280x720
+zig build demo   -- --record frames --still 10 --move 10 --reference 48
 zig build render -- --world --size 1920x1080 --frames 30 --out image.ppm
-zig build view   -- --size 1280x720
 ```
 
-`pyrit-view` is a viewer with **no graphics API at all**: Pyrit renders into a
-CUDA buffer, the viewer copies it into a shared-memory buffer and shows it over
-**Wayland** (xdg-shell). `libwayland-client` is loaded dynamically and the
-xdg-shell tables live in `tools/wayland.zig`. Controls: W/A/S/D to move, mouse
-drag to look, space to rise, Q/E to roll the sun, +/− to change the target voxel
-size.
+`pyrit-demo` is a Minecraft-like world, generated on the GPU by its own CUDA
+kernel written in Zig (`demo/terrain.zig`, `demo/kernels.zig`), with 1024 chunks
+of view distance. Pyrit itself has no built-in terrain: the demo plugs its
+generator in through `PyrWorldInfo.generate`, like any application would. The
+sky is computed by single scattering in the atmosphere (`demo/sky.zig`).
 
-`pyrit-render` also measures: `--profile` breaks the frame time down, `--flicker`
-measures temporal flicker, `--turn` rotates the camera along the test flight and
-`--view` sets the view distance.
+The window uses **no graphics API at all**: Pyrit renders into a CUDA buffer,
+the demo copies it into a shared-memory buffer and shows it over **Wayland**
+(xdg-shell). `libwayland-client` is loaded dynamically and the xdg-shell tables
+live in `demo/wayland.zig`. Controls (spectator mode): W/S fly along the view
+direction, A/D strafe, space up, shift down, ctrl faster, mouse drag to look,
+Q/E to roll the sun, +/− to change the target voxel size.
+
+`--record` renders without a window: first frames to settle, then still frames,
+then frames in flight, all written as PPM. `--reference N` additionally renders
+a converged reference for every frame in flight and reports how far the moving
+image deviates from it (with difference maps) — the measure for smearing,
+lag and "wandering" shadows during motion.
+
+`pyrit-render --world` renders the same world and measures: `--profile` breaks
+the frame time down, `--flicker` measures temporal flicker, `--seq` writes every
+frame, `--turn` rotates the camera along the test flight and `--view` sets the
+view distance.
 
 ## Documentation
 

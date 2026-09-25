@@ -26,30 +26,6 @@ fn oom(v: anytype) Error!@typeInfo(@TypeOf(v)).error_union.payload {
     return v catch return fail(error.OutOfMemory, "Host-Speicher", .{});
 }
 
-pub fn defaultTerrain() types.TerrainParams {
-    return .{
-        .seed = 1,
-        .octaves = 11,
-        .base_height = 40,
-        .amplitude = 620,
-        .wavelength = 3200,
-        .sea_level = 56,
-        .snow_height = 430,
-        .rock_slope = 1.1,
-        .attr_grass = 0,
-        .attr_dirt = 0,
-        .attr_rock = 0,
-        .attr_snow = 0,
-        .attr_sand = 0,
-        // Wasser und Bäume: 0 lässt sie weg. Die Materialien legt die
-        // Anwendung an (Wasser mit PYR_MATERIAL_TRANSPARENT).
-        .attr_water = 0,
-        .attr_leaves = 0,
-        .attr_wood = 0,
-        .tree_density = 0.004,
-    };
-}
-
 const Chunk = struct {
     key: Key,
     geometry: usize,
@@ -116,9 +92,8 @@ pub const World = struct {
     capacity: u32,
     mask: u32,
     rt_log2: u32,
-    generate: api.WorldGenFn,
+    generate: *const fn (user: ?*anyopaque, params: *const types.WorldGenParams, stream: ?*anyopaque) callconv(.c) void,
     user: ?*anyopaque,
-    terrain: types.TerrainParams,
 
     // Gerätepuffer (bleiben über alle Updates)
     keys_dev: cuda.CUdeviceptr = 0,
@@ -195,6 +170,10 @@ pub const World = struct {
     voxel_slots: u64 = 0,
     /// letzter Zustand, um unveränderte Frames zu erkennen
     last_cam: [3]f64 = .{ std.math.nan(f64), 0, 0 },
+    /// Seit dem letzten Planerlauf ist ein Auftrag fertig geworden. Dann muss
+    /// der Planer noch einmal laufen: erst mit den neuen Chunks kennt er die
+    /// nächstfeinere Stufe darunter.
+    replan: bool = true,
     last_refine_k: f64 = 0,
     quiet_frames: u64 = 0,
     /// Zeiten im Auftrag (nur mit PYRIT_WORLD_PROFILE)
@@ -216,14 +195,9 @@ pub const World = struct {
         if (max_lod > 20) return fail(error.InvalidArgument, "max_lod höchstens 20", .{});
         const voxel_px: f64 = if (info.voxel_pixels > 0) info.voxel_pixels else 4;
         const view_distance: f64 = if (info.view_distance > 0) info.view_distance else 16384;
-        const terrain = if (info.terrain) |t| t.* else defaultTerrain();
-        var y_min = info.y_min;
-        var y_max = info.y_max;
-        if (y_min == 0 and y_max == 0) {
-            if (info.generate != null) return fail(error.InvalidArgument, "mit eigenem Generator y_min/y_max angeben", .{});
-            y_min = @intFromFloat(@floor(terrain.base_height - 16));
-            y_max = @intFromFloat(@ceil(terrain.base_height + terrain.amplitude * 1.6 + 16));
-        }
+        const generate = info.generate orelse return fail(error.InvalidArgument, "generate fehlt: Pyrit bringt kein Gelände mit, die Anwendung liefert den Generator", .{});
+        const y_min = info.y_min;
+        const y_max = info.y_max;
         if (y_max <= y_min) return fail(error.InvalidArgument, "y_max muss größer als y_min sein", .{});
         const n: u32 = @as(u32, 1) << @intCast(cl);
         // Wie viele Chunks ein Auftrag umfasst, bestimmt, wie schnell eine
@@ -263,9 +237,8 @@ pub const World = struct {
             .capacity = cap,
             .mask = if (info.mask == 0) 0x1 else info.mask,
             .rt_log2 = rt_log2,
-            .generate = info.generate,
+            .generate = generate,
             .user = info.user,
-            .terrain = terrain,
             .voxel_pixels = voxel_px,
             .secondary_mask = info.secondary_mask,
             .secondary_factor = if (info.secondary_pixels > 0) @as(f64, info.secondary_pixels) / voxel_px else 4,
@@ -571,6 +544,7 @@ pub const World = struct {
             std.mem.eql(f64, &origin, &self.origin) and
             self.plan.cfg.refine_k == self.last_refine_k;
         const quiet = same_view and
+            !self.replan and
             self.job_idle and
             self.dirty.items.len == 0 and
             self.stats.pending_chunks == 0;
@@ -596,6 +570,7 @@ pub const World = struct {
         // Chunks blieben dann dauerhaft offen). Übersprungen wird nur der
         // vollständig ruhende Frame weiter oben.
         try oom(self.plan.update(camera));
+        self.replan = false;
         self.lap(1, &t0); // Planer
         self.stats.built_chunks = 0;
         self.stats.built_voxels = 0;
@@ -884,15 +859,7 @@ pub const World = struct {
                 .reserved = 0,
                 .user = @intFromPtr(self.user),
             };
-            if (self.generate) |gen| {
-                gen(self.user, &gp, @ptrCast(aux));
-            } else {
-                var tp = self.terrain;
-                const threads = k << @intCast(2 * self.chunk_log2);
-                const params = [_]?*anyopaque{ @ptrCast(&gp), @ptrCast(&tp) };
-                const b = types.gen_block;
-                try ctx.check(ctx.drv.cuLaunchKernel(ctx.fn_gen_terrain, (threads + b - 1) / b, 1, 1, b, 1, 1, 0, aux, @constCast(&params), null), "cuLaunchKernel(Gelände)");
-            }
+            self.generate(self.user, &gp, @ptrCast(aux));
 
             // 2. Belegung lesen. Passt ein Chunk nicht in die Kapazität, wird
             //    sie erhöht und der Auftrag wiederholt – abgeschnitten wird nie.
@@ -959,6 +926,7 @@ pub const World = struct {
 
     /// Hauptthread: Ergebnis übernehmen
     fn finishJob(self: *World) Error!void {
+        self.replan = true;
         const ctx = self.ctx;
         const k = self.job_count;
         self.job_idle = true;

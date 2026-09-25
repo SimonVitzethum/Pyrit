@@ -10,7 +10,7 @@ const std = @import("std");
 
 pub const size: u32 = 32;
 
-pub const Kind = enum { grass, rock, sand, snow, wood, leaves };
+pub const Kind = enum { grass, rock, sand, snow, wood, leaves, dirt, gravel };
 
 fn hash(x: u32, y: u32, s: u32) u32 {
     var h: u32 = x *% 0x8da6b343 +% y *% 0xd8163841 +% s *% 0xcb1ab31f;
@@ -61,7 +61,7 @@ pub fn make(kind: Kind, out: []u8) void {
                     // kurze senkrechte Halme: feines Rauschen, in y gestreckt
                     const blade = rnd(x, y / 3, 11);
                     const patch = smooth(x, y, 12, 8);
-                    const v = 0.80 + blade * 0.28 + patch * 0.16;
+                    const v = 0.70 + blade * 0.38 + patch * 0.20;
                     r = v * 0.92;
                     g = v;
                     b = v * 0.72;
@@ -86,10 +86,11 @@ pub fn make(kind: Kind, out: []u8) void {
                     b = v * 0.93;
                 },
                 .snow => {
-                    // fast gleichmäßig, einzelne glitzernde Körner
+                    // verwehte Mulden und einzelne glitzernde Körner
                     const n = smooth(x, y, 16, 8);
-                    const spark: f32 = if (rnd(x, y, 17) > 0.985) 1.18 else 1.0;
-                    const v = (0.94 + n * 0.10) * spark;
+                    const drift = smooth(x, y, 18, 16);
+                    const spark: f32 = if (rnd(x, y, 17) > 0.985) 1.15 else 1.0;
+                    const v = (0.84 + n * 0.14 + drift * 0.12) * spark;
                     r = v * 0.99;
                     g = v * 0.995;
                     b = v;
@@ -105,6 +106,25 @@ pub fn make(kind: Kind, out: []u8) void {
                     g = v * 0.92;
                     b = v * 0.84;
                 },
+                .dirt => {
+                    // Erde: Krümel, dazwischen einzelne helle Steinchen
+                    const n = smooth(x, y, 22, 8);
+                    const fine = rnd(x, y, 23);
+                    const pebble: f32 = if (rnd(x / 2, y / 2, 24) > 0.94) 1.2 else 1.0;
+                    const v = (0.80 + n * 0.20 + fine * 0.14) * pebble;
+                    r = v;
+                    g = v * 0.97;
+                    b = v * 0.93;
+                },
+                .gravel => {
+                    // Kies: grobe, deutlich verschieden helle Körner
+                    const stone = rnd(x / 3, y / 3, 25);
+                    const edge: f32 = if (x % 3 == 0 or y % 3 == 0) 0.82 else 1.0;
+                    const v = (0.70 + stone * 0.45) * edge;
+                    r = v;
+                    g = v * 0.98;
+                    b = v * 0.96;
+                },
                 .leaves => {
                     // Büschel: grobe Flecken, dazwischen dunkle Lücken
                     const clump = smooth(x, y, 20, 8);
@@ -115,6 +135,73 @@ pub fn make(kind: Kind, out: []u8) void {
                     g = v;
                     b = v * 0.70;
                 },
+            }
+            // Die Faktoren liegen um 1 und reichen bis gut 1,2. Ohne diese
+            // Skalierung wurde alles über 1 bei 255 abgeschnitten – genau die
+            // helle Hälfte der Zeichnung ging verloren, Gras wirkte flach.
+            const k: f32 = 0.82;
+            const o = (yy * size + xx) * 4;
+            out[o + 0] = @intFromFloat(@min(@max(r * k * 255, 0), 255));
+            out[o + 1] = @intFromFloat(@min(@max(g * k * 255, 0), 255));
+            out[o + 2] = @intFromFloat(@min(@max(b * k * 255, 0), 255));
+            out[o + 3] = 255;
+        }
+    }
+}
+
+/// Normalentextur zu einer Kachel: die Helligkeit gilt als Höhe (hell =
+/// erhaben), ihre Steigung wird in Rot (u) und Grün (v) um 128 abgelegt.
+/// Fugen im Stein, Halme im Gras und Rinde fangen damit das Streiflicht.
+pub fn normalMap(tile: []const u8, out: []u8, strength: f32) void {
+    const n = size;
+    for (0..n) |yy| {
+        for (0..n) |xx| {
+            const h = struct {
+                fn at(t: []const u8, x: usize, y: usize) f32 {
+                    const o = ((y % size) * size + (x % size)) * 4;
+                    return (0.2126 * @as(f32, @floatFromInt(t[o])) + 0.7152 * @as(f32, @floatFromInt(t[o + 1])) + 0.0722 * @as(f32, @floatFromInt(t[o + 2]))) / 255.0;
+                }
+            }.at;
+            const du = (h(tile, xx + 1, yy) - h(tile, xx + n - 1, yy)) * strength;
+            const dv = (h(tile, xx, yy + 1) - h(tile, xx, yy + n - 1)) * strength;
+            const o = (yy * n + xx) * 4;
+            out[o + 0] = @intFromFloat(@min(@max(128 + du * 127, 0), 255));
+            out[o + 1] = @intFromFloat(@min(@max(128 + dv * 127, 0), 255));
+            out[o + 2] = 255;
+            out[o + 3] = 255;
+        }
+    }
+}
+
+/// Seite eines Grasblocks: Erde, oben ein ausgefranster Grasrand. Anders als
+/// die übrigen Kacheln trägt sie ihre Farbe selbst (Material.side_color =
+/// 1,1,1), als lineares Albedo: Erde um 0,17/0,10/0,05, Gras um 0,05/0,10/0,02.
+/// Zeile size-1 liegt oben am Block.
+pub fn grassSide(out: []u8) void {
+    std.debug.assert(out.len >= size * size * 4);
+    for (0..size) |yy| {
+        for (0..size) |xx| {
+            const x: u32 = @intCast(xx);
+            const y: u32 = @intCast(yy);
+            // Tiefe des Grasrands je Spalte: 3 bis 7 Zeilen, ausgefranst
+            const fringe: u32 = 3 + @as(u32, @intFromFloat(rnd(x, 0, 31) * 3.0)) + @as(u32, @intFromFloat(smooth(x, 0, 32, 8) * 2.0));
+            const from_top = size - 1 - y;
+            const n = smooth(x, y, 33, 8);
+            const fine = rnd(x, y, 34);
+            var r: f32 = undefined;
+            var g: f32 = undefined;
+            var b: f32 = undefined;
+            if (from_top < fringe) {
+                const v = 0.8 + fine * 0.35 + n * 0.15;
+                r = 0.048 * v;
+                g = 0.098 * v;
+                b = 0.022 * v;
+            } else {
+                const pebble: f32 = if (rnd(x / 2, y / 2, 35) > 0.93) 1.35 else 1.0;
+                const v = (0.78 + n * 0.3 + fine * 0.2) * pebble;
+                r = 0.17 * v;
+                g = 0.10 * v;
+                b = 0.052 * v;
             }
             const o = (yy * size + xx) * 4;
             out[o + 0] = @intFromFloat(@min(@max(r * 255, 0), 255));

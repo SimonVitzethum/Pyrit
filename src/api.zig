@@ -3,7 +3,7 @@
 const types = @import("pyrit_device").types;
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 1;
+pub const version_minor: u32 = 2;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Result = i32;
@@ -153,7 +153,7 @@ pub const PostInfo = extern struct {
     output_ldr: u64,
     /// 0 = 1
     exposure: f32,
-    /// tonemap_* (aces, reinhard, none)
+    /// tonemap_* (aces, reinhard, none, aces_fitted, neutral)
     tonemap: u32,
     /// Schritte des À-trous-Filters, 0 = kein räumlicher Filter
     denoise_iterations: u32,
@@ -228,7 +228,8 @@ pub const PostFx = extern struct {
     supersample: u32 = 0,
 };
 
-/// TAAU (auch ohne Skalierung: TAA mit Subpixel-Rekonstruktion)
+/// TAAU, wenn hochskaliert wird; bei gleicher Auflösung wie upscaler_none
+/// (ohne Jitter hätte TAA dort nichts zu rekonstruieren, es würde nur verwischen)
 pub const upscaler_auto: u32 = 0;
 /// direkt in Renderauflösung auflösen (ohne TAAU)
 pub const upscaler_none: u32 = 1;
@@ -288,7 +289,6 @@ pub const build_editable: u32 = 0x2;
 
 pub const ChunkKey = types.ChunkKey;
 pub const WorldGenParams = types.WorldGenParams;
-pub const TerrainInfo = types.TerrainParams;
 
 /// Eigener Generator: startet Kernel auf `stream`, die params.voxels/counts
 /// füllen (siehe PyrWorldGenParams). Läuft ganz auf der GPU; kein Warten nötig.
@@ -314,7 +314,7 @@ pub const WorldInfo = extern struct {
     /// Obergrenze für den Chunk-Speicher in Bytes; darüber wird die Welt
     /// gleitend gröber (die Zielgröße der Voxel wächst). 0 = 256 MiB.
     memory_budget: u64,
-    /// senkrechter Bereich in Grundvoxeln [y_min, y_max); beide 0 = aus dem Gelände
+    /// senkrechter Bereich in Grundvoxeln [y_min, y_max) (Pflicht)
     y_min: i32,
     y_max: i32,
     /// Chunks je pyr_world_update, 0 = 256 (bestimmt, wie schnell eine frisch
@@ -335,11 +335,10 @@ pub const WorldInfo = extern struct {
     /// Frames, die ein nicht mehr gebrauchter Chunk bleibt, 0 = 8
     keep_frames: u32,
     flags: u32,
-    /// null = eingebautes Gelände (terrain)
+    /// Generator der Anwendung (Pflicht). Pyrit bringt kein Gelände mit:
+    /// was in der Welt steht, entscheidet allein dieser Kernel.
     generate: WorldGenFn,
     user: ?*anyopaque,
-    /// null = Standardgelände
-    terrain: ?*const TerrainInfo,
 };
 
 /// Eine Änderung an der Welt: ein Grundvoxel setzen oder entfernen.

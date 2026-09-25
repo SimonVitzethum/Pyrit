@@ -37,6 +37,14 @@ pub const hit_new: u32 = 0x8;
 pub const hit_no_history: u32 = 0x10;
 /// Strahl beginnt in einem gefüllten Voxel: t = tmin, Fläche undefiniert
 pub const hit_inside: u32 = 0x20;
+/// Das Pixel sieht durch eine durchsichtige Fläche (Wasser, Glas): Spiegelung
+/// und Brechung bewegen sich anders als der Untergrund, dessen Motion Vector
+/// das Pixel trägt. Die zeitliche Mittelung bleibt dort kurz.
+pub const hit_through_transparent: u32 = 0x40;
+/// Bits 24..31: Durchlässigkeit des Dunsts bis zum Treffer (255 = klar).
+/// Intern für die indirekte Beleuchtung in halber Auflösung, die erst nach
+/// dem Dunst dazukommt und von ihm gedämpft werden muss.
+pub const hit_fog_shift: u5 = 24;
 
 pub const Hit = extern struct {
     /// Strahlparameter; flt_max bei Fehlschuss
@@ -147,6 +155,8 @@ pub const Scene = extern struct {
     lighting: u64,
     /// Bit je Material: gesetzt = material_transparent (für trace_skip_transparent)
     transparent_materials: [4]u64,
+    /// Bit je Material: gesetzt = material_cutout
+    cutout_materials: [4]u64,
     /// const TextureData[texture_count], 1-basiert angesprochen
     textures: u64,
     texture_count: u32,
@@ -174,6 +184,11 @@ pub const material_transparent: u32 = 0x4;
 /// Wellen: die Normale wird zeitabhängig gestört (Wasser). Die Geometrie
 /// bleibt stehen, damit Treffer, Tiefe und Motion Vectors exakt bleiben.
 pub const material_waves: u32 = 0x8;
+/// Durchbrochen (Laub): jede Voxelfläche trägt ein festes 4x4-Muster mit
+/// etwa 30 % Löchern. Strahlen, die ein Loch treffen, laufen durch den Voxel
+/// hindurch – auch Schattenstrahlen, das ergibt Lichtflecken am Boden. Das
+/// Muster hängt nur von Voxel, Fläche und Attribut ab: es rauscht nicht.
+pub const material_cutout: u32 = 0x10;
 /// höchstens so viele transparente Grenzflächen je Pixel
 pub const max_transparent_layers: u32 = 4;
 
@@ -213,7 +228,13 @@ pub const Material = extern struct {
     /// Stärke und Wellenlänge einer erzeugten Detailnormale (ohne Textur)
     normal_strength: f32,
     normal_scale: f32,
-    reserved: u32,
+    /// Seitenflächen (Normale waagerecht) nehmen diese Textur statt `texture`
+    /// – wie der Grasblock, dessen Seiten Erde mit Grasrand zeigen. 0 = wie
+    /// oben. Die Normalentextur gilt weiter für alle Flächen.
+    side_texture: u32,
+    /// Farbe (linear) der Seitenflächen statt der Voxelfarbe; {0,0,0} = die
+    /// Voxelfarbe behalten. Mit {1,1,1} trägt die Seitentextur die Farbe selbst.
+    side_color: [3]f32,
 };
 
 /// Eine Textur: dicht gepackte RGBA8-Zeilen. Gefiltert wird von Hand
@@ -334,6 +355,18 @@ pub const Lighting = extern struct {
     /// Sehr helle, sehr kleine Lichter liefern sonst vereinzelte Ausreißer,
     /// die jeden Frame woanders sitzen und sichtbar flimmern.
     firefly_clamp: f32,
+    /// Schatten von Wolken (oder anderem sehr Fernem): eine Textur, entlang
+    /// der Sonnenrichtung auf eine Ebene in Höhe `sun_shadow_height`
+    /// projiziert. Ihr Rotanteil dämpft das Sonnenlicht um bis zu
+    /// `sun_shadow_strength`. `sun_shadow_scale` Welteinheiten je
+    /// Texturwiederholung; `sun_shadow_offset` verschiebt das Muster in x/z,
+    /// damit es beim Nachführen des Render-Ursprungs an der Welt haften
+    /// bleibt (Ursprung modulo scale eintragen). 0 = keine.
+    sun_shadow_texture: u32,
+    sun_shadow_height: f32,
+    sun_shadow_scale: f32,
+    sun_shadow_strength: f32,
+    sun_shadow_offset: [2]f32,
     reserved: [1]u32,
     lights: [max_lights]Light,
 };
@@ -546,6 +579,13 @@ pub const PostParams = extern struct {
 pub const tonemap_aces: u32 = 0;
 pub const tonemap_reinhard: u32 = 1;
 pub const tonemap_none: u32 = 2;
+/// ACES RRT+ODT als Anpassung (Hill): wirkt auf die Farbe als Ganzes,
+/// entsättigt helle Farben zum Weiß hin und hat eine weiche Schulter
+pub const tonemap_aces_fitted: u32 = 3;
+/// Khronos PBR Neutral: bis 0,76 linear (kein Fuß, Schatten bleiben so hell,
+/// wie Albedo und Licht es sagen), darüber weich komprimiert und zum Weiß
+/// hin entsättigt
+pub const tonemap_neutral: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // DAG-Bau auf der GPU (src/device/gbuild.zig)
@@ -648,8 +688,6 @@ pub const WorldGenParams = extern struct {
     user: u64,
 };
 
-pub const gen_block: u32 = 128;
-
 /// Änderungen an einer gestreamten Welt (src/device/worldedit.zig).
 /// Die Einträge liegen je Chunk gruppiert, `edit_offsets` hat count+1 Werte;
 /// ein Eintrag ist [x, y, z, attribut] in Chunk-lokalen Koordinaten der Stufe,
@@ -667,36 +705,6 @@ pub const WorldEditParams = extern struct {
 };
 
 pub const edit_block: u32 = 128;
-
-/// Eingebauter Geländegenerator (Höhenfeld aus fBm-Rauschen); nur die Haut
-/// der Oberfläche wird erzeugt, das Innere bleibt leer.
-pub const TerrainParams = extern struct {
-    seed: u32,
-    octaves: u32,
-    /// Höhen in Grundvoxeln
-    base_height: f32,
-    amplitude: f32,
-    /// Wellenlänge der gröbsten Oktave in Grundvoxeln
-    wavelength: f32,
-    sea_level: f32,
-    snow_height: f32,
-    /// Steigung (Höhe/Breite), ab der Fels statt Gras entsteht
-    rock_slope: f32,
-    /// Attribute (0 = eingebaute Farbe mit Material 0)
-    attr_grass: u32,
-    attr_dirt: u32,
-    attr_rock: u32,
-    attr_snow: u32,
-    attr_sand: u32,
-    /// Wasser bis sea_level; 0 = kein Wasser. Das Material sollte
-    /// material_transparent tragen (sonst ist es undurchsichtig).
-    attr_water: u32,
-    /// Bäume: Blätter (0 = keine Vegetation) und Stamm
-    attr_leaves: u32,
-    attr_wood: u32,
-    /// Anteil der Spalten mit Baum (0..1), z. B. 0,004
-    tree_density: f32,
-};
 
 // ---------------------------------------------------------------------------
 // Hochskalieren (TAAU) und Frame Generation

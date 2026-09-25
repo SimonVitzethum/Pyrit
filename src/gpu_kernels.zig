@@ -120,13 +120,8 @@ export fn pyr_k_build(p: types.BuildParams) callconv(kernel) void {
 }
 
 // ---------------------------------------------------------------------------
-// Welt-Streaming: eingebauter Geländegenerator (Logik in src/device/worldgen.zig)
+// Welt-Streaming: den Generator bringt die Anwendung mit (PyrWorldInfo.generate)
 // ---------------------------------------------------------------------------
-
-export fn pyr_k_gen_terrain(g: types.WorldGenParams, t: types.TerrainParams) callconv(kernel) void {
-    const i = @workGroupId(0) * types.gen_block + @workItemId(0);
-    pyr.worldgen.terrainColumn(&g, &t, i);
-}
 
 export fn pyr_k_edit_apply(p: types.WorldEditParams) callconv(kernel) void {
     const i = @as(u64, @workGroupId(0)) * types.edit_block + @workItemId(0);

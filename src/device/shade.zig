@@ -210,7 +210,7 @@ pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3, footpr
     var sf = surface(s, attribute);
     const mats: [*]const types.Material = @ptrFromInt(s.materials);
     const m = &mats[attribute & 0xFF];
-    if (m.texture == 0 and m.normal_texture == 0 and m.normal_strength == 0) return sf;
+    if (m.texture == 0 and m.side_texture == 0 and m.normal_texture == 0 and m.normal_strength == 0) return sf;
 
     const scale = if (m.texture_scale > 0) m.texture_scale else 1;
     const uv = faceUv(p, n, scale);
@@ -222,7 +222,11 @@ pub fn surfaceAt(s: *const types.Scene, attribute: u32, p: Vec3, n: Vec3, footpr
         const idx = if (m.texture != 0) m.texture else m.normal_texture;
         if (idx < s.texture_count) tpp = footprint / scale * @as(f32, @floatFromInt(tt[idx].width));
     }
-    if (m.texture != 0) sf.albedo *= sampleTexture(s, m.texture, uv[0], uv[1], tpp);
+    // Seitenflächen: eigene Textur und Farbe (Grasblock: Erde mit Grasrand)
+    const side = m.side_texture != 0 and @abs(n[1]) < 0.5;
+    if (side and (m.side_color[0] != 0 or m.side_color[1] != 0 or m.side_color[2] != 0)) sf.albedo = m.side_color;
+    const tex = if (side) m.side_texture else m.texture;
+    if (tex != 0) sf.albedo *= sampleTexture(s, tex, uv[0], uv[1], tpp);
 
     // Detailnormale: aus der Normalentextur oder erzeugt
     var du: f32 = 0;
@@ -374,8 +378,20 @@ pub fn envSample(l: *const types.Lighting, r1: f32, r2: f32) EnvSample {
 }
 
 pub fn sky(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
-    if (hasEnv(l)) return envRadiance(l, d);
+    if (hasEnv(l)) return envRadiance(l, d) + (if (with_sun) sunDisk(l, d) else splat(0));
     return skyAnalytic(l, d, with_sun);
+}
+
+/// Sichtbare Sonnenscheibe der analytischen Sonne (auch vor einer
+/// Umgebungskarte: die Karte trägt dann nur den Himmel)
+fn sunDisk(l: *const types.Lighting, d: Vec3) Vec3 {
+    if (l.flags & types.lighting_sun_disk == 0) return splat(0);
+    const sd = vec.normalize(l.sun_direction);
+    if (vec.dot(d, sd) <= fm.cos(l.sun_angular_radius)) return splat(0);
+    const r = @max(l.sun_angular_radius, 1e-3);
+    // Strahldichte der Scheibe: Beleuchtungsstärke (π · sun_color) durch
+    // ihren Raumwinkel (π r²)
+    return @as(Vec3, l.sun_color) * splat(1.0 / (r * r));
 }
 
 fn skyAnalytic(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
@@ -396,7 +412,7 @@ fn skyAnalytic(l: *const types.Lighting, d: Vec3, with_sun: bool) Vec3 {
         const cos_r = fm.cos(l.sun_angular_radius);
         if (vec.dot(d, sd) > cos_r) {
             const r = @max(l.sun_angular_radius, 1e-3);
-            c += @as(Vec3, l.sun_color) * splat(1.0 / (pi * r * r));
+            c += @as(Vec3, l.sun_color) * splat(1.0 / (r * r));
         }
     }
     return c;
@@ -460,22 +476,40 @@ pub const Waves = struct {
 };
 
 pub fn waveNormal(s: *const types.Scene, m: *const types.Material, p: Vec3, n: Vec3, footprint: f32) Waves {
-    const wl = @max(m.wave_length, 1e-3);
-    const k = 6.2831853 / wl;
+    // Sechs gerichtete Wellen statt zwei: Längen fallen geometrisch ab, die
+    // Richtungen streuen um eine Windrichtung. Mit nur zwei Kosinuswellen
+    // entstand ein regelmäßiges Muster aus Ringen, das man auf offenem Meer
+    // sofort als künstlich erkennt. Die Neigung jeder Welle ist gleich
+    // (Höhe proportional zur Länge), so trägt jede Größe gleich zum Glanz bei.
+    // Tiefwasser: Phasengeschwindigkeit wächst mit der Wurzel der Länge.
+    const wl0 = @max(m.wave_length, 1e-3);
     const t: f32 = @floatCast(s.time);
-    const ph = k * m.wave_speed * wl * t;
-    // Höhe h(x, z) = A · (sin(k·x + φ) + sin(0.7·k·(x + z) + 1.3·φ))
-    // Deutlich früher ausblenden: schon wenn eine Welle nur noch acht Pixel
-    // breit ist, beginnt die Spiegelung zu sprenkeln.
-    const fade = if (footprint > 0) @min(@max(wl / (16 * footprint), 0), 1) else 1;
-    // Neigungsmaß der vollen Wellen; was `fade` davon wegnimmt, wird Rauheit.
-    const slope = m.wave_height * k;
-    const lost = @sqrt(@max(slope * slope * (1 - fade * fade), 0));
-    const extra = @min(0.5 * lost, 1);
-    if (fade <= 0.01) return .{ .normal = n, .roughness = extra };
-    const a = m.wave_height * fade;
-    const dhdx = a * k * (fm.cos(k * p[0] + ph) + 0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
-    const dhdz = a * k * (0.7 * fm.cos(0.7 * k * (p[0] + p[2]) + 1.3 * ph));
+    const lens = [6]f32{ 1.0, 0.61, 0.37, 0.23, 0.14, 0.087 };
+    const angles = [6]f32{ 0.0, 0.55, -0.4, 1.1, -0.95, 0.25 };
+    const offs = [6]f32{ 0.0, 1.7, 4.1, 2.3, 5.9, 3.3 };
+    const steep = m.wave_height * 6.2831853 / wl0 * 0.5;
+    var dhdx: f32 = 0;
+    var dhdz: f32 = 0;
+    var lost2: f32 = 0;
+    inline for (0..6) |w| {
+        const wl = wl0 * lens[w];
+        const k = 6.2831853 / wl;
+        // Ausblenden, sobald eine Welle nur noch wenige Pixel breit ist –
+        // die verlorene Neigung wird unten zu Rauheit.
+        const fade = if (footprint > 0) @min(@max(wl / (16 * footprint), 0), 1) else 1;
+        lost2 += steep * steep * (1 - fade * fade);
+        if (fade > 0.01) {
+            const dx = fm.cos(angles[w]);
+            const dz = fm.sin(angles[w]);
+            const c = m.wave_speed * wl0 * @sqrt(lens[w]);
+            const arg = k * (dx * p[0] + dz * p[2] - c * t) + offs[w];
+            const g = steep * fade * fm.cos(arg);
+            dhdx += g * dx;
+            dhdz += g * dz;
+        }
+    }
+    const extra = @min(0.5 * @sqrt(lost2), 1);
+    if (dhdx == 0 and dhdz == 0) return .{ .normal = n, .roughness = extra };
     // Störung senkrecht zur Fläche
     var t1 = Vec3{ 1, 0, 0 };
     if (@abs(n[0]) > 0.9) t1 = .{ 0, 1, 0 };
@@ -644,6 +678,18 @@ fn transmission(tracer: anytype, s: *const types.Scene, o: Vec3, d: Vec3, tmax: 
     return att;
 }
 
+/// Durchlässigkeit der Wolkenschicht für die Sonne am Punkt p (1 = frei)
+pub fn cloudShadow(s: *const types.Scene, l: *const types.Lighting, p: Vec3, ld: Vec3) f32 {
+    if (ld[1] <= 0.02 or l.sun_shadow_scale <= 0) return 1;
+    const t = (l.sun_shadow_height - p[1]) / ld[1];
+    if (t <= 0) return 1;
+    const inv = 1.0 / l.sun_shadow_scale;
+    const u = (p[0] + ld[0] * t + l.sun_shadow_offset[0]) * inv;
+    const w = (p[2] + ld[2] * t + l.sun_shadow_offset[1]) * inv;
+    const c = sampleTexture(s, l.sun_shadow_texture, u - @floor(u), w - @floor(w), 0);
+    return 1 - l.sun_shadow_strength * c[0];
+}
+
 /// Direktes Licht (Sonne + Punktlichter) an Punkt p mit Normale n
 fn direct(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p: Vec3, n: Vec3, v: Vec3, sf: *const Surface, rng: *Rng, mask: u32, trans_mask: u32) Vec3 {
     return directAt(tracer, s, l, p, n, v, sf, rng, mask, trans_mask, true);
@@ -673,6 +719,7 @@ fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p:
                 tint = r.att;
             } else lit = !occluded(tracer, s, p, ld, types.flt_max, mask);
         }
+        if (lit and l.sun_shadow_texture != 0) tint *= splat(cloudShadow(s, l, p, ld));
         if (lit) {
             if (ndl > 0) c += brdf(n, v, ld, sf) * @as(Vec3, l.sun_color) * splat(ndl) * tint;
             if (sf.subsurface > 0 and ndl < 0)
@@ -699,7 +746,13 @@ fn directAt(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, p:
             if (lit) {
                 const pdf_bsdf = endl / pi;
                 const w = es.pdf * es.pdf / (es.pdf * es.pdf + pdf_bsdf * pdf_bsdf);
-                c += clampContribution(l, brdf(n, v, es.dir, sf) * es.radiance * splat(endl * w / es.pdf) * tint);
+                // brdf() trägt π für die durch π geteilten Lichtstärken der
+                // Sonne und Lampen. Die Karte liefert echte Strahldichte (so
+                // liest sie auch der GI-Strahl, der den Himmel trifft), hier
+                // also durch π – sonst zählte der Himmel über diesen Weg
+                // π-mal so stark wie über den anderen, und die MIS-Mischung
+                // beider wäre inkonsistent.
+                c += clampContribution(l, brdf(n, v, es.dir, sf) * es.radiance * splat(endl * w / (es.pdf * pi)) * tint);
             }
         }
     }
@@ -1121,36 +1174,124 @@ pub inline fn hasFog(l: *const types.Lighting) bool {
 
 /// Farbe hinter dem Medium dämpfen und das eingestreute Licht dazurechnen.
 /// `dist` ist die Länge des Sichtstrahls (flt_max für den Himmel).
-pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, o: Vec3, d: Vec3, dist: f32, color: Vec3, rng: *Rng, mask: u32) Vec3 {
-    const max_dist = @min(dist, if (l.gi_distance > 0) l.gi_distance * 4 else 4096);
-    if (!(max_dist > 0)) return color;
+///
+/// Zwei Abschnitte: nahe der Kamera wird mit Schattenstrahlen marschiert (dort
+/// sieht man Lichtschächte), dahinter bis zum Horizont ohne Strahlen, mit
+/// ungeschatteter Sonne. Vorher endete der Nebel nach dem nahen Abschnitt
+/// ganz – ferne Berge bekamen dann keinerlei Luftperspektive, und die Grenze
+/// lag mitten in der Landschaft.
+pub const Fogged = struct {
+    color: Vec3,
+    /// Durchlässigkeit bis zum Treffer (1 = kein Dunst)
+    transmittance: f32,
+};
+
+pub fn applyFog(tracer: anytype, s: *const types.Scene, l: *const types.Lighting, o: Vec3, d: Vec3, dist: f32, color: Vec3, rng: *Rng, mask: u32) Fogged {
+    // Reichweite des Mediums: der Himmel liegt dahinter, in Sichtweite
+    const far_max: f32 = 16384;
+    const total = @min(dist, far_max);
+    if (!(total > 0)) return .{ .color = color, .transmittance = 1 };
+    const near = @min(total, if (l.gi_distance > 0) l.gi_distance * 4 else 4096);
     const steps: u32 = if (l.fog_steps == 0) 12 else @min(l.fog_steps, 64);
-    const dt = max_dist / @as(f32, @floatFromInt(steps));
     const sd = vec.normalize(l.sun_direction);
     const phase = phaseHG(l.fog_anisotropy, vec.dot(d, sd));
     const shadows = l.flags & types.lighting_shadows != 0;
+    // Licht im Medium (Strahldichte): Sonne nach der Phasenfunktion – ihre
+    // Stärke ist durch π geteilt geführt, hier braucht es die volle –, dazu
+    // der Himmel, über alle Richtungen gestreut. Integriert über die Kugel
+    // ergibt die Phasenfunktion 1, eingestreut wird also der mittlere Himmel;
+    // als Näherung das Mittel aus Zenit und acht Richtungen über dem Horizont
+    // (eine einzige Richtung trifft mal eine Wolke, mal blauen Himmel – das
+    // ergab senkrechte Streifen im Dunst).
+    // (Vorher stand hier der Himmel im Zenit durch 4π: zwölfmal zu dunkel,
+    // der Dunst am Horizont wurde zu einem dunklen Band.)
+    const sun_in = @as(Vec3, l.sun_color) * splat(pi * phase);
+    var sky_in = sky(l, .{ 0, 1, 0 }, false);
+    inline for (0..8) |q| {
+        const ang = @as(f32, @floatFromInt(q)) * (pi / 4.0);
+        sky_in += sky(l, vec.normalize(.{ fm.cos(ang), 0.3, fm.sin(ang) }), false);
+    }
+    sky_in *= splat(1.0 / 9.0);
+    const fog_c: Vec3 = l.fog_color;
 
     var transmittance: f32 = 1;
     var inscatter: Vec3 = splat(0);
     const jitter = rng.next();
-    var i: u32 = 0;
-    while (i < steps) : (i += 1) {
-        const t = (@as(f32, @floatFromInt(i)) + jitter) * dt;
-        const pos = o + d * splat(t);
-        const dens = fogDensity(l, pos[1]);
-        if (dens <= 0) continue;
-        const sigma = dens * dt;
-        // Sonne sichtbar? Das ergibt die Schächte.
-        var vis: f32 = 1;
-        if (shadows and occluded(tracer, s, pos, sd, types.flt_max, mask)) vis = 0;
-        if (vis > 0) {
-            const li = @as(Vec3, l.sun_color) * splat(phase * vis);
-            inscatter += li * @as(Vec3, l.fog_color) * splat(sigma * transmittance);
-        }
-        // Umgebungslicht im Medium (grob: der Himmel von oben)
-        inscatter += sky(l, .{ 0, 1, 0 }, false) * @as(Vec3, l.fog_color) * splat(sigma * transmittance * (1.0 / (4 * pi)));
+    const dt = near / @as(f32, @floatFromInt(steps));
+    // Erst ohne Schatten durchlaufen und das Gewicht jedes Schritts für das
+    // Sonnenlicht merken. Die Sichtbarkeit der Sonne kommt danach aus nur zwei
+    // Schattenstrahlen, gezogen nach diesem Gewicht (geschichtet): statt eines
+    // Strahls je Schritt zwei je Pixel, und der Erwartungswert bleibt gleich.
+    // Die zeitliche Mittelung nimmt das Rauschen weg; bei dünnem Dunst ist es
+    // ohnehin schwach.
+    var wts: [64]f32 = undefined;
+    var w_total: f32 = 0;
+    var sun_total: Vec3 = splat(0);
+    var n_steps: u32 = 0;
+    while (n_steps < steps) : (n_steps += 1) {
+        // Dichte und Durchlässigkeit sind glatt: sie werden fest in der
+        // Schrittmitte ausgewertet und je Abschnitt exakt integriert. Mit
+        // zufällig verschobenen Schritten schwankte das Integral selbst von
+        // Frame zu Frame – bei stehender Kamera die größte Unruhe im Bild
+        // (0,20 % unruhige Pixel mit Dunst, 0,004 % ohne). Zufällig bleiben
+        // nur die Orte der Schattenstrahlen unten, sie ergeben die Schächte.
+        const t = (@as(f32, @floatFromInt(n_steps)) + 0.5) * dt;
+        const dens = fogDensity(l, o[1] + d[1] * t);
+        const sigma = @max(dens, 0) * dt;
+        const g = (1 - fm.exp(-sigma)) * transmittance;
+        inscatter += sky_in * fog_c * splat(g);
+        sun_total += sun_in * fog_c * splat(g);
+        wts[n_steps] = g;
+        w_total += g;
         transmittance *= fm.exp(-sigma);
-        if (transmittance < 0.01) break;
+        if (transmittance < 0.01) {
+            n_steps += 1;
+            break;
+        }
     }
-    return color * splat(transmittance) + inscatter;
+    if (w_total > 0) {
+        var vis: f32 = 1;
+        if (shadows) {
+            vis = 0;
+            const r0 = rng.next();
+            const nv = 2;
+            inline for (0..nv) |q| {
+                // Schritt nach seinem Gewicht wählen
+                const target = (@as(f32, @floatFromInt(q)) + r0) * (1.0 / @as(f32, nv)) * w_total;
+                var acc: f32 = 0;
+                var k: u32 = 0;
+                while (k + 1 < n_steps) : (k += 1) {
+                    acc += wts[k];
+                    if (acc >= target) break;
+                }
+                const t = (@as(f32, @floatFromInt(k)) + jitter) * dt;
+                if (!occluded(tracer, s, o + d * splat(t), sd, types.flt_max, mask)) vis += 1.0 / @as(f32, nv);
+            }
+        }
+        inscatter += sun_total * splat(vis);
+    }
+
+    // Ferner Abschnitt: Schritte wachsen geometrisch, keine Strahlen
+    if (total > near and transmittance >= 0.01) {
+        const far_steps: u32 = 10;
+        const ratio = total / near;
+        var t0 = near;
+        var k: u32 = 0;
+        while (k < far_steps) : (k += 1) {
+            const f1 = @as(f32, @floatFromInt(k + 1)) / @as(f32, @floatFromInt(far_steps));
+            const t1 = near * fm.exp2(fm.log2(ratio) * f1);
+            const tm = 0.5 * (t0 + t1);
+            const dens = fogDensity(l, o[1] + d[1] * tm);
+            if (dens > 0) {
+                const sigma = dens * (t1 - t0);
+                const ext = fm.exp(-sigma);
+                // über den Abschnitt integriert: (1 − e^−σ) statt σ
+                inscatter += (sun_in + sky_in) * fog_c * splat((1 - ext) * transmittance);
+                transmittance *= ext;
+                if (transmittance < 0.01) break;
+            }
+            t0 = t1;
+        }
+    }
+    return .{ .color = color * splat(transmittance) + inscatter, .transmittance = transmittance };
 }

@@ -4,6 +4,7 @@
 const std = @import("std");
 const pyr = @import("pyrit_device");
 const pyrit = @import("pyrit");
+const demo_terrain = @import("demo").terrain;
 const common = @import("common.zig");
 const types = pyr.types;
 const vec = pyr.vec;
@@ -373,7 +374,7 @@ fn rtEquivalence(log2: u32, rt_log2: u32, rays: usize) !void {
             const t1 = @min(@reduce(.Min, @max(lo, hi)), tmax);
             if (!(t0 <= t1)) continue;
             is_calls += 1;
-            if (pyr.rt.traceSubtree(&rg, prim, o, d, 0, tmax, true, null)) |hh| {
+            if (pyr.rt.traceSubtree(&rg, prim, o, d, 0, tmax, true, null, null)) |hh| {
                 if (hh.t < tmax) {
                     tmax = hh.t;
                     best = hh;
@@ -611,7 +612,10 @@ test "Nachbearbeitung: varianzgeführter Filter entrauscht dunkle Flächen" {
     var color: [n]V4 = undefined;
     var normal: [n]V4 = undefined;
     var albedo: [n]V4 = undefined;
-    var motion = [_][2]f32{.{ 0, 0 }} ** n;
+    // Bewegung um genau ein Pixel senkrecht: der Verlauf bleibt kurz wie bei
+    // bewegter Kamera (steht das Bild, darf er länger werden), und das
+    // Muster (links dunkel, rechts hell) verschiebt sich dabei nicht.
+    var motion = [_][2]f32{.{ 0, 1 }} ** n;
     var hits = [_]types.Hit{.{ .t = 1, .instance = 0, .attribute = 1, .meta = 0 }} ** n;
     var hist = [2][n]H4{ undefined, undefined };
     var hist_n = [2][n]H4{ undefined, undefined };
@@ -1056,7 +1060,7 @@ test "GPU-Bau im Chunk-Batch = Einzelbau je Chunk" {
 }
 
 /// Erzeugt und baut einen Chunk-Batch wie die Welt (Generator auf der CPU)
-fn worldBatch(e: gpu_build.Exec, t: *const types.TerrainParams, keys: []const types.ChunkKey, cl: u32, cap: u32, out: gpu_build.ChunkOut) !struct { b: gpu_build.Built, total: u32 } {
+fn worldBatch(e: gpu_build.Exec, t: *const demo_terrain.Params, keys: []const types.ChunkKey, cl: u32, cap: u32, out: gpu_build.ChunkOut) !struct { b: gpu_build.Built, total: u32 } {
     const k: u32 = @intCast(keys.len);
     const vox = try gpa.alloc([4]u32, k * cap);
     defer gpa.free(vox);
@@ -1066,7 +1070,7 @@ fn worldBatch(e: gpu_build.Exec, t: *const types.TerrainParams, keys: []const ty
     const gp = types.WorldGenParams{ .chunks = @intFromPtr(keys.ptr), .voxels = @intFromPtr(vox.ptr), .counts = @intFromPtr(cnt.ptr), .count = k, .capacity = cap, .chunk_log2 = cl, .reserved = 0, .user = 0 };
     const threads = k << @intCast(2 * cl);
     var i: u32 = 0;
-    while (i < threads) : (i += 1) pyr.worldgen.terrainColumn(&gp, t, i);
+    while (i < threads) : (i += 1) demo_terrain.column(&gp, t, i);
     const offs = try gpa.alloc(u32, k + 1);
     defer gpa.free(offs);
     offs[0] = 0;
@@ -1078,14 +1082,12 @@ fn worldBatch(e: gpu_build.Exec, t: *const types.TerrainParams, keys: []const ty
     return .{ .b = b, .total = offs[k] };
 }
 
-test "Welt: GPU-Gelände je LOD-Stufe, lückenlose Oberfläche" {
+test "Welt: Gelände der Demo je LOD-Stufe, lückenlose Oberfläche" {
     var cpu = gpu_build.CpuExec{ .gpa = gpa };
     defer cpu.deinit();
     const e = cpu.exec();
-    var t = pyrit.world_mod.defaultTerrain();
-    t.base_height = 20;
-    t.amplitude = 25;
-    t.wavelength = 200;
+    // ohne Wasser und Bäume: dann ist die Oberfläche genau das Höhenfeld
+    const t = demo_terrain.Params{ .water = 0, .tree_density = 0 };
     const cl = 5;
     const n = 32;
     for ([_]u32{ 0, 2 }) |lod| {
@@ -1093,7 +1095,7 @@ test "Welt: GPU-Gelände je LOD-Stufe, lückenlose Oberfläche" {
         // 3 x 3 Spalten, y-Chunks über den ganzen Höhenbereich
         var keys: std.ArrayList(types.ChunkKey) = .empty;
         defer keys.deinit(gpa);
-        const y_chunks: i32 = @intFromFloat(@ceil((t.base_height + t.amplitude * 1.6 + 2) / (n * step)));
+        const y_chunks: i32 = @intFromFloat(@ceil(@as(f32, demo_terrain.y_max) / (n * step)));
         for (0..3) |z| for (0..3) |x| {
             var y: i32 = 0;
             while (y < y_chunks) : (y += 1) try keys.append(gpa, .{ .x = @intCast(x), .y = y, .z = @intCast(z), .lod = lod });
@@ -1130,11 +1132,15 @@ test "Welt: GPU-Gelände je LOD-Stufe, lückenlose Oberfläche" {
                 const y = oy + (n + 1 - h.t) * step;
                 if (best == null or y > best.?) best = y;
             }
-            const y = best orelse return error.LochImGelaende;
+            const y = best orelse {
+                const t_ref = demo_terrain.heightWith(&t, demo_terrain.climate(&t, wx, wz), wx, wz, 2 * step);
+                print("  Loch bei ({d:.2}, {d:.2}), Stufe {d}, Höhe {d:.2}\n", .{ wx, wz, lod, t_ref });
+                return error.LochImGelaende;
+            };
             // Höhenfeld in voller Auflösung an der Spaltenmitte der Stufe
             const cx = (@floor(wx / step) + 0.5) * step;
             const cz = (@floor(wz / step) + 0.5) * step;
-            const ref = pyr.worldgen.height(&t, cx, cz, 2 * step);
+            const ref = demo_terrain.heightWith(&t, demo_terrain.climate(&t, cx, cz), cx, cz, 2 * step);
             worst = @max(worst, @abs(y - ref));
         }
         const cols: f32 = 9 * n * n;

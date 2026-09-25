@@ -213,7 +213,6 @@ pub const Context = struct {
     fn_fg_splat: cuda.CUfunction = null,
     fn_fg_splat_mv: cuda.CUfunction = null,
     fn_build: cuda.CUfunction = null,
-    fn_gen_terrain: cuda.CUfunction = null,
     fn_fx_pack_mvd: cuda.CUfunction = null,
     fn_fx_dof: cuda.CUfunction = null,
     fn_fx_motion: cuda.CUfunction = null,
@@ -465,7 +464,6 @@ pub const Context = struct {
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat, self.module, "pyr_k_fg_splat"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_fg_splat_mv, self.module, "pyr_k_fg_splat_mv"), "cuModuleGetFunction");
         try self.check(self.drv.cuModuleGetFunction(&self.fn_build, self.module, "pyr_k_build"), "cuModuleGetFunction");
-        try self.check(self.drv.cuModuleGetFunction(&self.fn_gen_terrain, self.module, "pyr_k_gen_terrain"), "cuModuleGetFunction");
         inline for (.{
             .{ "fn_fx_pack_mvd", "pyr_k_fx_pack_mvd" },
             .{ "fn_fx_dof", "pyr_k_fx_dof" },
@@ -660,6 +658,7 @@ pub const Context = struct {
             .materials = self.materials_dev,
             .lighting = self.lighting_dev,
             .transparent_materials = self.transparentMaterials(),
+            .cutout_materials = self.materialsWith(types.material_cutout),
             .textures = self.texture_table,
             .texture_count = self.texture_high,
             .reserved_tex = 0,
@@ -1492,7 +1491,8 @@ pub const Context = struct {
             .texture_scale = 1,
             .normal_strength = 0,
             .normal_scale = 1,
-            .reserved = 0,
+            .side_texture = 0,
+            .side_color = .{ 0, 0, 0 },
         };
     }
 
@@ -1516,9 +1516,13 @@ pub const Context = struct {
 
     /// Bitmaske der Materialien mit material_transparent (für die Traversierung)
     fn transparentMaterials(self: *const Context) [4]u64 {
+        return self.materialsWith(types.material_transparent);
+    }
+
+    fn materialsWith(self: *const Context, flag: u32) [4]u64 {
         var m = [4]u64{ 0, 0, 0, 0 };
         for (self.materials, 0..) |mat, i| {
-            if (mat.flags & types.material_transparent != 0) m[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+            if (mat.flags & flag != 0) m[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
         }
         return m;
     }
@@ -1639,6 +1643,13 @@ pub const Context = struct {
         // Diagnose: PYRIT_NOTIME haelt die Szenenzeit an. Damit stehen die
         // Wellen still - alles andere bleibt unveraendert.
         if (std.c.getenv("PYRIT_NOTIME") != null) self.time = 0;
+        // Diagnose: entfernungsabhaengiger Startversatz der Folgestrahlen.
+        // Die Genauigkeit von f32 skaliert mit der Entfernung, der bisherige
+        // Versatz aber nur mit der Voxelgroesse - bei grossem t startet der
+        // Schattenstrahl deshalb mal ueber, mal unter der Flaeche.
+        if (std.c.getenv("PYRIT_SECONDARY_BIAS")) |e| {
+            self.lighting.secondary_bias = std.fmt.parseFloat(f32, std.mem.span(e)) catch self.lighting.secondary_bias;
+        }
         if (self.env_data != 0 and self.lighting.env_intensity == 0) self.lighting.env_intensity = 1;
         try self.uploadValue(self.lighting_dev, &self.lighting);
     }
@@ -2032,7 +2043,15 @@ pub const Context = struct {
         const h = v.last.camera.height;
         const out_w = if (info.output_width == 0) w else info.output_width;
         const out_h = if (info.output_height == 0) h else info.output_height;
-        const mode: u32 = if (info.upscaler == api.upscaler_auto) api.upscaler_taau else info.upscaler;
+        // Automatik: TAAU nur, wenn wirklich hochskaliert wird. Bei gleicher
+        // Auflösung mittelte TAAU das *fertige* Bild samt Texturen ein zweites
+        // Mal über den Verlauf – ohne Jitter bringt das nichts als Unschärfe
+        // bei Bewegung (gemessen: 16 % weniger Schärfe schon im ersten
+        // bewegten Frame, 40 % nach zehn).
+        const mode: u32 = if (info.upscaler == api.upscaler_auto)
+            (if (out_w == w and out_h == h) api.upscaler_none else api.upscaler_taau)
+        else
+            info.upscaler;
         switch (mode) {
             api.upscaler_none => if (out_w != w or out_h != h)
                 return fail(error.InvalidArgument, "Hochskalieren ({d}x{d} -> {d}x{d}) braucht einen Upscaler", .{ w, h, out_w, out_h }),

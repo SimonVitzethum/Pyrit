@@ -701,16 +701,6 @@ pub export fn pyr_world_stats(world: ?*PyrWorld, out: ?*api.WorldStats) Result {
     return api.ok;
 }
 
-/// Höhe des eingebauten Geländes an (x, z) in Grundvoxeln (volle Auflösung),
-/// z. B. um die Kamera über den Boden zu setzen.
-pub export fn pyr_terrain_height(terrain: ?*const api.TerrainInfo, x: f64, z: f64) f32 {
-    const t = if (terrain) |p| p.* else world_mod.defaultTerrain();
-    return pyr_device.worldgen.height(&t, @floatCast(x), @floatCast(z), 0);
-}
-
-pub export fn pyr_terrain_default(out: ?*api.TerrainInfo) void {
-    if (out) |o| o.* = world_mod.defaultTerrain();
-}
 
 test {
     _ = @import("dag_builder.zig");

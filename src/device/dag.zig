@@ -92,15 +92,20 @@ inline fn exitAt(t: f32, axis: u32, oct: u32) DagHit {
 ///
 /// Achsen werden mit `inline for` behandelt, damit alles in Registern bleibt.
 pub fn trace(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool) ?DagHit {
-    return walk(false, g, o, d, tmin, tmax, want_attribute, null);
+    return walk(false, g, o, d, tmin, tmax, want_attribute, null, .{});
 }
 
 /// Wie `trace`, überspringt aber Voxel, deren Material in `skip` steht (ein Bit
 /// je Materialindex). So laufen Primär- und Schattenstrahlen durch Wasser oder
 /// Glas hindurch, ohne die Traversierung mehrfach zu starten.
-pub fn traceSkipping(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: *const [4]u64) ?DagHit {
-    return walk(false, g, o, d, tmin, tmax, want_attribute, skip);
+/// `cut`: Materialien mit Lochmuster (material_cutout); null = keine.
+/// `base`: Ursprung dieses DAGs in einem größeren (Teilbäume der RT-Cores),
+/// damit das Lochmuster auf beiden Wegen an denselben Voxeln sitzt.
+pub fn traceSkipping(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: ?*const [4]u64, cut: ?*const [4]u64, base: [3]i32) ?DagHit {
+    return walk(false, g, o, d, tmin, tmax, want_attribute, skip, .{ .cut = cut, .base = base });
 }
+
+pub const Cut = struct { cut: ?*const [4]u64 = null, base: [3]i32 = .{ 0, 0, 0 } };
 
 /// Austritt aus festem Material: erster Punkt ab tmin, an dem der Strahl in
 /// eine leere Zelle übergeht (für transparente Medien). `face` ist die dabei
@@ -108,7 +113,28 @@ pub fn traceSkipping(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want
 /// Leeren, ist das Ergebnis t = tmin. null, wenn der Strahl bis tmax im
 /// Material bleibt; Verlassen des Würfels zählt als Austritt.
 pub fn traceExit(g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32) ?DagHit {
-    return walk(true, g, o, d, tmin, tmax, false, null);
+    return walk(true, g, o, d, tmin, tmax, false, null, .{});
+}
+
+/// Loch im festen 4x4-Muster der Fläche, durch die der Strahl in den Voxel
+/// eintritt? `p`: Eintrittspunkt im Objektraum, `axis`: Achse der Fläche.
+inline fn cutHole(c: Cut, attribute: u32, voxel: [3]i32, p: Vec3, axis: u32) bool {
+    if (!skipped(c.cut, attribute)) return false;
+    var sub: [2]u32 = .{ 0, 0 };
+    var k: u32 = 0;
+    inline for (0..3) |a| {
+        if (a != axis) {
+            const f = @min(@max(p[a] - @as(f32, @floatFromInt(voxel[a])), 0), 0.999);
+            sub[k] = @intFromFloat(f * 4);
+            k += 1;
+        }
+    }
+    var h: u32 = @as(u32, @bitCast(voxel[0] +% c.base[0])) *% 0x8da6b343 +% @as(u32, @bitCast(voxel[1] +% c.base[1])) *% 0xd8163841 +%
+        @as(u32, @bitCast(voxel[2] +% c.base[2])) *% 0xcb1ab31f +% (attribute >> 8) *% 0x2545f491 +% axis *% 0x9e3779b9 +% (sub[0] * 4 + sub[1]) *% 0x632be5ab;
+    h ^= h >> 15;
+    h *%= 0x2c1b3c6d;
+    h ^= h >> 12;
+    return (h & 0xFF) < 77; // etwa 30 % Löcher
 }
 
 inline fn skipped(skip: ?*const [4]u64, attribute: u32) bool {
@@ -117,7 +143,7 @@ inline fn skipped(skip: ?*const [4]u64, attribute: u32) bool {
     return (m[idx >> 6] >> @intCast(idx & 63)) & 1 != 0;
 }
 
-fn walk(comptime exit_mode: bool, g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: ?*const [4]u64) ?DagHit {
+fn walk(comptime exit_mode: bool, g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tmax: f32, want_attribute: bool, skip: ?*const [4]u64, cut: Cut) ?DagHit {
     const n: u32 = @as(u32, 1) << @intCast(g.log2_size);
     const nf: f32 = @floatFromInt(n);
 
@@ -201,11 +227,18 @@ fn walk(comptime exit_mode: bool, g: *const Dag, o: Vec3, d: Vec3, tmin: f32, tm
                     voxel[a] = @intCast(v[a]);
                 }
                 var attribute = g.default_attribute;
-                if (want_attribute or skip != null) {
+                if (want_attribute or skip != null or cut.cut != null) {
                     if (g.attributes) |attrs| attribute = attrs[attributeRank(g, &stk, v, brick)];
                 }
-                // durchsichtiges Material: weiterlaufen statt treffen
-                if (skipped(skip, attribute)) {
+                // durchsichtiges Material oder Loch im Laub: weiterlaufen
+                // statt treffen. Startet der Strahl in einem Laubvoxel (er
+                // kam durch ein Loch und liegt auf der Innenfläche des
+                // Nachbarn), zählt dieser Voxel als offen – sonst wären
+                // Schatten- und GI-Strahlen von dort sofort verdeckt und jedes
+                // Loch zeigte schwarz.
+                const at_start = starts_inside and !moved;
+                const through_leaf = if (at_start) skipped(cut.cut, attribute) else cutHole(cut, attribute, voxel, o + d * @as(Vec3, @splat(t)), axis);
+                if (skipped(skip, attribute) or through_leaf) {
                     scale = 0;
                     // wie "Zelle leer": zur nächsten Zelle derselben Größe
                     const size0: u32 = 1;

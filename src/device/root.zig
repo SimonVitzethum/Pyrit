@@ -21,7 +21,6 @@ pub const post = @import("post.zig");
 pub const upscale = @import("upscale.zig");
 pub const anim = @import("anim.zig");
 pub const gbuild = @import("gbuild.zig");
-pub const worldgen = @import("worldgen.zig");
 pub const worldedit = @import("worldedit.zig");
 pub const postfx = @import("postfx.zig");
 pub const fmath = @import("fmath.zig");

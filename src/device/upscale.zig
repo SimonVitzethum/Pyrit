@@ -101,8 +101,9 @@ fn writeOutputFmt(out_hdr: u64, out_ldr: u64, i: u64, c: V4, exposure: f32, tone
     if (out_hdr != 0) st4(out_hdr, i, .{ c[0], c[1], c[2], 1 });
     if (out_ldr != 0) {
         var px: [4]u8 = undefined;
+        const tm = post.tonemap(.{ @max(c[0] * exposure, 0), @max(c[1] * exposure, 0), @max(c[2] * exposure, 0) }, tonemap);
         inline for (0..3) |k| {
-            const v = post.linearToSrgb(post.tonemapChannel(@max(c[k] * exposure, 0), tonemap));
+            const v = post.linearToSrgb(tm[k]);
             px[if (bgra) 2 - k else k] = @intFromFloat(@min(@max(v * 255.0 + 0.5, 0), 255));
         }
         px[3] = 255;
